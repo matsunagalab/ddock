@@ -35,6 +35,24 @@ _REPO = Path(__file__).resolve().parent.parent
 _DATA_ROOT = _REPO / "tests" / "data"
 
 
+def _pinder_holo_paths(pinder_id):
+    """Download (if needed) a PINDER system and return its bound (holo)
+    receptor / ligand monomer PDB paths.
+
+    PINDER ships a ``fastpdb`` reader that is incompatible with the installed
+    ``biotite`` (``PDBFile.lines`` is read-only), so we force ``PinderSystem``
+    onto the pure-``biotite`` engine. We only use it to fetch files + resolve
+    paths; the atoms themselves are re-parsed with our own ``parse_pdb_plain``
+    so featurization is identical to the DB5.5 path. The holo ``-R``/``-L``
+    monomers are extracted from the same native complex, so they already share
+    a coordinate frame => the ligand's given coords are the native placement.
+    """
+    from pinder.core import PinderSystem  # heavy import; only in pinder mode
+
+    ps = PinderSystem(pinder_id, pdb_engine="biotite")
+    return str(ps.holo_receptor.filepath), str(ps.holo_ligand.filepath)
+
+
 def _locate_and_prepare(name, args, device, dtype):
     """Return a PreparedProtein for ``name`` under the configured format."""
     if args.format == "pdbms":
@@ -43,6 +61,11 @@ def _locate_and_prepare(name, args, device, dtype):
         if not rec.exists() or not lig.exists():
             raise FileNotFoundError(f"missing pdb.ms for {name}: {rec} / {lig}")
         return prepare_protein_from_pdbms(name, rec, lig, device=device, dtype=dtype)
+    if args.format == "pinder":
+        # PINDER interface-deleaked systems (holo redocking). ``name`` is the
+        # PINDER system id, e.g. ``3k1i__D1_O25709--3k1i__A1_O25448``.
+        rec, lig = _pinder_holo_paths(name)
+        return prepare_protein_from_pdb(name, rec, lig, device=device, dtype=dtype)
     # DB5.5 plain-PDB bound constituents.
     d = Path(args.structures_dir)
     rec = d / f"{name}_r_{args.bound}.pdb"
@@ -144,8 +167,11 @@ def build(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--proteins", nargs="+", default=["1KXQ"])
+    p.add_argument("--ids-file", dest="ids_file", default=None,
+                   help="Optional file with one protein/system id per line "
+                        "(overrides --proteins; needed for long PINDER ids).")
     p.add_argument("--output", default=str(_REPO / "data" / "decoys.h5"))
-    p.add_argument("--format", choices=["pdbms", "pdb"], default="pdbms")
+    p.add_argument("--format", choices=["pdbms", "pdb", "pinder"], default="pdbms")
     p.add_argument("--structures-dir", dest="structures_dir",
                    default=str(_REPO / "external" / "benchmark5.5" / "structures"))
     p.add_argument("--bound", choices=["b", "u"], default="b",
@@ -161,7 +187,11 @@ def main() -> None:
     p.add_argument("--rot-chunk-size", type=int, default=32, dest="rot_chunk_size")
     p.add_argument("--rmsd-threshold", type=float, default=5.0, dest="rmsd_threshold")
     p.add_argument("--seed", type=int, default=0)
-    build(p.parse_args())
+    args = p.parse_args()
+    if args.ids_file:
+        with open(args.ids_file) as fh:
+            args.proteins = [ln.strip() for ln in fh if ln.strip()]
+    build(args)
 
 
 if __name__ == "__main__":

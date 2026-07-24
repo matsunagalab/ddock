@@ -171,8 +171,38 @@ pose `f` のスコア: `score[f] = α · S_SC[f] + S_IFACE[f] + β · S_ELEC[f]`
 | top-100 | 0.0% | **100%** | 0.0% | **100%** |
 
 - 学習後 α=0.0228、‖Δiface‖=11.527、mean best-DockQ@top1 = 0.452。
-- **過学習していない**: train-set の top-1 RMSD 70.5% と test の 71.0% がほぼ同一。
-  学習した SC 重みと 12×12 IFACE 行列が複合体間で汎化している。
+- ランダム分割上では train-set top-1 RMSD 70.5% と test 71.0% がほぼ一致し、一見
+  「汎化している」ように見えた。**しかしこれは interface leakage による楽観バイアス
+  だった**（5.4 で検証）。
+
+### 5.4 PINDER interface-deleaked split（leakage 検証）
+5.3 のランダム複合体分割は interface をクラスタリングしていないため、類似 interface が
+train/test に跨り得る。そこで **PINDER**（FoldSeek/MMseqs による interface 類似度
+クラスタリング＋iAlign による deleaking で構築された gold-standard split）を導入し、
+**設計上 train と test の間に interface leakage が無い**条件で測り直した。
+
+- `pinder` パッケージで index を取得。`fastpdb`↔`biotite 1.7` 非互換のため
+  `PinderSystem(id, pdb_engine="biotite")` で holo 単量体 PDB を取得し、DB5.5 と同一の
+  自作パーサ／featurization に流した（`scripts/build_decoy_dataset.py --format pinder`）。
+- **train**: `split==train` から別クラスタ 300 件をサンプル（test とクラスタ重複 0）。
+  **test**: 標準ベンチマーク **PINDER-S**（250 クラスタ代表）。7 GPU 並列生成後、
+  featurization 時の OOM を除いて **train 226 / test 241 複合体**。
+- 同一パイプライン・同一損失（`basin + 0.5·margin + 0.1·prior`, lr=0.01, 3000 epoch）:
+
+| K | baseline TEST DockQ | trained **TEST(deleaked)** DockQ | trained **TRAIN** DockQ |
+|---|---|---|---|
+| top-1 | 0.4% | **1.2%** | **82.7%** |
+| top-5 | 0.4% | 2.5% | 93.8% |
+| top-10 | 1.2% | 2.9% | 96.0% |
+| top-100 | 1.7% | **4.1%** | **99.6%** |
+
+- baseline は **train でも test でも** ほぼ 0%（top-1 DockQ 0.4%）。学習で train は
+  0.4%→**82.7%** に上がるが、deleaked test は 0.4%→**1.2%** しか上がらない。
+- **結論**: 156 パラメータは訓練複合体の interface 化学を「暗記」するが、**未知
+  interface には全く汎化しない**。5.3 の 71% は**ほぼ全てが leakage（過学習）由来の
+  楽観バイアス**であり、deleaked 条件での真の汎化性能は baseline+数 % に留まる。
+  → これが「deleak した split を作ると何が分かるか」の答え。leakage 除去は必須で、
+  現行モデル／損失は未知 interface への転移をまだ達成していない。
 
 ---
 
@@ -190,9 +220,11 @@ pose `f` のスコア: `score[f] = α · S_SC[f] + S_IFACE[f] + β · S_ELEC[f]`
 ---
 
 ## 7. 限界と次段階
-1. **split がランダム複合体分割で interface 非クラスタリング**。抗体系など類似
-   interface が train/test に跨る leakage が残り、71% は楽観的な可能性がある。次は
-   interface/配列クラスタリングでの deleaked split（または PINDER deleaked split）。
+1. **[実施済 → 5.4]** PINDER の interface-deleaked split で測り直した結果、ランダム
+   分割の 71% は leakage 由来と判明。deleaked test では 1〜4% しか出ず、**汎化が本質的
+   課題**であることが確定した。次に必要なのは (a) より強い正則化／実効パラメータ削減、
+   (b) train 複合体数の大幅増（数百→数千クラスタ）、(c) 損失の見直し（basin/margin が
+   train interface に過適合しやすい）。
 2. **hard-negative mining ループ**（現行 param で FFT を再生成して高スコア非 native を
    採掘）を回すと、探索そのものの品質も上げられる。
 3. **unbound/predicted 入力での fine-tuning**（GPT §2）。実用ドッキングでは bound は
@@ -221,6 +253,17 @@ tar xzf external/benchmark5.5.tgz -C external
 # （data/shards/shard{0..6}.h5 を生成）
 uv run python scripts/run_db55.py --shards 'data/shards/shard*.h5' \
     --device cuda --epochs 2000 --lr 0.05
+
+# PINDER interface-deleaked split（leakage 検証, 5.4）
+export PINDER_BASE_DIR=$PWD/external/pinder
+uv pip install pinder
+# test=PINDER-S(250) / train=別クラスタ300 の id リストを data/ に書き出し済み
+uv run python scripts/gen_pinder_shards.py --ids-file data/pinder_test_ids.txt \
+    --tag test --out-dir data/shards_pinder --gpus 0,1,2,3,4,5,6
+uv run python scripts/gen_pinder_shards.py --ids-file data/pinder_train_ids.txt \
+    --tag train --out-dir data/shards_pinder --gpus 0,1,2,3,4,5,6
+uv run python scripts/run_pinder.py --device cuda --epochs 3000 \
+    --lr 0.01 --lambda-prior 0.1
 ```
 
 生成物（`data/`, `external/`, `logs/`, `*.h5`）は `.gitignore` 済み。上記スクリプトで
