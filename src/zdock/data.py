@@ -110,6 +110,12 @@ def load_training_dataset(
                 if rmsd_ds is not None else None
             )
 
+            dockq_ds = g.get("dockq")
+            dockq = (
+                torch.as_tensor(dockq_ds[f_slice], dtype=dtype, device=device)
+                if dockq_ds is not None else None
+            )
+
             if rmsd_threshold_angstrom is not None:
                 if rmsd is None:
                     raise ValueError(
@@ -148,6 +154,7 @@ def load_training_dataset(
                     lig_charge_id=_i("lig_charge_id"),
                     hit_mask=hit_mask,
                     rmsd=rmsd,
+                    dockq=dockq,
                 )
             )
     return out

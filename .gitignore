@@ -31,3 +31,9 @@ outputs/
 checkpoints/
 wandb/
 lightning_logs/
+
+# Large generated / downloaded research data (reproducible via scripts/)
+data/
+external/
+logs/
+*.h5

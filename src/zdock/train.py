@@ -201,6 +201,54 @@ def loss_margin_hard_negatives(
     return hinge.mean()
 
 
+def loss_basin(
+    scores: torch.Tensor,
+    dockq: torch.Tensor,
+    *,
+    positive_threshold: float = 0.23,
+    temperature: float = 0.5,
+) -> torch.Tensor:
+    """Multi-positive InfoNCE ("basin") loss from the research proposal.
+
+    Treat *every* near-native pose (DockQ >= ``positive_threshold``) as a
+    positive and pull the softmax probability mass of the whole positive
+    basin up:
+
+        L = -log ( Σ_{g in B} exp(s_g / T) / Σ_{g in C} exp(s_g / T) )
+
+    Robust to the FFT rotation/translation discretization (many poses near
+    the native basin all count), handles symmetry-equivalent solutions, and
+    needs no hard argmax. If a protein has no positive in its candidate set
+    the term is a graph-connected zero (keeps autograd happy in a mixed
+    batch).
+    """
+    pos = dockq >= positive_threshold
+    if not pos.any():
+        return (scores * 0.0).sum()
+    logits = scores / temperature
+    log_denom = torch.logsumexp(logits, dim=0)
+    log_numer = torch.logsumexp(logits[pos], dim=0)
+    return -(log_numer - log_denom)
+
+
+def loss_param_prior(
+    alpha: torch.Tensor,
+    iface: torch.Tensor,
+    charge: torch.Tensor,
+    alpha0: torch.Tensor,
+    iface0: torch.Tensor,
+    charge0: torch.Tensor,
+) -> torch.Tensor:
+    """L2 anchor to the ZDOCK defaults (``‖θ − θ_ZDOCK‖²``). Keeps the
+    learned residual small and stops the 156 parameters from drifting into
+    a degenerate regime early in training."""
+    return (
+        (alpha - alpha0).pow(2).sum()
+        + (iface - iface0).pow(2).sum()
+        + (charge - charge0).pow(2).sum()
+    )
+
+
 def total_loss(
     proteins: Iterable[ProteinInputs],
     alpha: torch.Tensor,
@@ -226,7 +274,7 @@ def total_loss(
     return torch.stack(parts).sum()
 
 
-_VALID_LOSSES = ("split_mse", "rank", "dockq_rank", "dockq_margin")
+_VALID_LOSSES = ("split_mse", "rank", "dockq_rank", "dockq_margin", "basin", "combined")
 
 
 def train(
@@ -244,6 +292,9 @@ def train(
     dockq_temperature: float = 0.2,
     margin_positive_threshold: float = 0.23,
     margin: float = 1.0,
+    basin_temperature: float = 0.5,
+    lambda_margin: float = 0.5,
+    lambda_prior: float = 0.05,
 ) -> dict:
     """Run the full Adam optimization and return the trained parameters
     plus a loss history.
@@ -303,7 +354,7 @@ def train(
                     f"loss='rank' requires rmsd on every protein, but "
                     f"proteins[{i}] has rmsd=None"
                 )
-    if loss in ("dockq_rank", "dockq_margin"):
+    if loss in ("dockq_rank", "dockq_margin", "basin", "combined"):
         for i, p in enumerate(proteins):
             if p.dockq is None:
                 raise ValueError(
@@ -314,10 +365,13 @@ def train(
     # 27-28 defaults.
     alpha = torch.tensor(0.01, device=device, dtype=dtype, requires_grad=True)
     beta = torch.tensor(3.0, device=device, dtype=dtype)
-    iface_init = iface_ij(device=device, dtype=dtype, flat=True).clone()
-    iface = iface_init.detach().requires_grad_(True)
-    charge_init = default_charge_score(device=device, dtype=dtype).clone()
-    charge = charge_init.detach().requires_grad_(True)
+    iface = iface_ij(device=device, dtype=dtype, flat=True).clone().detach().requires_grad_(True)
+    charge = default_charge_score(device=device, dtype=dtype).clone().detach().requires_grad_(True)
+
+    # Frozen copies of the ZDOCK defaults for the L2 parameter prior.
+    alpha_init = alpha.detach().clone()
+    iface_init = iface.detach().clone()
+    charge_init = charge.detach().clone()
 
     # split_mse freezes per-protein targets from pre-training scores;
     # rank doesn't use targets at all.
@@ -357,6 +411,28 @@ def train(
                     scores, p.dockq,
                     positive_threshold=margin_positive_threshold,
                     margin=margin,
+                )
+            elif loss == "basin":
+                lp = loss_basin(
+                    scores, p.dockq,
+                    positive_threshold=margin_positive_threshold,
+                    temperature=basin_temperature,
+                )
+            elif loss == "combined":
+                lp = (
+                    loss_basin(
+                        scores, p.dockq,
+                        positive_threshold=margin_positive_threshold,
+                        temperature=basin_temperature,
+                    )
+                    + lambda_margin * loss_margin_hard_negatives(
+                        scores, p.dockq,
+                        positive_threshold=margin_positive_threshold,
+                        margin=margin,
+                    )
+                    + lambda_prior * loss_param_prior(
+                        alpha, iface, charge, alpha_init, iface_init, charge_init,
+                    )
                 )
             else:  # split_mse
                 ht, mt = tgt

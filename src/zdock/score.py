@@ -321,9 +321,17 @@ def _score_ligand_chunk(
     surface_threshold: float,
     elec_mode: ElecMode,
     scatter_mode: str = "nearest",
-) -> torch.Tensor:
+    return_components: bool = False,
+):
     """Per-frame total scores for a single ligand frame-chunk, re-using
     precomputed receptor grids.
+
+    If ``return_components`` is True, return the tuple ``(score_sc, T,
+    score_elec)`` instead of the combined score, where ``T`` is the
+    ``(F, 12, 12)`` IFACE contraction ``Σ_cell L_i H_j`` (so that
+    ``score_iface = (iface_matrix * T).sum((-2, -1))``). This exposes the
+    per-pose features that make the score linear in ``(alpha, iface)`` and
+    lets a caller cache them once and train the parameters cheaply.
 
     Split out of `docking_score_elec` so that callers can loop over
     chunks of F and optionally wrap each call in
@@ -460,6 +468,8 @@ def _score_ligand_chunk(
         c = (V_grid.reshape(F, 11, V) * U.reshape(11, V).unsqueeze(0)).sum(-1)
         score_elec = (charge_score.pow(2).unsqueeze(0) * c).sum(-1)
 
+    if return_components:
+        return score_sc, T, score_elec
     return alpha * score_sc + score_iface + beta * score_elec
 
 
@@ -487,8 +497,16 @@ def docking_score_elec(
     elec_mode: ElecMode = "coulomb",
     frame_chunk_size: int | None = None,
     scatter_mode: str = "nearest",
-) -> torch.Tensor:
+    return_components: bool = False,
+):
     """Return a (F,) tensor of docking scores.
+
+    If ``return_components`` is True, return ``(score_sc, T, score_elec)``
+    where ``T`` is ``(F, 12, 12)`` — the per-pose geometric features that
+    the score is linear in for ``(alpha, iface)``. See
+    ``_score_ligand_chunk`` for the exact definition. ``score_elec`` is
+    evaluated with the supplied ``charge_score`` (so freeze it at the
+    ZDOCK default to treat ELEC as a fixed per-pose feature).
 
     Default `elec_mode="coulomb"` implements the physically-correct Chen 2002 /
     Chen 2003 ELEC: receptor generates a Coulombic potential V(r) = Σⱼ qⱼ / |r−rⱼ|
@@ -627,6 +645,29 @@ def docking_score_elec(
         and frame_chunk_size > 0
         and frame_chunk_size < F_total
     )
+
+    if return_components:
+        # Feature-extraction path: return (score_sc, T, score_elec),
+        # concatenated over frame chunks. No checkpointing (used under
+        # no_grad for one-time caching).
+        step = frame_chunk_size if use_chunks else F_total
+        sc_parts, T_parts, elec_parts = [], [], []
+        for s in range(0, F_total, step):
+            e = min(s + step, F_total)
+            sc_c, T_c, elec_c = _score_ligand_chunk(
+                lig_xyz[s:e], alpha, iface_matrix, beta, charge_score,
+                H, rec_sc_real, rec_sc_imag, V_rec_or_U,
+                return_components=True, **chunk_kwargs,
+            )
+            sc_parts.append(sc_c)
+            T_parts.append(T_c)
+            elec_parts.append(elec_c)
+        return (
+            torch.cat(sc_parts, dim=0),
+            torch.cat(T_parts, dim=0),
+            torch.cat(elec_parts, dim=0),
+        )
+
     if not use_chunks:
         return _score_ligand_chunk(
             lig_xyz, alpha, iface_matrix, beta, charge_score,
