@@ -140,6 +140,56 @@ class PreparedProtein:
     q_star: torch.Tensor           # (4,)
     t_star: torch.Tensor           # (3,)
 
+    #: every field that holds a tensor — used by :meth:`to` / :meth:`state_dict`
+    TENSOR_FIELDS = (
+        "rec_xyz", "rec_radius", "rec_sasa", "rec_atomtype_id", "rec_charge_id",
+        "lig_ref", "lig_radius", "lig_sasa", "lig_atomtype_id", "lig_charge_id",
+        "native_lig", "q_star", "t_star",
+    )
+
+    @property
+    def n_rec(self) -> int:
+        return int(self.rec_xyz.shape[0])
+
+    @property
+    def n_lig(self) -> int:
+        return int(self.lig_ref.shape[0])
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
+    ) -> "PreparedProtein":
+        """Return a copy with every tensor field moved to ``device``.
+
+        Integer id fields keep their integer dtype; only floating-point
+        fields follow ``dtype``. Streaming pipelines use this to hold the
+        whole corpus on CPU (or on disk) and page one complex onto the
+        accelerator at a time.
+        """
+        moved = {}
+        for f in self.TENSOR_FIELDS:
+            t = getattr(self, f)
+            want = dtype if (dtype is not None and t.is_floating_point()) else None
+            moved[f] = t.to(device=device, dtype=want, non_blocking=non_blocking)
+        return PreparedProtein(name=self.name, **moved)
+
+    def cpu(self) -> "PreparedProtein":
+        return self.to("cpu")
+
+    def state_dict(self) -> dict:
+        """Plain ``{name, tensors...}`` dict for ``torch.save`` disk caching."""
+        d = {"name": self.name}
+        for f in self.TENSOR_FIELDS:
+            d[f] = getattr(self, f)
+        return d
+
+    @classmethod
+    def from_state_dict(cls, d: dict) -> "PreparedProtein":
+        return cls(name=d["name"], **{f: d[f] for f in cls.TENSOR_FIELDS})
+
 
 def _atoms_to_features(atoms, device, dtype):
     xyz = torch.as_tensor(atoms.xyz, device=device, dtype=dtype)

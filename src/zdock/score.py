@@ -224,80 +224,164 @@ def _grouped_calculate_distance(
 # ---------------------------------------------------------------------------
 
 
-def _assign_sc_plus(
-    grid: torch.Tensor,
+#: ``rho`` of the **pairwise** shape-complementarity grid, Chen et al. 2003
+#: Eq. (2) (ZDOCK 2.3, ``PSC+DE+ELEC``):
+#:
+#:     Re[R] = Re[L] = { rho    solvent-excluding surface layer
+#:                       rho^2  protein core
+#:                       0      open space }
+#:
+#: with ``rho = 3.5``, so a grid-point overlap costs ``rho^2 = 12.25``
+#: (surface-surface), ``rho^3 = 42.875`` (surface-core) or ``rho^4 = 150.06``
+#: (core-core) — a pure clash penalty; the *favourable* signal comes from the
+#: pair potential, not from this term. Chen & Weng 2002's earlier grid-based
+#: SC used a complex encoding with ``rho = 9`` instead; we follow the newer
+#: paper. ``rho`` is exposed as a trainable parameter (see
+#: ``docking_score_elec(..., sc_rho=...)``) initialised at the published value.
+SC_RHO = 3.5
+
+#: Chen et al. 2003 p.81: "ACE scores can be positive (unfavorable) or negative
+#: (favorable)". The pair table (:func:`zdock.atomtypes.iface_ij`, range
+#: -1.938..1.884) follows that convention, whereas the SC term above is written
+#: so that a clash *lowers* the score — i.e. the two terms disagree about which
+#: direction is better. The paper resolves exactly this ("To make these two
+#: scores compatible, we flip the signs of the PSC scores"); we flip the pair
+#: term instead so that the whole score stays "higher is better" and the FFT
+#: search's ``topk`` remains correct.
+IFACE_SIGN = -1.0
+
+#: The favourable atom-pair term now lives in ``S_PSC`` itself (Chen & Weng 2003
+#: Eq. (3)-(4), ``Re[R_PSC]*Re[L_PSC]``), so the pair table must NOT carry a
+#: second copy of it. Kept at 0 and exposed only so the double-counting variant
+#: can be reproduced.
+IFACE_PAIR_OFFSET = 0.0
+
+#: Grid spacing (Å) the ZDOCK coefficients were derived at — "A grid spacing of
+#: 1.2 Å is used throughout this study" (Chen & Weng 2003, Methods).
+SC_REFERENCE_SPACING = 1.2
+
+
+def sc_cell_volume_factor(x_grid, y_grid, z_grid,
+                          reference_spacing: float | None) -> float:
+    """Rescale a per-cell-counted quantity to a spacing-invariant one.
+
+    ``S_PSC``'s clash channel counts overlapping grid cells, so for a fixed
+    physical overlap it grows like ``1/(dx*dy*dz)``. Multiplying by
+    ``(dx*dy*dz)/reference_spacing**3`` removes that and is the identity at the
+    paper's 1.2 Å. Pass ``None`` to disable.
+    """
+    if reference_spacing is None:
+        return 1.0
+    dx = float(x_grid[1] - x_grid[0])
+    dy = float(y_grid[1] - y_grid[0])
+    dz = float(z_grid[1] - z_grid[0])
+    return (dx * dy * dz) / (reference_spacing ** 3)
+
+
+#: Chen & Weng 2003, "Optimizing PSC": the favourable component counts receptor
+#: atoms within ``D + receptor atom radius`` of each open-space grid point.
+#: "The parameters in the penalty term (-9 and -81) have been taken directly
+#: from our earlier GSC formulation. Thus, the only adjustable parameter in the
+#: PSC scoring function is the distance cutoff D." -> "We have chosen D = 3.6 Å
+#: as the default value for subsequent PSC calculations."
+PSC_D = 3.6
+
+
+def sc_encode(shell: torch.Tensor, core: torch.Tensor, *, rho=SC_RHO):
+    """Imaginary (clash) channel of Chen & Weng 2003 Eq. (3).
+
+    ``Im[R_PSC] = Im[L_PSC] = rho`` on the solvent-*excluding* surface (cells
+    covered by a surface atom), ``rho**2`` in the protein core, ``0`` in open
+    space — with core taking precedence. Overlapping these gives the published
+    penalties ``-rho**2`` / ``-rho**3`` / ``-rho**4`` for surface-surface /
+    surface-core / core-core once ``-Im[R]*Im[L]`` is taken in Eq. (4).
+
+    Note PSC, unlike GSC, has **no** "solvent accessible surface layer": "any
+    grid point that does not correspond to an atom is in the open space".
+    """
+    core_b = core > 0
+    shell_b = (shell > 0) & ~core_b
+    rho_t = rho if torch.is_tensor(rho) else torch.as_tensor(
+        rho, dtype=shell.dtype, device=shell.device)
+    return shell_b.to(shell.dtype) * rho_t + core_b.to(shell.dtype) * rho_t.pow(2)
+
+
+def sc_open_boundary_to_surface(re: torch.Tensor, im: torch.Tensor):
+    """Chen & Weng 2002, ``L_SC`` step 3: "if a grid point is assigned ``rho*i``
+    and any two of its nearest neighboring grid points have value 0, it is
+    changed to 1".
+
+    This converts the outermost shell of the ligand's core into surface cells,
+    so a ligand whose interface is formed by buried atoms can still make a
+    rewarding surface–surface contact. Works on ``(..., nx, ny, nz)``.
+    """
+    unoccupied = ((re <= 0) & (im <= 0)).to(re.dtype)
+    n_zero = torch.zeros_like(unoccupied)
+    for dim in (-3, -2, -1):
+        n_zero = (n_zero + torch.roll(unoccupied, 1, dims=dim)
+                  + torch.roll(unoccupied, -1, dims=dim))
+    flip = (im > 0) & (n_zero >= 2)
+    return (torch.where(flip, torch.ones_like(re), re),
+            torch.where(flip, torch.zeros_like(im), im))
+
+
+def _sc_indicator(shape, xyz, rcut, x_grid, y_grid, z_grid):
+    """Indicator grid of "within ``rcut[atom]`` of some atom"."""
+    from .spread import spread_neighbors_add
+
+    grid = torch.zeros(shape, device=xyz.device, dtype=x_grid.dtype)
+    if xyz.shape[0]:
+        spread_neighbors_add(
+            grid, xyz, torch.ones(xyz.shape[0], device=xyz.device, dtype=x_grid.dtype),
+            rcut, x_grid, y_grid, z_grid,
+        )
+    return grid
+
+
+def psc_grids(
     xyz: torch.Tensor,
     radius: torch.Tensor,
     id_surface: torch.Tensor,
     x_grid, y_grid, z_grid,
     *,
     receptor: bool,
-) -> torch.Tensor:
-    from .spread import spread_neighbors_substitute
+    rho=SC_RHO,
+    psc_d: float = PSC_D,
+):
+    """``(Re, Im)`` of Chen & Weng 2003 Eq. (3) for one molecule.
 
-    grid.zero_()
-    surf = id_surface
-    core = ~id_surface
+    ``Im`` is the clash channel (see :func:`sc_encode`). ``Re`` differs between
+    the two partners and is what supplies PSC's *favourable* component:
 
-    weight_s = torch.ones_like(radius[surf])
-    weight_c = torch.ones_like(radius[core])
+    * receptor — ``Re[R_PSC]`` is "the number of receptor atoms within
+      ``(D + receptor atom radius)``" of the grid point, and is non-zero **only
+      in open space**;
+    * ligand — ``Re[L_PSC]`` is "1 if this grid is the nearest grid of a ligand
+      atom". We accumulate the count instead of clamping to 1 so that two
+      ligand atoms sharing a cell still contribute two pairs; at the paper's
+      1.2 Å spacing the two are almost always identical.
 
-    if surf.any():
-        if receptor:
-            spread_neighbors_substitute(
-                grid, xyz[surf], weight_s, radius[surf] + 3.4, x_grid, y_grid, z_grid
-            )
-        spread_neighbors_substitute(
-            grid, xyz[surf], weight_s,
-            radius[surf] * math.sqrt(0.8) if receptor else radius[surf],
-            x_grid, y_grid, z_grid,
-        )
-    if core.any():
-        spread_neighbors_substitute(
-            grid, xyz[core], weight_c, radius[core] * math.sqrt(1.5), x_grid, y_grid, z_grid
-        )
-    return grid
+    Eq. (4) then reads ``Re[R.L] = Re[R]Re[L] - Im[R]Im[L]``: the first product
+    is the total number of receptor-ligand atom pairs within the cutoff, the
+    second is the clash penalty, "with a higher score indicating better shape
+    complementarity".
+    """
+    shape = (x_grid.numel(), y_grid.numel(), z_grid.numel())
+    surf, core = id_surface, ~id_surface
+    surf_ind = _sc_indicator(shape, xyz[surf], radius[surf], x_grid, y_grid, z_grid)
+    core_ind = _sc_indicator(shape, xyz[core], radius[core], x_grid, y_grid, z_grid)
+    im = sc_encode(surf_ind, core_ind, rho=rho)
 
-
-def _assign_sc_minus(
-    grid: torch.Tensor,
-    xyz: torch.Tensor,
-    radius: torch.Tensor,
-    id_surface: torch.Tensor,
-    x_grid, y_grid, z_grid,
-    *,
-    receptor: bool,
-) -> torch.Tensor:
-    from .spread import spread_neighbors_substitute
-
-    grid.zero_()
-    surf = id_surface
-    core = ~id_surface
-
-    if surf.any():
-        if receptor:
-            weight_s_1 = torch.full_like(radius[surf], 3.5)
-            spread_neighbors_substitute(
-                grid, xyz[surf], weight_s_1, radius[surf] + 3.4, x_grid, y_grid, z_grid
-            )
-        weight_s_2 = torch.full_like(radius[surf], 12.25)
-        spread_neighbors_substitute(
-            grid, xyz[surf], weight_s_2,
-            radius[surf] * math.sqrt(0.8) if receptor else radius[surf],
-            x_grid, y_grid, z_grid,
-        )
-
-    if core.any():
-        weight_c = torch.full_like(radius[core], 12.25)
-        spread_neighbors_substitute(
-            grid, xyz[core], weight_c, radius[core] * math.sqrt(1.5), x_grid, y_grid, z_grid
-        )
-    return grid
-
-
-# ---------------------------------------------------------------------------
-# Main entry point: docking_score_elec.
-# ---------------------------------------------------------------------------
+    if receptor:
+        counts = _sc_indicator(shape, xyz, radius + psc_d, x_grid, y_grid, z_grid)
+        re = counts * (im <= 0).to(counts.dtype)          # open space only
+    else:
+        from .spread import spread_nearest_add
+        re = torch.zeros(shape, device=xyz.device, dtype=x_grid.dtype)
+        spread_nearest_add(
+            re, xyz, torch.ones(xyz.shape[0], device=xyz.device, dtype=x_grid.dtype),
+            x_grid, y_grid, z_grid)
+    return re, im
 
 
 def _score_ligand_chunk(
@@ -321,6 +405,9 @@ def _score_ligand_chunk(
     surface_threshold: float,
     elec_mode: ElecMode,
     scatter_mode: str = "nearest",
+    sc_reference_spacing: float | None = SC_REFERENCE_SPACING,
+    sc_rho=SC_RHO,
+    psc_d: float = PSC_D,
     return_components: bool = False,
 ):
     """Per-frame total scores for a single ligand frame-chunk, re-using
@@ -375,44 +462,37 @@ def _score_ligand_chunk(
 
     surf_mask_flat = lig_surf_flat
     core_mask_flat = ~lig_surf_flat
-
-    lig_sc_real = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
     surf_idx = surf_mask_flat.nonzero(as_tuple=True)[0]
-    if surf_idx.numel() > 0:
-        layer1 = sc_union(
-            lxyz_flat[surf_idx],
-            frame_idx_per_atom[surf_idx], lig_radius_flat[surf_idx],
-            (F, nx, ny, nz),
-        )
-        lig_sc_real = torch.maximum(lig_sc_real, layer1)
     core_idx = core_mask_flat.nonzero(as_tuple=True)[0]
-    if core_idx.numel() > 0:
-        layer2 = sc_union(
-            lxyz_flat[core_idx],
-            frame_idx_per_atom[core_idx], lig_radius_flat[core_idx] * math.sqrt(1.5),
-            (F, nx, ny, nz),
-        )
-        lig_sc_real = torch.maximum(lig_sc_real, layer2)
 
-    lig_sc_imag = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
-    if surf_idx.numel() > 0:
-        lay1 = sc_union(
-            lxyz_flat[surf_idx],
-            frame_idx_per_atom[surf_idx], lig_radius_flat[surf_idx],
-            (F, nx, ny, nz),
-        )
-        lig_sc_imag = torch.where(lay1 > 0, lay1 * 3.5, lig_sc_imag)
-    if core_idx.numel() > 0:
-        lay2 = sc_union(
-            lxyz_flat[core_idx],
-            frame_idx_per_atom[core_idx], lig_radius_flat[core_idx] * math.sqrt(1.5),
-            (F, nx, ny, nz),
-        )
-        lig_sc_imag = torch.where(lay2 > 0, lay2 * 12.25, lig_sc_imag)
+    # Eq. (1) L_SC: core -> rho*i, then surface atoms overwrite with 1, then the
+    # core's open boundary is converted to surface. Real and imaginary parts are
+    # mutually exclusive, which is what makes a surface-surface contact score +1
+    # instead of a penalty.
+    zeros_g = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
+    surf_ind = (sc_union(lxyz_flat[surf_idx], frame_idx_per_atom[surf_idx],
+                         lig_radius_flat[surf_idx], (F, nx, ny, nz))
+                if surf_idx.numel() > 0 else zeros_g)
+    core_ind = (sc_union(lxyz_flat[core_idx], frame_idx_per_atom[core_idx],
+                         lig_radius_flat[core_idx] * math.sqrt(1.5),
+                         (F, nx, ny, nz))
+                if core_idx.numel() > 0 else zeros_g)
+    lig_sc_imag = sc_encode(surf_ind, core_ind, rho=sc_rho)
+    # Re[L_PSC]: one count at each ligand atom's nearest grid point (Eq. (3)).
+    lig_sc_real = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
+    _grouped_spread_nearest_add(
+        lig_sc_real, lxyz_flat, frame_idx_per_atom,
+        torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
+        x_grid, y_grid, z_grid)
 
-    multi_real = rec_sc_real.unsqueeze(0) * lig_sc_real - rec_sc_imag.unsqueeze(0) * lig_sc_imag
-    multi_imag = rec_sc_real.unsqueeze(0) * lig_sc_imag + rec_sc_imag.unsqueeze(0) * lig_sc_real
-    score_sc = multi_real.reshape(F, -1).sum(-1) - multi_imag.reshape(F, -1).sum(-1)
+    multi_real = (rec_sc_real.unsqueeze(0) * lig_sc_real
+                  - rec_sc_imag.unsqueeze(0) * lig_sc_imag)
+    # Chen & Weng 2003 Eq. (4): S_PSC = Re[R_PSC . L_PSC]
+    #   = Re[R]Re[L] (favourable atom-pair count) - Im[R]Im[L] (clash penalty),
+    # "with a higher score indicating better shape complementarity".
+    score_sc = multi_real.reshape(F, -1).sum(-1)
+    score_sc = score_sc * sc_cell_volume_factor(x_grid, y_grid, z_grid,
+                                                sc_reference_spacing)
 
     L_count = torch.zeros((F * 12, nx, ny, nz), device=device, dtype=dtype)
     group_f12 = frame_idx_per_atom * 12 + lig_group_iface_flat
@@ -490,13 +570,16 @@ def docking_score_elec(
     charge_score: torch.Tensor,         # (11,)
     *,
     lig_xyz_for_grid: torch.Tensor | None = None,  # (N_lig, 3) post-orient
-    spacing: float = 3.0,
+    spacing: float = SC_REFERENCE_SPACING,
     rcut_iface: float = 6.0,
     rcut_elec: float = 8.0,
     surface_threshold: float = 1.0,
     elec_mode: ElecMode = "coulomb",
     frame_chunk_size: int | None = None,
     scatter_mode: str = "nearest",
+    sc_reference_spacing: float | None = SC_REFERENCE_SPACING,
+    sc_rho=SC_RHO,
+    psc_d: float = PSC_D,
     return_components: bool = False,
 ):
     """Return a (F,) tensor of docking scores.
@@ -547,7 +630,10 @@ def docking_score_elec(
     # Reshape iface_ij_flat (column-major 12×12) → (12, 12) matrix where
     # M[i, j] = iface_ij_flat[12*j + i]. Julia's k = 12*(j-1)+i maps to
     # Python index 12*j+i after 1-based → 0-based. The fortran-order view:
-    iface_matrix = iface_ij_flat.view(12, 12).T  # (12, 12), M[i, j]
+    # IFACE_SIGN reconciles the pair table's "favourable = negative" convention
+    # with the clash-penalty sign of S_SC (Chen et al. 2003, p.81).
+    iface_matrix = (IFACE_PAIR_OFFSET
+                    + IFACE_SIGN * iface_ij_flat.view(12, 12).T)  # (12, 12)
 
     # Julia's generate_grid applies `orient!` (PCA rotation) to the
     # ligand internally before computing grid bounds. We compute the same
@@ -569,12 +655,9 @@ def docking_score_elec(
 
     # Precompute receptor SC slabs (real + imag parts of SC filter).
     rec_surf = rec_sasa > surface_threshold
-    rec_sc_real = torch.zeros_like(grid_real)
-    rec_sc_imag = torch.zeros_like(grid_imag)
-    _assign_sc_plus(rec_sc_real, rec_xyz, rec_radius, rec_surf,
-                    x_grid, y_grid, z_grid, receptor=True)
-    _assign_sc_minus(rec_sc_imag, rec_xyz, rec_radius, rec_surf,
-                     x_grid, y_grid, z_grid, receptor=True)
+    rec_sc_real, rec_sc_imag = psc_grids(
+        rec_xyz, rec_radius, rec_surf, x_grid, y_grid, z_grid, receptor=True,
+        rho=sc_rho, psc_d=psc_d)
 
     # Precompute receptor IFACE contribution slabs H[j] for j in 1..12.
     # H[j] = Σ_atoms_of_type_j (within rcut=6 of cell) indicator. Weight 1.
@@ -638,7 +721,8 @@ def docking_score_elec(
         lig_atomtype_id=lig_atomtype_id, lig_charge_id=lig_charge_id,
         x_grid=x_grid, y_grid=y_grid, z_grid=z_grid,
         surface_threshold=surface_threshold, elec_mode=elec_mode,
-        scatter_mode=scatter_mode,
+        scatter_mode=scatter_mode, sc_reference_spacing=sc_reference_spacing,
+        sc_rho=sc_rho, psc_d=psc_d,
     )
     use_chunks = (
         frame_chunk_size is not None

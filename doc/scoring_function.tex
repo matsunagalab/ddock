@@ -1,0 +1,379 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,
+            citecolor=blue!50!black}
+
+\newcommand{\doi}[1]{\href{https://doi.org/#1}{doi:#1}}
+\newcommand{\localfile}[1]{\\ \hspace*{1em}\texttt{#1}}
+\newcommand{\Rgrid}{R}
+\newcommand{\Lgrid}{L}
+\newcommand{\Spsc}{S_{\mathrm{PSC}}}
+\newcommand{\Siface}{S_{\mathrm{IFACE}}}
+\newcommand{\Selec}{S_{\mathrm{ELEC}}}
+
+\title{The docking score implemented in this repository}
+\author{Differentiable ZDOCK --- \texttt{src/zdock}}
+\date{2026-07-25}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note states, in closed form, the scoring function evaluated by
+\texttt{zdock.score.docking\_score\_elec} and maximised by
+\texttt{zdock.search.docking\_search}, and maps every symbol onto the primary
+literature: the pairwise shape-complementarity term of Chen \& Weng
+(2003)~\cite{ChenWeng2003psc}, the interface atomic-contact-energy pair
+potential of Mintseris \emph{et~al.}\ (2007)~\cite{Mintseris2007}, and the
+combination with electrostatics of Chen \emph{et~al.}\
+(2003)~\cite{Chen2003zdock}, with the earlier grid-based formulation of Chen
+\& Weng (2002)~\cite{ChenWeng2002} given only where it explains a symbol that
+survives in the code. It also records where the implementation deviates from
+the papers, and why.
+\end{abstract}
+
+\section{Total score}
+
+Let $R$ denote the receptor (held fixed at the origin) and $L$ the ligand,
+placed by a rigid transform $(q,\mathbf{t})$: a rotation $q$ drawn from a
+finite quaternion set, followed by a translation $\mathbf{t}$ on the FFT
+lattice. All three terms are evaluated by scattering atoms onto a Cartesian
+grid of spacing $h$ and contracting grid functions, so that the translational
+scan is a single FFT correlation per rotation --- the construction of
+Katchalski-Katzir \emph{et~al.}~\cite{Katchalski1992}, used by every ZDOCK
+version~\cite{ChenWeng2002,ChenWeng2003psc,Chen2003zdock}. The total is
+
+\begin{equation}
+  S(q,\mathbf{t}) \;=\; \alpha\,\Spsc(q,\mathbf{t})
+  \;+\; \Siface(q,\mathbf{t})
+  \;+\; \beta\,\Selec(q,\mathbf{t}),
+  \label{eq:total}
+\end{equation}
+
+and \textbf{higher is better}: \texttt{docking\_search} returns the top-$N$
+poses by $S$. Section~\ref{sec:signs} explains why keeping all three terms in a
+``higher is better'' convention requires an explicit sign flip on $\Siface$.
+
+\paragraph{Grid.}
+$h = 1.2$~\AA{} throughout, the value used by every ZDOCK paper
+(``A grid spacing of 1.2~\AA{} is used throughout this
+study''~\cite{ChenWeng2003psc}). An atom is a \emph{surface} atom if its
+solvent-accessible area, computed with a 1.4~\AA{} water probe, exceeds
+1~\AA$^2$; otherwise it is a \emph{core} atom (\cite{ChenWeng2003psc},
+Methods; same definition in~\cite{ChenWeng2002}).
+
+\section{Shape complementarity: PSC}
+
+\subsection{Grid functions}
+
+Following Chen \& Weng~\cite{ChenWeng2003psc}, Eq.~(3), each molecule is
+described by one complex grid function. Write $\mathcal{S}$ and $\mathcal{C}$
+for the sets of surface and core atoms, $r_j$ for the van der Waals radius of
+atom $j$, and $\mathbf{x}_c$ for the centre of grid cell $c$. Define the
+occupancy sets
+\begin{align}
+  \mathrm{surf}(c) &\iff \exists j\in\mathcal{S}: \lVert \mathbf{x}_c-\mathbf{x}_j\rVert < r_j, \\
+  \mathrm{core}(c) &\iff \exists j\in\mathcal{C}: \lVert \mathbf{x}_c-\mathbf{x}_j\rVert < r_j,
+\end{align}
+with $\mathrm{core}$ taking precedence, and let
+$\mathrm{open}(c)\iff \neg\,\mathrm{surf}(c)\wedge\neg\,\mathrm{core}(c)$.
+Note that PSC, unlike the earlier GSC, defines \emph{no} solvent-accessible
+surface layer: ``any grid point that does not correspond to an atom is in the
+open space''~\cite{ChenWeng2003psc}.
+
+The imaginary channel is the same for both partners and encodes the clash
+penalty,
+\begin{equation}
+  \operatorname{Im}[\Rgrid_{\mathrm{PSC}}(c)]
+  = \operatorname{Im}[\Lgrid_{\mathrm{PSC}}(c)]
+  = \begin{cases}
+      \rho   & \mathrm{surf}(c)\\
+      \rho^2 & \mathrm{core}(c)\\
+      0      & \mathrm{open}(c),
+    \end{cases}
+  \label{eq:psc-im}
+\end{equation}
+while the real channel differs between the two and encodes the favourable
+atom-pair count,
+\begin{align}
+  \operatorname{Re}[\Rgrid_{\mathrm{PSC}}(c)] &=
+    \begin{cases}
+      \bigl|\{\, j \in R : \lVert \mathbf{x}_c-\mathbf{x}_j\rVert < D + r_j \,\}\bigr|
+        & \mathrm{open}(c)\\
+      0 & \text{otherwise,}
+    \end{cases}
+  \label{eq:psc-reR}\\[2pt]
+  \operatorname{Re}[\Lgrid_{\mathrm{PSC}}(c)] &=
+    \bigl|\{\, k \in L : c = \operatorname{nearest}(\mathbf{x}_k) \,\}\bigr|.
+  \label{eq:psc-reL}
+\end{align}
+
+\subsection{Score}
+
+Eq.~(4) of~\cite{ChenWeng2003psc} takes the \emph{real part} of the
+cross-correlation only:
+\begin{equation}
+  \Spsc(\mathbf{t})
+  = \operatorname{Re}\!\Bigl[\textstyle\sum_{c}
+      \Rgrid_{\mathrm{PSC}}(c)\,\Lgrid_{\mathrm{PSC}}(c+\mathbf{t})\Bigr]
+  = \underbrace{\sum_c \operatorname{Re}[\Rgrid]\operatorname{Re}[\Lgrid]}_{\text{favourable}}
+  \;-\; \underbrace{\sum_c \operatorname{Im}[\Rgrid]\operatorname{Im}[\Lgrid]}_{\text{clash penalty}}.
+  \label{eq:psc}
+\end{equation}
+The first sum is exactly the number of receptor--ligand atom pairs within the
+cutoff, because $\operatorname{Re}[\Lgrid]$ places one count at each ligand
+atom and $\operatorname{Re}[\Rgrid]$ reports how many receptor atoms lie within
+$D+r_j$ of that point. The second sum contributes
+\begin{center}
+\begin{tabular}{lcc}
+  \toprule
+  overlap & value & $\rho=3.5$ \\
+  \midrule
+  surface--surface & $-\rho^2$ & $-12.25$ \\
+  surface--core    & $-\rho^3$ & $-42.88$ \\
+  core--core       & $-\rho^4$ & $-150.06$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+so deeper interpenetration is punished super-linearly, ``with a higher score
+indicating better shape complementarity''~\cite{ChenWeng2003psc}.
+
+\paragraph{Why this term dominates.}
+On clash-free surface-placed decoys the bare pair count
+$\sum_{ij} n_{ij}$ separates near-native from non-native poses with a
+Mann--Whitney AUC of $0.998$, i.e.\ it is by far the strongest single signal in
+the score. Omitting it --- as this port did until the present revision --- makes
+every contact a net penalty and drives the search towards poses that do not
+touch at all.
+
+\section{Desolvation: the IFACE pair potential}
+
+Mintseris \emph{et~al.}~\cite{Mintseris2007} replace ZDOCK's averaged ACE
+desolvation by a pairwise statistical potential over $k=12$ optimised atom
+types. With $n_{ij}$ the number of contacts between receptor atoms of type $i$
+and ligand atoms of type $j$, their Eq.~(11) and Eq.~(14) read
+\begin{equation}
+  e_{ij} = \ln \frac{n_{ij}}{c_{\text{surface-fraction};ij}},
+  \qquad
+  E_{\mathrm{IFACE}} = \sum_{i=1}^{k}\sum_{j=1}^{k} e_{ij}\, n_{ij}.
+  \label{eq:iface}
+\end{equation}
+On the grid (their Eq.~(13)) the receptor side pre-multiplies the potential,
+\begin{equation}
+  W_i(c) = \sum_{j} e_{ij}\, H_j(c),
+  \qquad
+  H_j(c) = \bigl|\{\, m \in R \ \text{of type } j : \lVert \mathbf{x}_c-\mathbf{x}_m\rVert < 6\,\text{\AA} \,\}\bigr|,
+\end{equation}
+the 6~\AA{} contact sphere being the one that defines $n_{ij}$
+in~\cite{Mintseris2007}, Eqs.~(8)--(9),
+and the ligand side is the per-type occupancy indicator of their Eq.~(12),
+$\Lgrid_i(c)\in\{0,1\}$, so that
+\begin{equation}
+  \Siface(\mathbf{t})
+  = \sigma \sum_{i}\sum_{c} W_i(c)\,\Lgrid_i(c+\mathbf{t}),
+  \qquad \sigma = -1 .
+  \label{eq:iface-grid}
+\end{equation}
+
+\section{Electrostatics}
+
+Chen \& Weng~\cite{ChenWeng2002} write the electrostatic energy as a
+correlation between the receptor's electric potential and the ligand's atomic
+charges, using CHARMM19 partial charges, with grid points in the receptor core
+assigned zero potential "to avoid the contributions from non-physical
+receptor-core/ligand contacts"; Chen \emph{et~al.}~\cite{Chen2003zdock},
+Eq.~(2), carry the same term into ZDOCK through the imaginary channel. Here it
+is kept as a separate real correlation:
+\begin{equation}
+  V(c) = \sum_{m \in R} \frac{q_m}{\lVert \mathbf{x}_c-\mathbf{x}_m\rVert}
+  \quad (\lVert\cdot\rVert < 8\,\text{\AA},\ \mathrm{open}(c)),
+  \qquad
+  \Selec(\mathbf{t}) = \sum_c V(c)\, Q_L(c+\mathbf{t}).
+\end{equation}
+
+\section{Sign conventions}
+\label{sec:signs}
+
+The two ingredient papers disagree about which direction is favourable, and
+Chen \emph{et~al.}~\cite{Chen2003zdock} say so explicitly:
+
+\begin{quote}\small
+``positive PSC scores indicate good shape complementarity \ldots{} whereas ACE
+scores can be positive (unfavorable) or negative (favorable) \ldots{} To make
+these two scores compatible, we flip the signs of the PSC scores.''
+\end{quote}
+
+They resolve it by flipping PSC and \emph{minimising}. Because the FFT search
+here selects poses by \texttt{topk}, this implementation flips the other term
+instead: $\sigma=-1$ in Eq.~\eqref{eq:iface-grid} turns the ACE-convention pair
+potential into a ``higher is better'' quantity, and every term in
+Eq.~\eqref{eq:total} then agrees with $\Spsc$. Omitting this flip makes
+$\Siface$ anti-correlated with pose quality (measured AUC $0.127$; the negated
+term gives $0.873$), and since $\lvert\Siface\rvert \approx \lvert\Spsc\rvert$
+it then dominates the total.
+
+\section{Parameters}
+
+\begin{center}
+\begin{tabular}{llll}
+  \toprule
+  symbol & meaning & initial value & source \\
+  \midrule
+  $h$        & grid spacing              & $1.2$~\AA  & \cite{ChenWeng2003psc}, Methods \\
+  $D$        & PSC pair cutoff offset    & $3.6$~\AA  & \cite{ChenWeng2003psc}, ``Optimizing PSC'' \\
+  $\rho$     & PSC clash scale           & $3.5$      & \cite{Chen2003zdock}, Eq.~(2) \\
+  $\alpha$   & weight on $\Spsc$         & $1.0$      & see below \\
+  $\beta$    & weight on $\Selec$        & $3.0$      & \cite{Chen2003zdock}, p.~82 \\
+  $e_{ij}$   & $12\times12$ pair potential & IFACE table & \cite{Mintseris2007}, Eq.~(11) \\
+  $q_m$      & partial charges (11 types) & CHARMM19 & \cite{ChenWeng2002}, ``Electrostatics'' \\
+  $\sigma$   & pair-term sign            & $-1$       & \cite{Chen2003zdock}, p.~81 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+$\rho$, $D$, $\alpha$, $\beta$, $e_{ij}$ and $q_m$ are all exposed as
+differentiable tensors, so any of them can be optimised; the values above are
+the initialisation. Note that $\alpha$ has no counterpart in
+Eq.~(2) of~\cite{Chen2003zdock}, where the scale of the PSC term is fixed by
+$\rho$ and the term enters with unit weight; the $\alpha = 0.01$ carried in
+earlier revisions of this code belongs to the \emph{grid}-based
+formulation of~\cite{ChenWeng2002}, Eq.~(6), whose second term is an averaged
+ACE energy on a kcal/mol scale rather than a pair count.
+
+\section{Where each equation comes from}
+
+\begin{center}
+\begin{tabular}{llll}
+  \toprule
+  here & quantity & source & source equation \\
+  \midrule
+  \eqref{eq:total}   & $S = \alpha \Spsc + \Siface + \beta \Selec$
+                     & \cite{Chen2003zdock} & Eq.~(2) \\
+  \eqref{eq:psc-im}  & clash channel $\rho,\rho^2$
+                     & \cite{ChenWeng2003psc} & Eq.~(3), $\operatorname{Im}$ \\
+  \eqref{eq:psc-reR} & receptor pair-count channel
+                     & \cite{ChenWeng2003psc} & Eq.~(3), $\operatorname{Re}[R]$ \\
+  \eqref{eq:psc-reL} & ligand nearest-grid channel
+                     & \cite{ChenWeng2003psc} & Eq.~(3), $\operatorname{Re}[L]$ \\
+  \eqref{eq:psc}     & $\Spsc = \operatorname{Re}[R\cdot L]$
+                     & \cite{ChenWeng2003psc} & Eq.~(4) \\
+  \eqref{eq:iface}   & $e_{ij}$, $E_{\mathrm{IFACE}}$
+                     & \cite{Mintseris2007} & Eqs.~(11), (14) \\
+  \eqref{eq:iface-grid} & grid form of the pair sum
+                     & \cite{Mintseris2007} & Eqs.~(12), (13) \\
+  $\sigma = -1$      & sign reconciliation & \cite{Chen2003zdock} & p.~81 \\
+  $D = 3.6$~\AA      & pair cutoff offset & \cite{ChenWeng2003psc} & ``Optimizing PSC'' \\
+  $\rho = 3.5$       & clash scale & \cite{Chen2003zdock} & Eq.~(2) \\
+  $\beta = 3$        & electrostatics weight & \cite{Chen2003zdock} & p.~82 \\
+  $h = 1.2$~\AA      & grid spacing & \cite{ChenWeng2003psc} & Methods \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+The four ZDOCK papers are in \texttt{ref/} of this repository (file names in
+the bibliography); \cite{Zhang1997ace,Katchalski1992,Basu2016dockq} are cited
+for provenance and are not needed to run the code.
+
+\section{Deviations from the papers}
+
+\begin{enumerate}
+  \item \textbf{Rotational sampling.} ZDOCK uses evenly distributed Euler angle
+    sets --- $1800$ orientations at $\Delta=20^\circ$, $54\,000$ at $6^\circ$,
+    $180\,000$ at $4^\circ$ (\cite{ChenWeng2003psc}, ``Rotational Sampling'').
+    This implementation draws uniform random quaternions, so for the same count
+    the worst-case angular error is larger. Finer is not automatically better:
+    \cite{ChenWeng2003psc} report that ``finer angular intervals tend to rank
+    the best hits lower than coarser angular intervals'', $\Delta=4^\circ$
+    giving the \emph{lowest} success rate for $N_P > 100$.
+  \item \textbf{Ligand occupancy in $\Siface$.} Eq.~(12)
+    of~\cite{Mintseris2007} is a binary indicator (their Eq.~(14) uses
+    ``$\cong$'', acknowledging that the grid form only approximates
+    $\sum_{ij}e_{ij}n_{ij}$), which under-counts when two
+    ligand atoms of the same type share a cell. That is negligible at
+    $h=1.2$~\AA{} (cell volume $1.7$~\AA$^3$) but not at coarser spacings; the
+    quantity is $37\%$ smaller at $h=3.0$~\AA.
+  \item \textbf{Cell-volume normalisation.} The clash channel counts grid
+    cells, so it scales as $h^{-3}$. \texttt{sc\_cell\_volume\_factor}
+    rescales it to the $1.2$~\AA{} reference, making the term
+    spacing-invariant; it is the identity at the default spacing.
+  \item \textbf{DockQ.} Pose quality is scored against~\cite{Basu2016dockq} by
+    an atom-level approximation
+    without residue or backbone metadata, and without symmetry handling, so
+    the $0.23$ acceptance threshold is not identical to canonical CAPRI. Ligand
+    RMSD is reported alongside as a cross-check.
+\end{enumerate}
+
+\section{Measured effect of completing PSC}
+
+Twelve interface-deleaked PINDER complexes, default parameters (no training),
+$1900$ uniform rotations, $h=1.2$~\AA, top-$2000$ search output, nothing
+injected into the candidate set. ``Ceiling'' is the DockQ of the best sampled
+rotation at the lattice-snapped native translation --- a parameter-free upper
+bound on what the search could return; it is $\ge 0.23$ for $100\%$ of these
+complexes throughout.
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+  \toprule
+  score implementation & recall & best DockQ & s@1 & s@10 & s@100 \\
+  \midrule
+  clash penalty only, $h=3.0$~\AA        & $0.0\%$  & $0.107$ & $0\%$  & $0\%$  & $0\%$ \\
+  clash penalty only, $h=1.2$~\AA        & $0.0\%$  & $0.066$ & $0\%$  & $0\%$  & $0\%$ \\
+  \ \ + pair-term sign flip              & $16.7\%$ & $0.116$ & $0\%$  & $0\%$  & $0\%$ \\
+  \textbf{full PSC, Eqs.\ \eqref{eq:psc-reR}--\eqref{eq:psc}}
+                                         & $\mathbf{66.7\%}$ & $\mathbf{0.649}$
+                                         & $\mathbf{17\%}$ & $\mathbf{42\%}$ & $\mathbf{50\%}$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{thebibliography}{9}
+\bibitem{ChenWeng2003psc}
+  R.~Chen and Z.~Weng.
+  \emph{A novel shape complementarity scoring function for protein--protein
+  docking.}
+  Proteins \textbf{51}(3), 397--408 (2003). \doi{10.1002/prot.10334}.
+  \localfile{ref/Chen\_Weng\_2003.pdf}
+\bibitem{Chen2003zdock}
+  R.~Chen, L.~Li and Z.~Weng.
+  \emph{ZDOCK: an initial-stage protein-docking algorithm.}
+  Proteins \textbf{52}(1), 80--87 (2003). \doi{10.1002/prot.10389}.
+  \localfile{ref/Chen\_et\_al\_2003.pdf}
+\bibitem{Mintseris2007}
+  J.~Mintseris, B.~Pierce, K.~Wiehe, R.~Anderson, R.~Chen and Z.~Weng.
+  \emph{Integrating statistical pair potentials into protein complex
+  prediction.}
+  Proteins \textbf{69}(3), 511--520 (2007). \doi{10.1002/prot.21502}.
+  \localfile{ref/Mintseris\_et\_al\_2007.pdf}
+\bibitem{ChenWeng2002}
+  R.~Chen and Z.~Weng.
+  \emph{Docking unbound proteins using shape complementarity, desolvation, and
+  electrostatics.}
+  Proteins \textbf{47}(3), 281--294 (2002). \doi{10.1002/prot.10092}.
+  \localfile{ref/Chen\_Weng\_2002.pdf}
+\bibitem{Zhang1997ace}
+  C.~Zhang, S.~Vasmatzis, J.~L.~Cornette and C.~DeLisi.
+  \emph{Determination of atomic desolvation energies from the structures of
+  crystallized proteins.}
+  J.\ Mol.\ Biol.\ \textbf{267}(3), 707--726 (1997).
+  \doi{10.1006/jmbi.1997.0859}.
+\bibitem{Katchalski1992}
+  E.~Katchalski-Katzir, I.~Shariv, M.~Eisenstein, A.~A.~Friesem, C.~Aflalo and
+  I.~A.~Vakser.
+  \emph{Molecular surface recognition: determination of geometric fit between
+  proteins and their ligands by correlation techniques.}
+  Proc.\ Natl.\ Acad.\ Sci.\ USA \textbf{89}(6), 2195--2199 (1992).
+  \doi{10.1073/pnas.89.6.2195}.
+\bibitem{Basu2016dockq}
+  S.~Basu and B.~Wallner.
+  \emph{DockQ: a quality measure for protein--protein docking models.}
+  PLoS ONE \textbf{11}(8), e0161879 (2016).
+  \doi{10.1371/journal.pone.0161879}.
+\end{thebibliography}
+
+\end{document}

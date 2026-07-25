@@ -37,3 +37,6 @@ data/
 external/
 logs/
 *.h5
+
+# Literature PDFs (publisher copies — not redistributable)
+ref/

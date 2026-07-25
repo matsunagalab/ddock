@@ -38,11 +38,17 @@ import math
 from .atomtypes import iface_ij, partial_charge_per_atom
 from .geom import decenter, generate_grid, orient
 from .score import (
-    _assign_sc_plus,
-    _assign_sc_minus,
+    IFACE_PAIR_OFFSET,
+    IFACE_SIGN,
+    SC_REFERENCE_SPACING,
+    SC_RHO,
     _grouped_spread_nearest_add,
     _grouped_spread_neighbors_add,
+    psc_grids,
     docking_score_elec,
+    PSC_D,
+    sc_cell_volume_factor,
+    sc_encode,
 )
 from .spread import spread_neighbors_coulomb
 
@@ -113,19 +119,16 @@ def _build_receptor_sc_grids(
     z_grid: torch.Tensor,
     *,
     surface_threshold: float = 1.0,
+    sc_rho=SC_RHO,
+    psc_d: float = PSC_D,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scatter receptor atoms into the SC real/imag grids."""
+    """Receptor ``R_PSC`` grids, Chen & Weng 2003 Eq. (3)."""
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
     device = rec_xyz.device
     dtype = rec_xyz.dtype
-    R_real = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
-    R_imag = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
     rec_surf = rec_sasa > surface_threshold
-    _assign_sc_plus(R_real, rec_xyz, rec_radius, rec_surf,
-                    x_grid, y_grid, z_grid, receptor=True)
-    _assign_sc_minus(R_imag, rec_xyz, rec_radius, rec_surf,
-                     x_grid, y_grid, z_grid, receptor=True)
-    return R_real, R_imag
+    return psc_grids(rec_xyz, rec_radius, rec_surf, x_grid, y_grid, z_grid,
+                     receptor=True, rho=sc_rho, psc_d=psc_d)
 
 
 def _build_ligand_sc_grid_single(
@@ -135,20 +138,15 @@ def _build_ligand_sc_grid_single(
     x_grid: torch.Tensor,
     y_grid: torch.Tensor,
     z_grid: torch.Tensor,
+    *,
+    sc_rho=SC_RHO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Replicate `docking_score_elec`'s ligand SC construction exactly
-    (score.py lines 281–313). Produces the real and imag SC grids for
-    one ligand pose. Key differences from `_assign_sc_minus(receptor=False)`:
+    """Ligand ``L_SC`` for a single pose, Chen & Weng 2002 Eq. (1).
 
-        * Surface atoms contribute 1.0 to the real grid and 3.5 to the
-          imag grid (not 12.25).
-        * Core atoms contribute 1.0 to real and 12.25 to imag.
-        * Core overwrites surface in imag (core takes precedence where
-          both cover a cell).
-        * Layer boundaries come from (cnt > 0) indicator unions, not
-          substitute writes.
-
-    Matching this exactly is required for Phase 1 V-SC parity against
+    Mirrors the batched construction in `docking_score_elec` /
+    `_build_ligand_sc_grids_vectorised`: real and imaginary parts are mutually
+    exclusive (surface overwrites core), then the core's open boundary becomes
+    surface. Matching this exactly is required for Phase 1 V-SC parity against
     `docking_score_elec`.
     """
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
@@ -168,30 +166,21 @@ def _build_ligand_sc_grid_single(
         )
         return (cnt[0] > 0).to(dtype)
 
-    L_real = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
-    L_imag = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
-
+    zeros_g = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
     surf_idx = lig_surf.nonzero(as_tuple=True)[0]
     core_idx = core.nonzero(as_tuple=True)[0]
 
-    if surf_idx.numel() > 0:
-        lay1 = sc_union(lig_xyz[surf_idx], lig_radius[surf_idx])
-        L_real = torch.maximum(L_real, lay1)
-    if core_idx.numel() > 0:
-        lay2 = sc_union(
-            lig_xyz[core_idx], lig_radius[core_idx] * math.sqrt(1.5),
-        )
-        L_real = torch.maximum(L_real, lay2)
+    surf_ind = (sc_union(lig_xyz[surf_idx], lig_radius[surf_idx])
+                if surf_idx.numel() > 0 else zeros_g)
+    core_ind = (sc_union(lig_xyz[core_idx], lig_radius[core_idx] * math.sqrt(1.5))
+                if core_idx.numel() > 0 else zeros_g)
 
-    if surf_idx.numel() > 0:
-        lay1 = sc_union(lig_xyz[surf_idx], lig_radius[surf_idx])
-        L_imag = torch.where(lay1 > 0, lay1 * 3.5, L_imag)
-    if core_idx.numel() > 0:
-        lay2 = sc_union(
-            lig_xyz[core_idx], lig_radius[core_idx] * math.sqrt(1.5),
-        )
-        L_imag = torch.where(lay2 > 0, lay2 * 12.25, L_imag)
-
+    L_imag = sc_encode(surf_ind, core_ind, rho=sc_rho)
+    L_real = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
+    from .spread import spread_nearest_add
+    spread_nearest_add(L_real, lig_xyz,
+                       torch.ones(lig_xyz.shape[0], device=device, dtype=dtype),
+                       x_grid, y_grid, z_grid)
     return L_real, L_imag
 
 
@@ -245,6 +234,8 @@ def _build_ligand_sc_grids_vectorised(
     x_grid: torch.Tensor,
     y_grid: torch.Tensor,
     z_grid: torch.Tensor,
+    *,
+    sc_rho=SC_RHO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Vectorised SC grid construction across a rotation batch.
 
@@ -283,15 +274,14 @@ def _build_ligand_sc_grids_vectorised(
     surf_layer = sc_union(surf_flat, 1.0)
     core_layer = sc_union(core_flat, math.sqrt(1.5))
 
-    L_real = torch.maximum(surf_layer, core_layer)
-    # L_imag: core (12.25) overwrites surface (3.5) where both are set
-    # — replicates the `torch.where(lay2 > 0, ...)` overwrite pattern in
-    # `docking_score_elec`.
-    L_imag = torch.where(
-        surf_layer > 0, surf_layer * 3.5,
-        torch.zeros_like(surf_layer),
-    )
-    L_imag = torch.where(core_layer > 0, core_layer * 12.25, L_imag)
+    # Chen & Weng 2003 Eq. (3): Im = clash channel, Re = one count at each
+    # ligand atom's nearest grid point.
+    L_imag = sc_encode(surf_layer, core_layer, rho=sc_rho)
+    L_real = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+    _grouped_spread_nearest_add(
+        L_real, xyz_flat, frame_idx,
+        torch.ones(xyz_flat.shape[0], device=device, dtype=dtype),
+        x_grid, y_grid, z_grid)
     return L_real, L_imag
 
 
@@ -617,12 +607,15 @@ def docking_search(
     iface_ij_flat: torch.Tensor,    # (144,) — docking_score_elec convention
     beta: torch.Tensor,
     charge_score_lut: torch.Tensor, # (11,) partial charge LUT
-    spacing: float = 3.0,
+    spacing: float = SC_REFERENCE_SPACING,
     surface_threshold: float = 1.0,
     rcut_iface: float = 6.0,
     rcut_elec: float = 8.0,
     ntop: int = 2000,
     rot_chunk_size: int = 16,
+    sc_reference_spacing: float | None = SC_REFERENCE_SPACING,
+    sc_rho=SC_RHO,
+    psc_d: float = PSC_D,
 ) -> DockingResultSC:
     """Full-score FFT docking search matching ``docking_score_elec``.
 
@@ -655,11 +648,12 @@ def docking_search(
     )
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
     V = nx * ny * nz
+    sc_factor = sc_cell_volume_factor(x_grid, y_grid, z_grid, sc_reference_spacing)
 
     # Receptor SC complex grid (+ FFT) — also needed for ELEC core mask.
     R_real, R_imag = _build_receptor_sc_grids(
         rec_xyz, rec_radius, rec_sasa, x_grid, y_grid, z_grid,
-        surface_threshold=surface_threshold,
+        sc_rho=sc_rho, psc_d=psc_d, surface_threshold=surface_threshold,
     )
     complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
     Z_R = (R_real + 1j * R_imag).to(complex_dtype)
@@ -667,7 +661,9 @@ def docking_search(
 
     # Receptor IFACE (12 W_i grids, pre-weighted by iface_matrix).
     # iface_ij_flat → (12,12) matching docking_score_elec line 413.
-    iface_matrix = iface_ij_flat.view(12, 12).T
+    # Same sign reconciliation as docking_score_elec (Chen et al. 2003 p.81).
+    iface_matrix = (IFACE_PAIR_OFFSET
+                    + IFACE_SIGN * iface_ij_flat.view(12, 12).T)
     W = _build_receptor_iface_weighted_grids(
         rec_xyz, rec_atomtype_id, iface_matrix, x_grid, y_grid, z_grid,
         rcut_iface=rcut_iface,
@@ -702,6 +698,7 @@ def docking_search(
         # quantity using frame-compound group indices (no per-B loop).
         L_sc_real, L_sc_imag = _build_ligand_sc_grids_vectorised(
             lig_rot, lig_radius, lig_surf, x_grid, y_grid, z_grid,
+            sc_rho=sc_rho,
         )
         L_iface = _build_ligand_iface_grids_vectorised(
             lig_rot, lig_atomtype_id, x_grid, y_grid, z_grid,
@@ -715,7 +712,8 @@ def docking_search(
         Z_L = (L_sc_real + 1j * L_sc_imag).to(complex_dtype)
         F_Z_L = torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj()
         G_sc = torch.fft.ifftn(F_Z_R.unsqueeze(0) * F_Z_L, dim=(-3, -2, -1))
-        score_sc = G_sc.real - G_sc.imag             # (B, nx, ny, nz)
+        # Eq. (4): S_PSC = Re[R_PSC . L_PSC] — real part only.
+        score_sc = G_sc.real                          # (B, nx, ny, nz)
 
         # IFACE: 12 real FFTs, sum in frequency domain, single IFFT.
         F_L_iface = torch.fft.fftn(L_iface, dim=(-3, -2, -1))  # (B, 12, .)
@@ -729,8 +727,11 @@ def docking_search(
             F_V.unsqueeze(0) * F_L_elec.conj(), dim=(-3, -2, -1),
         ).real
 
-        # Combine per docking_score_elec: α SC + IFACE + β ELEC.
-        score_grid = alpha * score_sc + score_iface + beta * score_elec
+        # Combine per docking_score_elec: α SC + IFACE + β ELEC. The SC cell
+        # count is rescaled to a physical overlap volume so the three terms
+        # keep their calibrated relative weights at any grid spacing.
+        score_grid = (alpha * (sc_factor * score_sc) + score_iface
+                      + beta * score_elec)
 
         # Top-k per rotation then merge with buffer.
         score_flat = score_grid.reshape(B, -1)
@@ -869,7 +870,7 @@ def docking_search_sc(
     lig_sasa: torch.Tensor,
     quaternions: torch.Tensor,      # (R, 4)
     *,
-    spacing: float = 3.0,
+    spacing: float = SC_REFERENCE_SPACING,
     surface_threshold: float = 1.0,
     ntop: int = 100,
     rot_chunk_size: int = 16,
@@ -918,7 +919,7 @@ def docking_search_sc(
     # 2. Receptor-side FFT (done once).
     R_real, R_imag = _build_receptor_sc_grids(
         rec_xyz, rec_radius, rec_sasa, x_grid, y_grid, z_grid,
-        surface_threshold=surface_threshold,
+        sc_rho=sc_rho, psc_d=psc_d, surface_threshold=surface_threshold,
     )
     complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
     Z_R = (R_real + 1j * R_imag).to(complex_dtype)
