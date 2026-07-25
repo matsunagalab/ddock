@@ -49,12 +49,13 @@ import torch
 
 from zdock.atomtypes import iface_ij
 from zdock.evaluate import evaluate_ranking
+from zdock.score import iface_score_matrix
 
 KS = (1, 5, 10, 50, 100)
 
 
 def score_from_feats(sc, T, elec, alpha, iface_flat, beta):
-    imat = iface_flat.view(12, 12).T
+    imat = iface_score_matrix(iface_flat)
     return alpha * sc + (imat * T).sum(dim=(-2, -1)) + beta * elec
 
 

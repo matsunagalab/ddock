@@ -20,7 +20,12 @@ import torch
 
 from zdock.atomtypes import charge_score as default_charge_score_lut
 from zdock.geom import generate_grid
-from zdock.score import docking_score_elec
+from zdock.score import (
+    SC_REFERENCE_SPACING,
+    docking_score_elec,
+    iface_score_matrix,
+    sc_cell_volume_factor,
+)
 from zdock.search import (
     _build_ligand_elec_grid_single,
     _build_ligand_iface_grid_single,
@@ -389,9 +394,11 @@ def test_iface_fft_matches_docking_score_elec_synthetic():
     )
     nx, ny, nz = xg.numel(), yg.numel(), zg.numel()
 
+    # docking_score_elec contracts T with iface_score_matrix(), not the raw
+    # table: it applies the ACE/PSC sign reconciliation (Chen et al. 2003 p.81).
     W = _build_receptor_iface_weighted_grids(
-        sys["rec_xyz"], sys["rec_atomtype_id"], iface_matrix, xg, yg, zg,
-        rcut_iface=6.0,
+        sys["rec_xyz"], sys["rec_atomtype_id"], iface_score_matrix(iface_flat),
+        xg, yg, zg, rcut_iface=6.0,
     )
     L = _build_ligand_iface_grid_single(
         sys["lig_xyz"], sys["lig_atomtype_id"], xg, yg, zg,
@@ -532,7 +539,7 @@ def _full_score_grid(rec, lig, alpha, iface_flat, beta, charge_lut,
     R_real, R_imag = _build_receptor_sc_grids(
         rec["xyz"], rec["radius"], rec["sasa"], xg, yg, zg, surface_threshold=1.0,
     )
-    iface_matrix = iface_flat.view(12, 12).T
+    iface_matrix = iface_score_matrix(iface_flat)
     W = _build_receptor_iface_weighted_grids(
         rec["xyz"], rec["atomtype_id"], iface_matrix, xg, yg, zg, rcut_iface=6.0,
     )
@@ -557,7 +564,9 @@ def _full_score_grid(rec, lig, alpha, iface_flat, beta, charge_lut,
         * torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj(),
         dim=(-3, -2, -1),
     )
-    score_sc = G_sc.real - G_sc.imag
+    # Chen & Weng 2003 Eq. (4): real part only, then the same cell-volume
+    # rescaling docking_score_elec applies.
+    score_sc = G_sc.real * sc_cell_volume_factor(xg, yg, zg, SC_REFERENCE_SPACING)
     score_iface = torch.fft.ifftn(
         (torch.fft.fftn(W, dim=(-3, -2, -1))
          * torch.fft.fftn(L_iface, dim=(-3, -2, -1)).conj()).sum(dim=0),
@@ -934,7 +943,8 @@ def test_sc_fft_matches_elec_1kxq(refs_root, sc_only_params):
     F_Z_R = torch.fft.fftn(Z_R, dim=(-3, -2, -1))
     F_Z_L = torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj()
     G = torch.fft.ifftn(F_Z_R * F_Z_L, dim=(-3, -2, -1))
-    score_grid = G.real - G.imag
+    # Chen & Weng 2003 Eq. (4): S_PSC is the real part of the product only.
+    score_grid = G.real
 
     for t in [
         (0.0, 0.0, 0.0),

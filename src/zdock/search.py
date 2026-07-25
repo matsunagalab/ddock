@@ -40,6 +40,7 @@ from .geom import decenter, generate_grid, orient
 from .score import (
     IFACE_PAIR_OFFSET,
     IFACE_SIGN,
+    iface_score_matrix,
     SC_REFERENCE_SPACING,
     SC_RHO,
     _grouped_spread_nearest_add,
@@ -172,7 +173,7 @@ def _build_ligand_sc_grid_single(
 
     surf_ind = (sc_union(lig_xyz[surf_idx], lig_radius[surf_idx])
                 if surf_idx.numel() > 0 else zeros_g)
-    core_ind = (sc_union(lig_xyz[core_idx], lig_radius[core_idx] * math.sqrt(1.5))
+    core_ind = (sc_union(lig_xyz[core_idx], lig_radius[core_idx])
                 if core_idx.numel() > 0 else zeros_g)
 
     L_imag = sc_encode(surf_ind, core_ind, rho=sc_rho)
@@ -272,7 +273,7 @@ def _build_ligand_sc_grids_vectorised(
         return (cnt > 0).to(dtype)
 
     surf_layer = sc_union(surf_flat, 1.0)
-    core_layer = sc_union(core_flat, math.sqrt(1.5))
+    core_layer = sc_union(core_flat, 1.0)   # plain vdW radius (PSC)
 
     # Chen & Weng 2003 Eq. (3): Im = clash channel, Re = one count at each
     # ligand atom's nearest grid point.
@@ -616,6 +617,7 @@ def docking_search(
     sc_reference_spacing: float | None = SC_REFERENCE_SPACING,
     sc_rho=SC_RHO,
     psc_d: float = PSC_D,
+    trans_per_rotation: int = 1,
 ) -> DockingResultSC:
     """Full-score FFT docking search matching ``docking_score_elec``.
 
@@ -662,8 +664,7 @@ def docking_search(
     # Receptor IFACE (12 W_i grids, pre-weighted by iface_matrix).
     # iface_ij_flat → (12,12) matching docking_score_elec line 413.
     # Same sign reconciliation as docking_score_elec (Chen et al. 2003 p.81).
-    iface_matrix = (IFACE_PAIR_OFFSET
-                    + IFACE_SIGN * iface_ij_flat.view(12, 12).T)
+    iface_matrix = iface_score_matrix(iface_ij_flat)
     W = _build_receptor_iface_weighted_grids(
         rec_xyz, rec_atomtype_id, iface_matrix, x_grid, y_grid, z_grid,
         rcut_iface=rcut_iface,
@@ -733,9 +734,17 @@ def docking_search(
         score_grid = (alpha * (sc_factor * score_sc) + score_iface
                       + beta * score_elec)
 
-        # Top-k per rotation then merge with buffer.
+        # Top-k per rotation then merge with buffer. Chen & Weng 2003, Methods:
+        # "Only the best translational orientation is kept for every rotational
+        # orientation. We used to keep the top 10 translational orientations for
+        # each rotation. We subsequently discovered that these 10 translations
+        # are extremely similar, and keeping only the best one helped to remove
+        # false positives without affecting the ranking of the best hit."
+        # This is non-maximum suppression, not a pure top-K over poses, so
+        # success@K under the two conventions is not the same quantity.
         score_flat = score_grid.reshape(B, -1)
-        k_per_rot = min(ntop, score_flat.shape[1])
+        k_per_rot = min(trans_per_rotation if trans_per_rotation > 0 else ntop,
+                        ntop, score_flat.shape[1])
         top_vals, top_idx = torch.topk(score_flat, k=k_per_rot, dim=1)
         cand_scores = top_vals.reshape(-1)
         cand_quat = (
@@ -747,10 +756,19 @@ def docking_search(
         all_scores = torch.cat([buf_scores, cand_scores])
         all_quat = torch.cat([buf_quat, cand_quat])
         all_flat = torch.cat([buf_flat, cand_flat])
-        new_vals, new_idx = torch.topk(all_scores, k=ntop)
-        buf_scores = new_vals
-        buf_quat = all_quat[new_idx]
-        buf_flat = all_flat[new_idx]
+        # Ties are common once only the best translation per rotation is kept
+        # (many rotations can reach the same score), and `topk` resolves them by
+        # position, which depends on `rot_chunk_size`. Break ties on
+        # (quaternion index, flat translation index) so the result is
+        # independent of how the rotations were batched.
+        keep = min(ntop, all_scores.numel())
+        order = torch.argsort(all_flat, stable=True)
+        order = order[torch.argsort(all_quat[order], stable=True)]
+        order = order[torch.argsort(all_scores[order], descending=True,
+                                    stable=True)][:keep]
+        buf_scores = all_scores[order]
+        buf_quat = all_quat[order]
+        buf_flat = all_flat[order]
 
     tz = buf_flat % nz
     ty = (buf_flat // nz) % ny
@@ -874,6 +892,9 @@ def docking_search_sc(
     surface_threshold: float = 1.0,
     ntop: int = 100,
     rot_chunk_size: int = 16,
+    sc_rho=SC_RHO,
+    psc_d: float = PSC_D,
+    sc_reference_spacing: float | None = SC_REFERENCE_SPACING,
 ) -> DockingResultSC:
     """FFT-based SC-only docking search.
 
@@ -915,6 +936,7 @@ def docking_search_sc(
         rec_xyz, lig_xyz_ref, spacing=spacing, device=device, dtype=dtype,
     )
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    sc_factor = sc_cell_volume_factor(x_grid, y_grid, z_grid, sc_reference_spacing)
 
     # 2. Receptor-side FFT (done once).
     R_real, R_imag = _build_receptor_sc_grids(
@@ -953,7 +975,10 @@ def docking_search_sc(
         # `docking_score_elec`'s pointwise SC combination at t=0.
         F_Z_L = torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj()
         G = torch.fft.ifftn(F_Z_R.unsqueeze(0) * F_Z_L, dim=(-3, -2, -1))
-        score_grid = G.real - G.imag           # (B, nx, ny, nz), real dtype
+        # Chen & Weng 2003 Eq. (4) keeps only the real part of the product.
+        # Same cell-volume rescaling as docking_score_elec, so the two paths
+        # agree at any grid spacing.
+        score_grid = sc_factor * G.real         # (B, nx, ny, nz), real dtype
 
         # 5. Per-rotation top-k, merge with running buffer.
         score_flat = score_grid.reshape(B, -1)  # (B, V)
@@ -972,10 +997,19 @@ def docking_search_sc(
         all_scores = torch.cat([buf_scores, cand_scores])
         all_quat = torch.cat([buf_quat, cand_quat])
         all_flat = torch.cat([buf_flat, cand_flat])
-        new_vals, new_idx = torch.topk(all_scores, k=ntop)
-        buf_scores = new_vals
-        buf_quat = all_quat[new_idx]
-        buf_flat = all_flat[new_idx]
+        # Ties are common once only the best translation per rotation is kept
+        # (many rotations can reach the same score), and `topk` resolves them by
+        # position, which depends on `rot_chunk_size`. Break ties on
+        # (quaternion index, flat translation index) so the result is
+        # independent of how the rotations were batched.
+        keep = min(ntop, all_scores.numel())
+        order = torch.argsort(all_flat, stable=True)
+        order = order[torch.argsort(all_quat[order], stable=True)]
+        order = order[torch.argsort(all_scores[order], descending=True,
+                                    stable=True)][:keep]
+        buf_scores = all_scores[order]
+        buf_quat = all_quat[order]
+        buf_flat = all_flat[order]
 
     # 6. Decode flat cell indices to signed cartesian translations.
     V = nx * ny * nz

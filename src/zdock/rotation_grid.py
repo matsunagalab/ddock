@@ -249,3 +249,160 @@ def euler_quaternions(
     if device is not None:
         q = q.to(device)
     return q
+
+
+# ---------------------------------------------------------------------------
+# Uniform incremental SO(3) grid via the Hopf fibration
+# ---------------------------------------------------------------------------
+#
+# ZDOCK does not sample rotations at random: "Evenly distributed Euler angles
+# are used for the rotational search. The Euler angle sets ... have been
+# obtained from Dr. Julie C. Mitchell. An angle set is equivalent to a
+# uniformly distributed set of points on a projective sphere, which ensures
+# that minimal orientations are required to cover the entire rotational space.
+# The angular distance between any orientation and its nearest orientation ...
+# is Delta or smaller" (Chen & Weng 2003, Methods).
+#
+# The published sets are not distributable, so we generate an equivalent grid
+# with the method of Yershova, Jain, LaValle & Mitchell, "Generating Uniform
+# Incremental Grids on SO(3) Using the Hopf Fibration", IJRR 29(7):801-812
+# (2010) — same Mitchell as the ZDOCK acknowledgement. S^3 factors as
+# S^2 x S^1 under the Hopf map, so an even grid on SO(3) is the product of an
+# even grid on the sphere (HEALPix) and an even grid on the circle:
+#
+#     q(theta, phi, psi) = ( cos(theta/2) cos(psi/2),
+#                            cos(theta/2) sin(psi/2),
+#                            sin(theta/2) cos(phi + psi/2),
+#                            sin(theta/2) sin(phi + psi/2) )
+#
+# What matters for docking is the *covering radius* — the largest angle any
+# orientation can be from its nearest grid point — because that is what bounds
+# how far a rigid ligand must be rotated away from its true pose, and hence how
+# much clash penalty the discretisation forces on the correct answer. Use
+# :func:`covering_radius_deg` to measure it.
+
+
+def _healpix_ring_angles(nside: int) -> tuple[np.ndarray, np.ndarray]:
+    """Centres ``(theta, phi)`` of all ``12*nside**2`` HEALPix pixels, RING
+    scheme. Equal-area pixels, so the centres are an even sphere sample."""
+    npix = 12 * nside * nside
+    ipix = np.arange(npix, dtype=np.int64)
+    ncap = 2 * nside * (nside - 1)
+    z = np.empty(npix, dtype=np.float64)
+    phi = np.empty(npix, dtype=np.float64)
+
+    north = ipix < ncap
+    p = ipix[north] + 1
+    i = np.floor(np.sqrt(p / 2.0 - np.sqrt(np.floor(p / 2.0)))).astype(np.int64) + 1
+    j = p - 2 * i * (i - 1)
+    z[north] = 1.0 - (i * i) / (3.0 * nside * nside)
+    phi[north] = (j - 0.5) * (np.pi / 2.0) / i
+
+    south = ipix >= npix - ncap
+    p = npix - ipix[south]
+    i = np.floor(np.sqrt(p / 2.0 - np.sqrt(np.floor(p / 2.0)))).astype(np.int64) + 1
+    j = 4 * i + 1 - (p - 2 * i * (i - 1))
+    z[south] = -1.0 + (i * i) / (3.0 * nside * nside)
+    phi[south] = (j - 0.5) * (np.pi / 2.0) / i
+
+    eq = ~(north | south)
+    ip = ipix[eq] - ncap
+    i = (ip // (4 * nside)) + nside
+    j = (ip % (4 * nside)) + 1
+    fodd = 0.5 * (1 + ((i + nside) % 2))
+    z[eq] = (2 * nside - i) * 2.0 / (3.0 * nside)
+    phi[eq] = (j - fodd) * (np.pi / 2.0) / nside
+
+    return np.arccos(np.clip(z, -1.0, 1.0)), np.mod(phi, 2.0 * np.pi)
+
+
+def hopf_quaternions(
+    nside: int,
+    n_psi: int | None = None,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Full Hopf grid: ``12*nside**2 * n_psi`` quaternions, unordered.
+
+    ``n_psi`` defaults to ``6*nside``, which makes the angular resolution along
+    the fibre match the resolution on the base sphere (Yershova et al. 2010).
+    """
+    if n_psi is None:
+        n_psi = 6 * nside
+    theta, phi = _healpix_ring_angles(nside)
+    psi = (np.arange(n_psi, dtype=np.float64) + 0.5) * (2.0 * np.pi / n_psi)
+
+    th = theta[:, None]
+    ph = phi[:, None]
+    ps = psi[None, :]
+    q = np.stack([
+        np.broadcast_to(np.cos(th / 2), (theta.size, n_psi)) * np.cos(ps / 2),
+        np.broadcast_to(np.cos(th / 2), (theta.size, n_psi)) * np.sin(ps / 2),
+        np.broadcast_to(np.sin(th / 2), (theta.size, n_psi)) * np.cos(ph + ps / 2),
+        np.broadcast_to(np.sin(th / 2), (theta.size, n_psi)) * np.sin(ph + ps / 2),
+    ], axis=-1).reshape(-1, 4)
+    out = torch.as_tensor(q, dtype=dtype)
+    return out.to(device) if device is not None else out
+
+
+def so3_geodesic_deg(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Pairwise SO(3) angle (deg) between quaternion sets ``(N,4)``/``(M,4)``.
+
+    Uses ``2*arccos(|a.b|)``: the absolute value is what makes ``q`` and ``-q``
+    the same rotation, and is why an off-the-shelf Euclidean farthest-point
+    routine cannot be used on raw quaternions.
+    """
+    d = (a @ b.T).abs().clamp(max=1.0)
+    return torch.rad2deg(2.0 * torch.acos(d))
+
+
+def farthest_point_order(
+    quats: torch.Tensor,
+    n: int | None = None,
+    *,
+    start: int = 0,
+    chunk: int = 4096,
+) -> torch.Tensor:
+    """Greedy max-min ordering, so that **every prefix** is a good covering.
+
+    This is what makes the grid *incremental*: taking the first ``n`` entries
+    of the reordered set gives a near-optimal ``n``-point covering, and growing
+    ``n`` never moves the points already chosen.
+    """
+    N = quats.shape[0]
+    n = N if n is None else min(n, N)
+    order = torch.empty(n, dtype=torch.long, device=quats.device)
+    order[0] = start
+    dmin = so3_geodesic_deg(quats, quats[start:start + 1]).squeeze(1)
+    for k in range(1, n):
+        nxt = int(dmin.argmax())
+        order[k] = nxt
+        d = so3_geodesic_deg(quats, quats[nxt:nxt + 1]).squeeze(1)
+        dmin = torch.minimum(dmin, d)
+    return order
+
+
+def covering_radius_deg(
+    quats: torch.Tensor,
+    *,
+    n_probe: int = 20000,
+    seed: int = 0,
+    chunk: int = 512,
+) -> dict:
+    """Measure how far a random orientation can be from the grid.
+
+    Returns the mean / median / 95th percentile / max nearest-grid angle over
+    ``n_probe`` uniformly random orientations. The max estimates the covering
+    radius, i.e. the ``Delta`` that Chen & Weng 2003 quote for their sets.
+    """
+    probe = random_quaternions(n_probe, seed=seed, device=quats.device,
+                               dtype=quats.dtype)
+    best = torch.empty(n_probe, device=quats.device, dtype=quats.dtype)
+    for s in range(0, n_probe, chunk):
+        e = min(s + chunk, n_probe)
+        best[s:e] = so3_geodesic_deg(probe[s:e], quats).min(dim=1).values
+    b = best.double()
+    return {"n_grid": int(quats.shape[0]), "n_probe": n_probe,
+            "mean_deg": float(b.mean()), "median_deg": float(b.median()),
+            "p95_deg": float(b.quantile(0.95)), "max_deg": float(b.max())}

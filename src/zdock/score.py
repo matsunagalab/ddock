@@ -384,6 +384,18 @@ def psc_grids(
     return re, im
 
 
+def iface_score_matrix(iface_ij_flat: torch.Tensor) -> torch.Tensor:
+    """The (12, 12) matrix ``docking_score_elec`` actually contracts ``T`` with.
+
+    Anything that reconstructs a score from cached ``(S_SC, T, S_ELEC)``
+    features must use this, not the raw table: the score applies the ACE/PSC
+    sign reconciliation (:data:`IFACE_SIGN`) and, when enabled, the pair-count
+    offset. Reconstructing with the raw table silently optimises a different
+    objective from the one the FFT search ranks by.
+    """
+    return IFACE_PAIR_OFFSET + IFACE_SIGN * iface_ij_flat.view(12, 12).T
+
+
 def _score_ligand_chunk(
     lig_xyz: torch.Tensor,                     # (F_c, N_lig, 3)
     alpha: torch.Tensor,
@@ -473,9 +485,11 @@ def _score_ligand_chunk(
     surf_ind = (sc_union(lxyz_flat[surf_idx], frame_idx_per_atom[surf_idx],
                          lig_radius_flat[surf_idx], (F, nx, ny, nz))
                 if surf_idx.numel() > 0 else zeros_g)
+    # Plain vdW radii for both partners: Chen & Weng 2003 Fig. 1(b) draws PSC's
+    # occupancy as the atom circles themselves. The sqrt(1.5) / sqrt(0.8)
+    # scalings belong to the older GSC formulation.
     core_ind = (sc_union(lxyz_flat[core_idx], frame_idx_per_atom[core_idx],
-                         lig_radius_flat[core_idx] * math.sqrt(1.5),
-                         (F, nx, ny, nz))
+                         lig_radius_flat[core_idx], (F, nx, ny, nz))
                 if core_idx.numel() > 0 else zeros_g)
     lig_sc_imag = sc_encode(surf_ind, core_ind, rho=sc_rho)
     # Re[L_PSC]: one count at each ligand atom's nearest grid point (Eq. (3)).
@@ -632,8 +646,7 @@ def docking_score_elec(
     # Python index 12*j+i after 1-based → 0-based. The fortran-order view:
     # IFACE_SIGN reconciles the pair table's "favourable = negative" convention
     # with the clash-penalty sign of S_SC (Chen et al. 2003, p.81).
-    iface_matrix = (IFACE_PAIR_OFFSET
-                    + IFACE_SIGN * iface_ij_flat.view(12, 12).T)  # (12, 12)
+    iface_matrix = iface_score_matrix(iface_ij_flat)  # (12, 12), M[i, j]
 
     # Julia's generate_grid applies `orient!` (PCA rotation) to the
     # ligand internally before computing grid bounds. We compute the same

@@ -54,7 +54,12 @@ from zdock.atomtypes import charge_score as default_charge_score  # noqa: E402
 from zdock.atomtypes import iface_ij  # noqa: E402
 from zdock.dockq import dockq_batch, ligand_rmsd_to_native  # noqa: E402
 from zdock.prep_cache import load_prepared  # noqa: E402
-from zdock.rotation_grid import random_quaternions, rotation_cone  # noqa: E402
+from zdock.rotation_grid import (  # noqa: E402
+    covering_radius_deg,
+    hopf_quaternions,
+    random_quaternions,
+    rotation_cone,
+)
 from zdock.search import _rotate_batch, docking_search  # noqa: E402
 
 KS = (1, 5, 10, 50, 100, 500)
@@ -101,6 +106,7 @@ def run_one(prot, quats, spacing, alpha, iface, beta, charge, args):
                 quats, alpha=alpha, iface_ij_flat=iface, beta=beta,
                 charge_score_lut=charge, spacing=spacing, ntop=args.ntop,
                 rot_chunk_size=rot_chunk,
+                trans_per_rotation=args.trans_per_rotation,
                 **({} if args.sc_rho is None else {"sc_rho": args.sc_rho}))
             break
         except torch.cuda.OutOfMemoryError:
@@ -159,6 +165,18 @@ def main() -> None:
                          "GSC formulation of Chen & Weng 2002 Eq.(6).")
     ap.add_argument("--sc-rho", type=float, default=None, dest="sc_rho")
     ap.add_argument("--n-rot-override", type=int, default=0, dest="n_rot_override")
+    ap.add_argument("--rot-set", choices=("uniform", "hopf"), default="uniform",
+                    dest="rot_set",
+                    help="uniform random quaternions, or the Hopf-fibration "
+                         "grid of Yershova et al. 2010 (ZDOCK uses an evenly "
+                         "distributed set, not random sampling)")
+    ap.add_argument("--hopf-nside", type=int, default=3, dest="hopf_nside")
+    ap.add_argument("--trans-per-rotation", type=int, default=1,
+                    dest="trans_per_rotation",
+                    help="Chen & Weng 2003 keep only the best translation per "
+                         "rotation; pass 0 for the pure pose-top-K convention")
+    ap.add_argument("--ids", default="", help="comma-separated substrings; only "
+                                              "complexes matching one are run")
     ap.add_argument("--out", default="data/scaling/grid_spacing_validation.csv")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -170,8 +188,22 @@ def main() -> None:
     vox = json.loads(Path(args.grid_voxels).read_text())
     ok = [json.loads(l)["id"] for l in Path(args.prep_manifest).read_text().splitlines()
           if l.strip() and json.loads(l)["status"] == "ok"]
-    picks = [p for p in ok if vox.get(p, 1 << 60) <= args.max_vox][: args.n_complexes]
+    picks = [p for p in ok if vox.get(p, 1 << 60) <= args.max_vox]
+    if args.ids:
+        want = [t.strip() for t in args.ids.split(",") if t.strip()]
+        picks = [p for p in picks if any(w in p for w in want)]
+    picks = picks[: args.n_complexes]
     print(f"{len(picks)} complexes with <= {args.max_vox} voxels at 3.0 Å", flush=True)
+    _probe = (hopf_quaternions(args.hopf_nside, device=device, dtype=dtype)
+              if args.rot_set == "hopf"
+              else random_quaternions(args.n_rot_override or args.n_random_rot,
+                                      seed=args.rot_seed, device=device, dtype=dtype))
+    _probe = _probe / _probe.norm(dim=-1, keepdim=True)
+    _cov = covering_radius_deg(_probe, n_probe=4000, seed=1)
+    print(f"rotation set: {args.rot_set} N={_cov['n_grid']} "
+          f"covering radius mean={_cov['mean_deg']:.1f}° p95={_cov['p95_deg']:.1f}° "
+          f"max={_cov['max_deg']:.1f}° | trans_per_rotation={args.trans_per_rotation}",
+          flush=True)
 
     beta = torch.tensor(3.0, device=device, dtype=dtype)
     alpha = torch.tensor(args.alpha, device=device, dtype=dtype)
@@ -186,12 +218,22 @@ def main() -> None:
         prot = prot_cpu.to(device, dtype=dtype)
         # Identical rotation set for every spacing: 1500 uniform + 400 cone,
         # exactly what generate_decoys uses to build the pools.
-        n_rand = args.n_rot_override or args.n_random_rot
-        q_rand = random_quaternions(n_rand, seed=args.rot_seed,
-                                    device=device, dtype=dtype)
-        q_cone = rotation_cone(prot.q_star, args.n_cone, cone_deg=args.cone_deg,
-                               seed=args.rot_seed, device=device, dtype=dtype)
-        quats = torch.cat([q_rand, q_cone], dim=0)
+        if args.rot_set == "hopf":
+            q_rand = hopf_quaternions(args.hopf_nside, device=device, dtype=dtype)
+            q_rand = q_rand / q_rand.norm(dim=-1, keepdim=True)
+        else:
+            n_rand = args.n_rot_override or args.n_random_rot
+            q_rand = random_quaternions(n_rand, seed=args.rot_seed,
+                                        device=device, dtype=dtype)
+        # --n-cone 0 gives the honest condition: uniform rotations only, with
+        # no knowledge of the native orientation q*. A non-zero cone leaks q*
+        # into the candidate set and inflates both the ceiling and the recall.
+        if args.n_cone > 0:
+            q_cone = rotation_cone(prot.q_star, args.n_cone, cone_deg=args.cone_deg,
+                                   seed=args.rot_seed, device=device, dtype=dtype)
+            quats = torch.cat([q_rand, q_cone], dim=0)
+        else:
+            quats = q_rand
         for sp in spacings:
             try:
                 rows.append(run_one(prot, quats, sp, alpha, iface, beta, charge, args))

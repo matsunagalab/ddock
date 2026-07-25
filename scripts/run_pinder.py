@@ -35,7 +35,7 @@ from zdock.atomtypes import charge_score as default_charge_score
 from zdock.atomtypes import iface_ij
 from zdock.data import list_proteins, load_training_dataset
 from zdock.evaluate import evaluate_ranking
-from zdock.score import docking_score_elec
+from zdock.score import docking_score_elec, iface_score_matrix
 from zdock.train import loss_basin, loss_margin_hard_negatives, loss_param_prior
 
 
@@ -54,7 +54,7 @@ class Feats:
 
 
 def score_from_feats(f: Feats, alpha, iface_flat, beta) -> torch.Tensor:
-    imat = iface_flat.view(12, 12).T
+    imat = iface_score_matrix(iface_flat)
     return alpha * f.sc + (imat * f.T).sum(dim=(-2, -1)) + beta * f.elec
 
 

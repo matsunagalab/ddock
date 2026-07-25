@@ -308,29 +308,134 @@ for provenance and are not needed to run the code.
     RMSD is reported alongside as a cross-check.
 \end{enumerate}
 
-\section{Measured effect of completing PSC}
+\section{Rotational sampling}
+
+ZDOCK does not sample rotations at random: ``Evenly distributed Euler angles are
+used for the rotational search. The Euler angle sets \ldots{} have been obtained
+from Dr.\ Julie C.\ Mitchell. An angle set is equivalent to a uniformly
+distributed set of points on a projective sphere, which ensures that minimal
+orientations are required to cover the entire rotational space. The angular
+distance between any orientation and its nearest orientation \ldots{} is
+$\Delta$ or smaller''~\cite{ChenWeng2003psc}. The published sets are not
+distributable, so this implementation generates an equivalent grid with the
+Hopf-fibration construction of Yershova \emph{et~al.}~\cite{Yershova2010} ---
+the same Mitchell as the ZDOCK acknowledgement. Writing $S^3 = S^2 \times S^1$,
+
+\begin{equation}
+  q(\theta,\phi,\psi) =
+  \bigl(\cos\tfrac{\theta}{2}\cos\tfrac{\psi}{2},\;
+        \cos\tfrac{\theta}{2}\sin\tfrac{\psi}{2},\;
+        \sin\tfrac{\theta}{2}\cos(\phi+\tfrac{\psi}{2}),\;
+        \sin\tfrac{\theta}{2}\sin(\phi+\tfrac{\psi}{2})\bigr),
+\end{equation}
+with $(\theta,\phi)$ the centres of the $12\,n_{\text{side}}^2$ equal-area
+HEALPix pixels and $\psi$ an even grid of $6\,n_{\text{side}}$ points on the
+circle.
+
+What matters is the \emph{covering radius}: the largest angle any orientation
+can be from the grid bounds how far a rigid ligand must be rotated away from its
+true pose, and therefore how much clash penalty the discretisation forces onto
+the correct answer. Measured over 8000 random orientations:
+
+\begin{center}
+\begin{tabular}{lrrrr}
+  \toprule
+  rotation set & $N$ & mean & p95 & max \\
+  \midrule
+  Hopf $n_{\text{side}}=3$ & 1\,944  & $9.4^\circ$ & $13.2^\circ$ & $\mathbf{16.8^\circ}$ \\
+  uniform random           & 1\,900  & $11.1^\circ$ & $17.9^\circ$ & $25.9^\circ$ \\
+  Hopf $n_{\text{side}}=4$ & 4\,608  & $7.0^\circ$ & $9.9^\circ$ & $\mathbf{12.2^\circ}$ \\
+  uniform random           & 4\,608  & $8.2^\circ$ & $13.4^\circ$ & $20.6^\circ$ \\
+  Hopf $n_{\text{side}}=9$ & 52\,488 & $3.1^\circ$ & $4.4^\circ$ & $\mathbf{5.5^\circ}$ \\
+  uniform random           & 52\,488 & $3.6^\circ$ & $5.8^\circ$ & $8.8^\circ$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+At equal point count the Hopf grid cuts the worst case by 35\%; the tail
+improves far more than the mean. $n_{\text{side}}=3$ corresponds to
+$\Delta \approx 17^\circ$, matching the paper's ``1800 orientations at
+$\Delta = 20^\circ$''.
+
+\paragraph{Translations kept per rotation.}
+``Only the best translational orientation is kept for every rotational
+orientation. We used to keep the top 10 \ldots{} keeping only the best one
+helped to remove false positives without affecting the ranking of the best
+hit''~\cite{ChenWeng2003psc}. The default here follows the paper ($1$). This is
+non-maximum suppression rather than a pure top-$K$ over poses, so success@$K$
+under the two conventions is \emph{not} the same quantity and the two must not
+be compared directly.
+
+\section{Measured effect}
 
 Twelve interface-deleaked PINDER complexes, default parameters (no training),
-$1900$ uniform rotations, $h=1.2$~\AA, top-$2000$ search output, nothing
-injected into the candidate set. ``Ceiling'' is the DockQ of the best sampled
-rotation at the lattice-snapped native translation --- a parameter-free upper
-bound on what the search could return; it is $\ge 0.23$ for $100\%$ of these
-complexes throughout.
+$h = 1.2$~\AA, top-2000 search output, \textbf{nothing injected into the
+candidate set and no native-informed rotations}. An earlier revision of this
+note quoted higher numbers measured with a $25^\circ$ cone around the native
+orientation $q^\ast$ mixed into the rotation set; that leaks the answer and is
+excluded here.
 
 \begin{center}
 \begin{tabular}{lrrrrr}
   \toprule
-  score implementation & recall & best DockQ & s@1 & s@10 & s@100 \\
+  implementation & recall & best DockQ & s@1 & s@10 & s@100 \\
   \midrule
-  clash penalty only, $h=3.0$~\AA        & $0.0\%$  & $0.107$ & $0\%$  & $0\%$  & $0\%$ \\
-  clash penalty only, $h=1.2$~\AA        & $0.0\%$  & $0.066$ & $0\%$  & $0\%$  & $0\%$ \\
-  \ \ + pair-term sign flip              & $16.7\%$ & $0.116$ & $0\%$  & $0\%$  & $0\%$ \\
-  \textbf{full PSC, Eqs.\ \eqref{eq:psc-reR}--\eqref{eq:psc}}
-                                         & $\mathbf{66.7\%}$ & $\mathbf{0.649}$
-                                         & $\mathbf{17\%}$ & $\mathbf{42\%}$ & $\mathbf{50\%}$ \\
+  clash penalty only, $h=3.0$~\AA        & $0.0\%$  & $0.107$ & $0\%$ & $0\%$ & $0\%$ \\
+  clash penalty only, $h=1.2$~\AA        & $0.0\%$  & $0.066$ & $0\%$ & $0\%$ & $0\%$ \\
+  \ \ + pair-term sign flip              & $16.7\%$ & $0.116$ & $0\%$ & $0\%$ & $0\%$ \\
+  full PSC, uniform rotations            & $58\%$   & $0.398$ & $8\%$ & $17\%$ & $42\%$ \\
+  \textbf{full PSC, Hopf grid, 1 trans/rot}
+                                         & $\mathbf{75\%}$ & $\mathbf{0.53}$
+                                         & $\mathbf{8\%}$ & $\mathbf{17\%}$ & $\mathbf{25\%}$ \\
   \bottomrule
 \end{tabular}
 \end{center}
+
+Recall --- whether the search surfaces a near-native pose at all --- goes from
+$0\%$ to $75\%$, but success@1 stays at $8\%$ (1 of 12) in every configuration.
+The answer is now returned; it is not ranked first.
+
+\section{Why the correct pose loses}
+
+Decomposing the score of three poses per complex --- the exact native
+$(q^\ast, t^\ast)$, the best \emph{reachable} pose (nearest sampled rotation at
+the lattice-snapped $t^\ast$), and the pose the search actually ranked first ---
+separates the two failure modes. Grouping by whether the search recovered a
+near-native pose anywhere in its output:
+
+\begin{center}
+\begin{tabular}{lrrrrrr}
+  \toprule
+  & $n$ & $\alpha S_{\text{fav}}$ & $-\alpha S_{\text{clash}}$ & $S_{\text{IFACE}}$ & total \\
+  \midrule
+  \multicolumn{6}{l}{\emph{search top-1 minus best reachable} (positive $=$ prefers the wrong pose)}\\
+  recall $>0$ & 9 & $+102$ & $\mathbf{+742}$ & $+139$ & $+982$ \\
+  recall $=0$ & 3 & $\mathbf{+706}$ & $-180$ & $\mathbf{+366}$ & $+891$ \\
+  \midrule
+  \multicolumn{6}{l}{\emph{best reachable minus exact native} (what discretisation costs)}\\
+  recall $>0$ & 9 & $+109$ & $\mathbf{-966}$ & $-8$ & $-865$ \\
+  recall $=0$ & 3 & $+17$  & $-72$  & $-17$ & $-71$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+For the nine complexes where the answer is found, essentially the entire
+discretisation cost is the clash penalty. Snapping the native orientation to the
+nearest grid point ($9^\circ$ on average) makes a \emph{rigid} ligand
+interpenetrate the receptor --- real interfaces relieve this with side-chain
+motion --- and $\rho^4 = 150$ per overlapping cell then falls only on the correct
+pose. A wrong pose that grazes the surface pays nothing. In the worst case
+(3wlb) the reachable native scores $-4770$.
+
+For the remaining three the clash term is not the problem; the favourable pair
+count and the IFACE potential both prefer the wrong pose, pointing at $D$ and at
+the pair table.
+
+$\rho = 3.5$ is the value ZDOCK uses \emph{with} an evenly distributed angle set
+and a downstream refinement stage. Without refinement the penalty is strong
+enough to eliminate the correct answer, which makes $\rho$ --- with its
+fourth-power sensitivity --- the first parameter to calibrate, followed by
+$\alpha$, $D$, and the pair table.
 
 \begin{thebibliography}{9}
 \bibitem{ChenWeng2003psc}
@@ -369,6 +474,12 @@ complexes throughout.
   proteins and their ligands by correlation techniques.}
   Proc.\ Natl.\ Acad.\ Sci.\ USA \textbf{89}(6), 2195--2199 (1992).
   \doi{10.1073/pnas.89.6.2195}.
+\bibitem{Yershova2010}
+  A.~Yershova, S.~Jain, S.~M.~LaValle and J.~C.~Mitchell.
+  \emph{Generating uniform incremental grids on SO(3) using the Hopf
+  fibration.}
+  Int.\ J.\ Robotics Research \textbf{29}(7), 801--812 (2010).
+  \doi{10.1177/0278364909352700}.
 \bibitem{Basu2016dockq}
   S.~Basu and B.~Wallner.
   \emph{DockQ: a quality measure for protein--protein docking models.}
