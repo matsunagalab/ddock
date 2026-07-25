@@ -56,6 +56,7 @@ import torch  # noqa: E402
 
 from zdock.atomtypes import charge_score as default_charge_score  # noqa: E402
 from zdock.atomtypes import iface_ij  # noqa: E402
+from zdock.score import SC_REFERENCE_SPACING  # noqa: E402
 from zdock.dockq import dockq_batch, ligand_rmsd_to_native  # noqa: E402
 from zdock.prep_cache import load_prepared  # noqa: E402
 from zdock.rotation_grid import random_quaternions  # noqa: E402
@@ -168,7 +169,7 @@ def main() -> None:
     ap.add_argument("--rot-seed", type=int, default=12345, dest="rot_seed",
                     help="fixed so every condition searches the same rotations")
     ap.add_argument("--ntop", type=int, default=1500)
-    ap.add_argument("--spacing", type=float, default=3.0)
+    ap.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
     ap.add_argument("--rot-chunk", type=int, default=8, dest="rot_chunk")
     ap.add_argument("--dockq-budget", type=int, default=50_000_000, dest="dockq_budget")
     ap.add_argument("--oom-retries", type=int, default=3, dest="oom_retries")

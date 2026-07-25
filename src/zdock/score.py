@@ -278,6 +278,27 @@ def sc_cell_volume_factor(x_grid, y_grid, z_grid,
     return (dx * dy * dz) / (reference_spacing ** 3)
 
 
+#: Chen et al. 2003 Eq. (2): ``Im[L_PSC+ELEC] = -1 x (atom charge)``, in a
+#: convention where "a more negative score indicates a more favorable
+#: interaction energy" (p.81). This repository *maximises* the total score, so
+#: the ELEC contribution must be ``-beta * sum(V*q)`` for an attractive
+#: (opposite-charge) contact to raise the score. We carry the flip on the
+#: ligand deposition, exactly as Eq. (2) writes it. An earlier revision
+#: deposited ``+q``, which made the search reward electrostatic *repulsion*;
+#: note this could not be absorbed by training, since ``S_ELEC`` is quadratic
+#: in the charge LUT (the same LUT builds V_rec and Q_L) and beta is frozen.
+ELEC_LIGAND_SIGN = -1.0
+
+
+def ligand_partial_charge(lig_charge_id: torch.Tensor,
+                          charge_score: torch.Tensor) -> torch.Tensor:
+    """``Im[L_PSC+ELEC]`` of Chen et al. 2003 Eq. (2) — see
+    :data:`ELEC_LIGAND_SIGN`. Every ligand-side ELEC scatter must go through
+    this so the FFT and direct paths cannot drift apart."""
+    return ELEC_LIGAND_SIGN * partial_charge_per_atom(lig_charge_id,
+                                                      charge_score)
+
+
 #: Chen & Weng 2003, "Optimizing PSC": the favourable component counts receptor
 #: atoms within ``D + receptor atom radius`` of each open-space grid point.
 #: "The parameters in the penalty term (-9 and -81) have been taken directly
@@ -292,15 +313,26 @@ def sc_encode(shell: torch.Tensor, core: torch.Tensor, *, rho=SC_RHO):
 
     ``Im[R_PSC] = Im[L_PSC] = rho`` on the solvent-*excluding* surface (cells
     covered by a surface atom), ``rho**2`` in the protein core, ``0`` in open
-    space — with core taking precedence. Overlapping these gives the published
-    penalties ``-rho**2`` / ``-rho**3`` / ``-rho**4`` for surface-surface /
-    surface-core / core-core once ``-Im[R]*Im[L]`` is taken in Eq. (4).
+    space. Overlapping these gives the published penalties ``-rho**2`` /
+    ``-rho**3`` / ``-rho**4`` for surface-surface / surface-core / core-core
+    once ``-Im[R]*Im[L]`` is taken in Eq. (4).
+
+    **Surface takes precedence over core**, per Chen & Weng 2003 (and repeated
+    verbatim in Chen et al. 2003): "The 'solvent excluding surface layer of a
+    protein' is defined by the grid points corresponding to surface atoms. *All
+    other* grid points corresponding to any core atoms are in the protein
+    'core'." The surface layer is defined first; the core is the residual. An
+    earlier revision of this function had the precedence inverted, which
+    over-penalised exactly the interface-adjacent cells PSC is meant to treat
+    leniently (measured on 1KXQ: 17% of occupied receptor cells are covered by
+    both a surface and a core atom; the native-pose penalty was 24% too high at
+    rho=3.5, i.e. S_PSC 168.75 instead of 291.2).
 
     Note PSC, unlike GSC, has **no** "solvent accessible surface layer": "any
     grid point that does not correspond to an atom is in the open space".
     """
-    core_b = core > 0
-    shell_b = (shell > 0) & ~core_b
+    shell_b = shell > 0
+    core_b = (core > 0) & ~shell_b
     rho_t = rho if torch.is_tensor(rho) else torch.as_tensor(
         rho, dtype=shell.dtype, device=shell.device)
     return shell_b.to(shell.dtype) * rho_t + core_b.to(shell.dtype) * rho_t.pow(2)
@@ -477,10 +509,9 @@ def _score_ligand_chunk(
     surf_idx = surf_mask_flat.nonzero(as_tuple=True)[0]
     core_idx = core_mask_flat.nonzero(as_tuple=True)[0]
 
-    # Eq. (1) L_SC: core -> rho*i, then surface atoms overwrite with 1, then the
-    # core's open boundary is converted to surface. Real and imaginary parts are
-    # mutually exclusive, which is what makes a surface-surface contact score +1
-    # instead of a penalty.
+    # Chen & Weng 2003 Eq. (3), ligand side: `Im[L_PSC]` is the clash channel
+    # built by `sc_encode` (surface layer first, core = residual) and
+    # `Re[L_PSC]` is one count at each atom's nearest grid point.
     zeros_g = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
     surf_ind = (sc_union(lxyz_flat[surf_idx], frame_idx_per_atom[surf_idx],
                          lig_radius_flat[surf_idx], (F, nx, ny, nz))
@@ -532,7 +563,7 @@ def _score_ligand_chunk(
 
     if elec_mode == "coulomb":
         V_rec = V_rec_or_U
-        lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score)
+        lig_partial_q = ligand_partial_charge(lig_charge_id, charge_score)
         lig_partial_q_flat = lig_partial_q.unsqueeze(0).expand(F, -1).reshape(-1)
         Q_L = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
         if scatter_mode == "trilinear":
@@ -688,15 +719,27 @@ def docking_score_elec(
         # Chen 2002 p284: V(r) = Σⱼ qⱼ / |r − rⱼ|. Zero out cells that fall
         # inside the receptor SC shape (Chen 2002 p284: "grid points in the
         # core of the receptor are assigned a value of 0 for the electric
-        # potential"). `rec_sc_real > 0` covers both surface shell and core
-        # per the SC encoding, so V_rec is populated only in open space.
+        # potential, to avoid the contributions from non-physical
+        # receptor-core/ligand contacts").
+        #
+        # The occupancy channel is `rec_sc_imag`: it is `rho` on the
+        # solvent-excluding surface layer, `rho**2` in the core and exactly 0
+        # in open space ("any grid point that does not correspond to an atom is
+        # in the open space", Chen & Weng 2003). `rec_sc_real` must NOT be used
+        # here: after the PSC rewrite it is the *count of receptor atoms within
+        # `radius + D`*, so `rec_sc_real == 0` selects cells further than ~5.4 Å
+        # from every receptor atom, i.e. bulk solvent. Conjoining it deleted the
+        # whole contact band (measured on 1KXQ: 80% of Σ|V|; nearest surviving
+        # cell 5.12 Å from any receptor atom, so every interface ligand atom saw
+        # V = 0) and left beta and the charge LUT with identically zero gradient
+        # for any contacting pose.
         rec_partial_q = partial_charge_per_atom(rec_charge_id, charge_score)
         V_rec = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
         spread_neighbors_coulomb(
             V_rec, rec_xyz, rec_partial_q, rcut_elec,
             x_grid, y_grid, z_grid,
         )
-        open_space_mask = (rec_sc_real == 0) & (rec_sc_imag == 0)
+        open_space_mask = rec_sc_imag <= 0
         V_rec = V_rec * open_space_mask.to(dtype)
     else:  # elec_mode == "legacy"
         # Original notebook behaviour: group by atomtype_id (B9), compute

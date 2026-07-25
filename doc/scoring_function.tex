@@ -80,7 +80,10 @@ occupancy sets
   \mathrm{surf}(c) &\iff \exists j\in\mathcal{S}: \lVert \mathbf{x}_c-\mathbf{x}_j\rVert < r_j, \\
   \mathrm{core}(c) &\iff \exists j\in\mathcal{C}: \lVert \mathbf{x}_c-\mathbf{x}_j\rVert < r_j,
 \end{align}
-with $\mathrm{core}$ taking precedence, and let
+with $\mathrm{surf}$ taking precedence (``the solvent excluding surface layer
+\ldots{} is defined by the grid points corresponding to surface atoms; \emph{all
+other} grid points corresponding to any core atoms are in the protein
+core''~\cite{ChenWeng2003psc,Chen2003zdock}), and let
 $\mathrm{open}(c)\iff \neg\,\mathrm{surf}(c)\wedge\neg\,\mathrm{core}(c)$.
 Note that PSC, unlike the earlier GSC, defines \emph{no} solvent-accessible
 surface layer: ``any grid point that does not correspond to an atom is in the
@@ -142,6 +145,21 @@ $D+r_j$ of that point. The second sum contributes
 \end{center}
 so deeper interpenetration is punished super-linearly, ``with a higher score
 indicating better shape complementarity''~\cite{ChenWeng2003psc}.
+
+\paragraph{Caveat on $\rho$.} These are \emph{not} the penalties printed in
+the PSC paper, which states them explicitly: ``a core--core, surface--core, or
+surface--surface grid point overlap results in a penalty of $-9\times9=-81$,
+$-3\times9=-27$, and $-3\times3=-9$ respectively''~\cite{ChenWeng2003psc},
+i.e.\ $\rho = 3$ against a favourable weight of $+1$ per pair. The
+$\rho = 3.5$ used here comes from Eq.~(2) of~\cite{Chen2003zdock}, but there
+the favourable term is simultaneously raised to $1.334$ per pair (``we decrease
+the PSC score for each atom pair from $-1$ to $-1.334$ \ldots{} the PSC penalty
+is increased slightly to balance the increased favorable contribution by
+electrostatics''). The penalty:reward ratio is $9.0$ in the first formulation
+and $9.18$ in the second; the present code mixes $\rho = 3.5$ with a reward
+weight of $1$, giving $12.25$ --- about 36\% harsher than either published
+variant. Either set $\rho = 3$, or keep $3.5$ and set the pair weight to
+$1.334$.
 
 \paragraph{Why this term dominates.}
 On clash-free surface-placed decoys the bare pair count
@@ -236,9 +254,17 @@ it then dominates the total.
 \end{tabular}
 \end{center}
 
-$\rho$, $D$, $\alpha$, $\beta$, $e_{ij}$ and $q_m$ are all exposed as
-differentiable tensors, so any of them can be optimised; the values above are
-the initialisation. Note that $\alpha$ has no counterpart in
+$\rho$, $\alpha$, $\beta$, $e_{ij}$ and $q_m$ are exposed as differentiable
+tensors and can be optimised; the values above are the initialisation.
+$D$ \textbf{cannot}: it enters only through the hard distance test
+$\lVert\mathbf{x}_c-\mathbf{x}_j\rVert < r_j + D$, whose output is a boolean
+selection, so $\partial S/\partial D \equiv 0$ (verified: the score changes
+from $-11138.30$ at $D=3.5$ to $-11111.30$ at $D=3.6$ but autograd returns
+\texttt{None} and every finite difference below $h=10^{-2}$ is exactly zero).
+$D$ must be tuned by grid search, or the cutoff replaced by a smooth switching
+function. Note also that $q_m$ is listed as CHARMM19 above but the table
+currently in the code is not CHARMM19 (the backbone N even has the opposite
+sign); see the audit in \texttt{EXPERIMENT\_REPORT.md} \S5.7.7. Note that $\alpha$ has no counterpart in
 Eq.~(2) of~\cite{Chen2003zdock}, where the scale of the PSC term is fixed by
 $\rho$ and the term enters with unit weight; the $\alpha = 0.01$ carried in
 earlier revisions of this code belongs to the \emph{grid}-based
@@ -335,7 +361,14 @@ circle.
 What matters is the \emph{covering radius}: the largest angle any orientation
 can be from the grid bounds how far a rigid ligand must be rotated away from its
 true pose, and therefore how much clash penalty the discretisation forces onto
-the correct answer. Measured over 8000 random orientations:
+the correct answer. The \textbf{max} column below is a sample maximum over
+$4000$ random probes and is therefore a downward-biased \emph{lower bound} on
+the covering radius (a $2$M-probe reference with local ascent gives
+$\ge 18.5^\circ$, $\ge 13.9^\circ$ and $\ge 6.2^\circ$ for the three Hopf
+rows). The mean and p95 columns are converged. Note the $\Delta$ quoted by
+\cite{ChenWeng2003psc} is a \emph{guaranteed} bound, so it is not measured the
+same way; packing efficiency is the like-for-like comparison, and there the two
+agree ($0.25$--$0.31$ for the paper's sets, $0.29$ for the Hopf grids).
 
 \begin{center}
 \begin{tabular}{lrrrr}
@@ -352,10 +385,12 @@ the correct answer. Measured over 8000 random orientations:
 \end{tabular}
 \end{center}
 
-At equal point count the Hopf grid cuts the worst case by 35\%; the tail
+At essentially equal point count ($1\,944$ vs $1\,900$) the Hopf grid cuts the
+worst case by 35\%; that relative figure is robust, since both sides are
+estimated the same way (true values $18.53^\circ$ vs $28.33^\circ$). The tail
 improves far more than the mean. $n_{\text{side}}=3$ corresponds to
-$\Delta \approx 17^\circ$, matching the paper's ``1800 orientations at
-$\Delta = 20^\circ$''.
+$\Delta \gtrsim 18.5^\circ$, comparable to the paper's ``1800 orientations at
+$\Delta = 20^\circ$'' in packing efficiency.
 
 \paragraph{Translations kept per rotation.}
 ``Only the best translational orientation is kept for every rotational
@@ -368,22 +403,29 @@ be compared directly.
 
 \section{Measured effect}
 
-Twelve interface-deleaked PINDER complexes, default parameters (no training),
-$h = 1.2$~\AA, top-2000 search output, \textbf{nothing injected into the
-candidate set and no native-informed rotations}. An earlier revision of this
-note quoted higher numbers measured with a $25^\circ$ cone around the native
-orientation $q^\ast$ mixed into the rotation set; that leaks the answer and is
-excluded here.
+Interface-deleaked PINDER complexes, default parameters (no training),
+$h = 1.2$~\AA, top-2000 search output.
+
+\textbf{Correction (2026-07-25).} An earlier version of this caption claimed
+\emph{nothing injected into the candidate set and no native-informed rotations}
+for the whole table. That is true only of the last two rows. Rows~1--3 were
+produced by \texttt{validate\_grid\_spacing.py} at its then-default
+\texttt{-{}-n-cone 400}, i.e.\ with a $25^\circ$ cone around the native
+orientation $q^\ast$ mixed into the rotation set, which leaks the answer and
+inflates both recall and the ceiling; rows~1--2 are also over \emph{20}
+complexes, not 12. They are upper bounds on the corresponding cone-free
+numbers and are marked accordingly. The script default is now $0$.
 
 \begin{center}
 \begin{tabular}{lrrrrr}
   \toprule
   implementation & recall & best DockQ & s@1 & s@10 & s@100 \\
   \midrule
-  clash penalty only, $h=3.0$~\AA        & $0.0\%$  & $0.107$ & $0\%$ & $0\%$ & $0\%$ \\
-  clash penalty only, $h=1.2$~\AA        & $0.0\%$  & $0.066$ & $0\%$ & $0\%$ & $0\%$ \\
-  \ \ + pair-term sign flip              & $16.7\%$ & $0.116$ & $0\%$ & $0\%$ & $0\%$ \\
-  full PSC, uniform rotations            & $58\%$   & $0.398$ & $8\%$ & $17\%$ & $42\%$ \\
+  clash only, $h=3.0$~\AA\ \emph{(cone, $n{=}20$)} & $0.0\%$  & $0.107$ & $0\%$ & $0\%$ & $0\%$ \\
+  clash only, $h=1.2$~\AA\ \emph{(cone, $n{=}20$)} & $0.0\%$  & $0.066$ & $0\%$ & $0\%$ & $0\%$ \\
+  \ \ + pair-term sign flip \emph{(cone, $n{=}12$)} & $16.7\%$ & $0.116$ & $0\%$ & $0\%$ & $0\%$ \\
+  \midrule
+  full PSC, uniform rot.\ \emph{(cone-free, $n{=}12$)} & $58\%$ & $0.398$ & $8\%$ & $17\%$ & $42\%$ \\
   \textbf{full PSC, Hopf grid, 1 trans/rot}
                                          & $\mathbf{75\%}$ & $\mathbf{0.53}$
                                          & $\mathbf{8\%}$ & $\mathbf{17\%}$ & $\mathbf{25\%}$ \\

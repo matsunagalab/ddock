@@ -7,13 +7,48 @@ import numpy as np
 import pytest
 import torch
 
+from zdock import spread as _spread
 from zdock.spread import (
+    _nearest_cell_indices,
     calculate_distance,
     spread_nearest_add,
     spread_nearest_substitute,
     spread_neighbors_add,
     spread_neighbors_substitute,
 )
+
+
+@pytest.fixture
+def legacy_floor_binning(monkeypatch):
+    """Restore the Julia reference's `ceil((x - x_min)/dx) - 1` binning.
+
+    The production code now assigns each atom to its NEAREST grid point; the
+    Julia binning was a floor, i.e. a systematic -h/2 offset per axis (see
+    `_nearest_cell_indices`). The stored reference grids encode the old
+    behaviour, so the two tests below pin the *legacy path* — they verify the
+    port is still faithful, not that the current default is correct. The
+    current default is covered by `test_nearest_cell_is_actually_nearest`.
+    """
+    monkeypatch.setattr(_spread, "_LEGACY_FLOOR_BINNING", True)
+
+
+def test_nearest_cell_is_actually_nearest(device, dtype):
+    """Every atom lands on the closest grid point, and the assignment is
+    symmetric about each grid point (the old floor binning was not)."""
+    h = 1.2
+    g = torch.arange(10, device=device, dtype=dtype) * h - 5.0   # -5.0 .. 5.8
+    # points at, just below and just above grid node index 3 (x = -1.4)
+    node = float(g[3])
+    xs = [node - 0.59, node - 0.01, node, node + 0.01, node + 0.59]
+    xyz = torch.tensor([[x, node, node] for x in xs], device=device, dtype=dtype)
+    ix, iy, iz = _nearest_cell_indices(xyz, g, g, g)
+    assert ix.tolist() == [3, 3, 3, 3, 3], ix.tolist()
+    assert iy.tolist() == [3] * 5 and iz.tolist() == [3] * 5
+    # and one cell over on either side
+    xyz2 = torch.tensor([[node - 0.61, node, node],
+                         [node + 0.61, node, node]], device=device, dtype=dtype)
+    ix2, _, _ = _nearest_cell_indices(xyz2, g, g, g)
+    assert ix2.tolist() == [2, 4], ix2.tolist()
 
 
 def _load_grid(ref: dict, key: str) -> np.ndarray:
@@ -41,7 +76,8 @@ def _make_grid(ref: dict, device: torch.device, dtype: torch.dtype):
     return grid, xg, yg, zg
 
 
-def test_spread_nearest_add(load_ref, device, dtype, tol):
+def test_spread_nearest_add_legacy(load_ref, device, dtype, tol,
+                                   legacy_floor_binning):
     ref = load_ref("phase3", "spread")
     xyz = _as_xyz(ref, device, dtype)
     w = torch.as_tensor(np.asarray(ref["weight"]), device=device, dtype=dtype)
@@ -52,7 +88,8 @@ def test_spread_nearest_add(load_ref, device, dtype, tol):
     torch.testing.assert_close(grid, expected, **tol)
 
 
-def test_spread_nearest_substitute(load_ref, device, dtype, tol):
+def test_spread_nearest_substitute_legacy(load_ref, device, dtype, tol,
+                                          legacy_floor_binning):
     ref = load_ref("phase3", "spread")
     xyz = _as_xyz(ref, device, dtype)
     w = torch.as_tensor(np.asarray(ref["weight"]), device=device, dtype=dtype)

@@ -47,15 +47,13 @@ from zdock.prep_cache import load_prepared  # noqa: E402
 from zdock.rotation_grid import (  # noqa: E402
     hopf_quaternions,
     random_quaternions,
-    rotation_cone,
 )
 from zdock.score import (  # noqa: E402
-    IFACE_PAIR_OFFSET,
-    IFACE_SIGN,
     PSC_D,
     SC_REFERENCE_SPACING,
     SC_RHO,
     docking_score_elec,
+    iface_score_matrix,
 )
 from zdock.search import _rotate_batch, docking_search  # noqa: E402
 
@@ -91,8 +89,14 @@ def terms(prot, poses, alpha, iface, beta, charge, args):
             frame_chunk_size=args.frame_chunk, return_components=True)
 
     psc_full, T, elec = _call(args.sc_rho)
-    psc_fav, _, _ = _call(0.0)
-    imat = IFACE_PAIR_OFFSET + IFACE_SIGN * iface.view(12, 12).T
+    # `rho` must stay strictly positive. `psc_grids` masks the receptor's
+    # favourable channel with `(im <= 0)`, so rho=0 makes `im` identically zero
+    # and un-masks the receptor interior: the favourable count leaks by ~29%
+    # (measured), and since `clash = fav - full`, the leak lands in BOTH columns
+    # with the same sign — exactly the confound this table is meant to resolve.
+    # rho=1e-6 keeps the mask bit-identical and makes Im_R*Im_L ~ 1e-12.
+    psc_fav, _, _ = _call(1e-6)
+    imat = iface_score_matrix(iface)
     return {
         "fav": psc_fav,
         "clash": psc_fav - psc_full,          # >= 0
@@ -126,8 +130,6 @@ def main() -> None:
                     dest="trans_per_rotation")
     ap.add_argument("--ntop", type=int, default=2000)
     ap.add_argument("--rot-chunk", type=int, default=4, dest="rot_chunk")
-    ap.add_argument("--n-near", type=int, default=200, dest="n_near")
-    ap.add_argument("--cone-deg", type=float, default=10.0, dest="cone_deg")
     ap.add_argument("--frame-chunk", type=int, default=25, dest="frame_chunk")
     ap.add_argument("--dockq-budget", type=int, default=50_000_000, dest="dockq_budget")
     ap.add_argument("--dockq-threshold", type=float, default=0.23, dest="dockq_thr")

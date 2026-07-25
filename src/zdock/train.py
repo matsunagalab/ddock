@@ -430,15 +430,22 @@ def train(
                         positive_threshold=margin_positive_threshold,
                         margin=margin,
                     )
-                    + lambda_prior * loss_param_prior(
-                        alpha, iface, charge, alpha_init, iface_init, charge_init,
-                    )
                 )
             else:  # split_mse
                 ht, mt = tgt
                 lp = loss_b2_fixed(scores, p.hit_mask, ht, mt)
             lp.backward()
             epoch_loss += float(lp.detach())
+        if loss == "combined":
+            # Once per epoch, NOT once per protein. Inside the loop the prior
+            # was effectively multiplied by the number of proteins relative to
+            # the data terms (and accumulated N times through backward()),
+            # which disagreed with `run_pinder_scaling.mean_objective`.
+            lp_prior = lambda_prior * loss_param_prior(
+                alpha, iface, charge, alpha_init, iface_init, charge_init,
+            )
+            lp_prior.backward()
+            epoch_loss += float(lp_prior.detach())
         opt.step()
         history["loss"].append(epoch_loss)
         if epoch % progress_every == 0 or epoch == n_epoch - 1:

@@ -29,6 +29,7 @@ import torch
 
 from zdock.geom import generate_grid
 from zdock.prep_cache import load_prepared
+from zdock.score import SC_REFERENCE_SPACING
 
 
 def main() -> None:
@@ -36,7 +37,7 @@ def main() -> None:
     ap.add_argument("--prep-manifest", default="data/scaling/prep_manifest.jsonl",
                     dest="prep_manifest")
     ap.add_argument("--prep-cache", default="data/scaling/prep_cache", dest="prep_cache")
-    ap.add_argument("--spacing", type=float, default=3.0)
+    ap.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
     ap.add_argument("--out", default="data/scaling/grid_voxels.json")
     args = ap.parse_args()
 

@@ -111,7 +111,7 @@ def test_sc_fft_matches_direct_xcorr():
     F_Z_R = torch.fft.fftn(Z_R, dim=(-3, -2, -1))
     F_Z_L = torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj()
     G = torch.fft.ifftn(F_Z_R * F_Z_L, dim=(-3, -2, -1))
-    score_fft = G.real - G.imag
+    score_fft = G.real   # Eq. (4): real part only
 
     score_direct = docking_score_sc_direct(R_r, R_i, L_r, L_i)
 

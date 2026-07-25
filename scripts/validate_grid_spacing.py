@@ -150,7 +150,13 @@ def main() -> None:
     ap.add_argument("--n-complexes", type=int, default=20, dest="n_complexes")
     ap.add_argument("--spacings", default="3.0,1.2")
     ap.add_argument("--n-random-rot", type=int, default=1500, dest="n_random_rot")
-    ap.add_argument("--n-cone", type=int, default=400, dest="n_cone")
+    # 0 = the honest condition. Any non-zero cone leaks q* into the rotation
+    # set and inflates both the ceiling and the recall; the module docstring
+    # ("nothing is injected") is only true at 0.
+    ap.add_argument("--n-cone", type=int, default=0, dest="n_cone")
+    ap.add_argument("--cov-probes", type=int, default=200_000,
+                    dest="cov_probes",
+                    help="probes for the covering-radius lower bound")
     ap.add_argument("--cone-deg", type=float, default=25.0, dest="cone_deg")
     ap.add_argument("--rot-seed", type=int, default=12345, dest="rot_seed")
     ap.add_argument("--ntop", type=int, default=2000)
@@ -199,11 +205,16 @@ def main() -> None:
               else random_quaternions(args.n_rot_override or args.n_random_rot,
                                       seed=args.rot_seed, device=device, dtype=dtype))
     _probe = _probe / _probe.norm(dim=-1, keepdim=True)
-    _cov = covering_radius_deg(_probe, n_probe=4000, seed=1)
+    _cov = covering_radius_deg(_probe, n_probe=args.cov_probes, seed=1)
     print(f"rotation set: {args.rot_set} N={_cov['n_grid']} "
           f"covering radius mean={_cov['mean_deg']:.1f}° p95={_cov['p95_deg']:.1f}° "
-          f"max={_cov['max_deg']:.1f}° | trans_per_rotation={args.trans_per_rotation}",
+          f"max>={_cov['max_deg_lower_bound']:.1f}° (lower bound, "
+          f"{_cov['n_probe']} probes) | trans_per_rotation={args.trans_per_rotation}",
           flush=True)
+    if args.n_cone:
+        print(f"  NOTE: the printed covering radius describes q_rand only; the "
+              f"search also gets {args.n_cone} native-informed cone rotations, "
+              f"so recall/ceiling below are q*-informed.", flush=True)
 
     beta = torch.tensor(3.0, device=device, dtype=dtype)
     alpha = torch.tensor(args.alpha, device=device, dtype=dtype)

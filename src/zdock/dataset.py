@@ -50,6 +50,7 @@ from .geom import decenter, orient
 from .io import parse_pdb_ms
 from .rotation_grid import kabsch_quaternion, random_quaternions, rotation_cone
 from .sasa import compute_sasa
+from .score import SC_REFERENCE_SPACING
 from .search import _rotate_batch, docking_search
 
 
@@ -297,15 +298,21 @@ def generate_decoys(
     n_cone: int = 400,
     cone_deg: float = 25.0,
     ntop: int = 2000,
-    spacing: float = 3.0,
+    spacing: float = SC_REFERENCE_SPACING,
     rot_chunk_size: int = 32,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the FFT search + near-native cone and return candidate poses.
 
     Returns ``(poses, scores)`` where ``poses`` is ``(F, N_lig, 3)`` in the
-    receptor-decentered frame and ``scores`` is ``(F,)`` — the raw docking
-    score assigned by the FFT search with the given parameters.
+    receptor-decentered frame. Note ``poses`` has ``ntop + n_cone`` rows while
+    ``scores`` has only the ``ntop`` FFT scores — the injected near-native poses
+    were never scored by the search. Callers must not zip the two.
+
+    ``spacing`` must be the same value the caller later passes to
+    ``docking_score_elec`` when featurising these poses: the search default used
+    to be 3.0 Å while the scorer default was 1.2 Å, so the pool cut was made
+    under a scorer nobody trained or reported.
     """
     device = prot.rec_xyz.device
     dtype = prot.rec_xyz.dtype

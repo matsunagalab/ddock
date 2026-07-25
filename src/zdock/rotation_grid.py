@@ -135,10 +135,14 @@ def rotation_cone(
     Sampling scheme: for each sample, draw a uniform axis on S² and an
     angle θ ~ Uniform(0, cone_deg). Compose δ(axis, θ) · q_center.
 
-    Angle is uniform in [0, cone_deg], which overweights the shell
-    near cone_deg slightly relative to a uniform volume sampling — but
-    for our purpose (guarantee coverage near q_center, including the
-    exact pose at θ = 0) this is fine and predictable.
+    Angle is uniform in [0, cone_deg]. NOTE this over-weights the **centre**,
+    not the shell: the Haar density in θ goes like (1 − cos θ), so the
+    innermost 5° bin is ~25x over-represented relative to a volume-uniform
+    sample of the same cone (measured at cone_deg=25 over 200k samples:
+    39,917 vs 1,615). Since this cone is seeded on the native orientation, the
+    leak it introduces is correspondingly ~25x more concentrated on the answer
+    than "uniform in the cone" would suggest. For a volume-uniform cone, invert
+    F(θ) = (θ − sin θ)/(θ_max − sin θ_max) instead.
     """
     if q_center.shape != (4,):
         raise ValueError(f"q_center must be (4,), got {tuple(q_center.shape)}")
@@ -160,7 +164,9 @@ def rotation_cone(
     # is guaranteed to appear — useful for sanity checks.
     cone_rad = math.radians(cone_deg)
     theta = rng.uniform(0.0, cone_rad, size=n)
-    theta[0] = 0.0  # first sample is exact center
+    if n:
+        theta[0] = 0.0  # first sample is exact center
+    # n = 0 is the honest "no leak" setting and must not raise.
 
     half = theta / 2.0
     delta_xyz = v * np.sin(half)[:, None]                # (n, 3)
@@ -386,15 +392,32 @@ def farthest_point_order(
 def covering_radius_deg(
     quats: torch.Tensor,
     *,
-    n_probe: int = 20000,
-    seed: int = 0,
+    n_probe: int = 200000,
+    seed: int = 1,
     chunk: int = 512,
 ) -> dict:
     """Measure how far a random orientation can be from the grid.
 
     Returns the mean / median / 95th percentile / max nearest-grid angle over
-    ``n_probe`` uniformly random orientations. The max estimates the covering
-    radius, i.e. the ``Delta`` that Chen & Weng 2003 quote for their sets.
+    ``n_probe`` uniformly random orientations.
+
+    **``max_deg`` is a downward-biased LOWER BOUND on the covering radius**, not
+    the covering radius itself: a sample maximum can only underestimate a
+    supremum, and the SO(3) volume within eps of the deepest hole shrinks like
+    eps^3, so the gap closes only as ``n_probe^(-1/3)`` — 8x more probes to
+    halve the error. Measured bias against a 2M-probe + local-ascent reference:
+    -9% at n_probe=4000 and -6% at 20000 for a 1944-point Hopf grid (16.8 deg
+    and 17.5 deg against a true value of >=18.5 deg). The key is returned as
+    ``max_deg_lower_bound``; ``max_deg`` is kept as an alias for older readers.
+    ``mean_deg`` and ``p95_deg`` ARE converged at n_probe=20000 (sd 0.02 deg)
+    and are safe to quote. Note also that the ``Delta`` Chen & Weng 2003 quote
+    is a *guaranteed bound*, so it is not the same kind of number; packing
+    efficiency is the like-for-like comparison.
+
+    The default ``seed`` is 1, not 0: ``random_quaternions`` is prefix-stable,
+    so probing a ``random_quaternions(..., seed=0)`` grid with ``seed=0`` makes
+    the first ``min(N, n_probe)`` probes literally be the grid points and
+    reports a covering radius of ~0.
     """
     probe = random_quaternions(n_probe, seed=seed, device=quats.device,
                                dtype=quats.dtype)
@@ -403,6 +426,8 @@ def covering_radius_deg(
         e = min(s + chunk, n_probe)
         best[s:e] = so3_geodesic_deg(probe[s:e], quats).min(dim=1).values
     b = best.double()
+    lb = float(b.max())
     return {"n_grid": int(quats.shape[0]), "n_probe": n_probe,
             "mean_deg": float(b.mean()), "median_deg": float(b.median()),
-            "p95_deg": float(b.quantile(0.95)), "max_deg": float(b.max())}
+            "p95_deg": float(b.quantile(0.95)),
+            "max_deg_lower_bound": lb, "max_deg": lb}

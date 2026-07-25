@@ -68,7 +68,8 @@ from zdock.atomtypes import iface_ij
 from zdock.dataset import generate_decoys, label_decoys
 from zdock.evaluate import evaluate_ranking
 from zdock.prep_cache import load_prepared
-from zdock.score import docking_score_elec, iface_score_matrix
+from zdock.score import (docking_score_elec, iface_score_matrix,
+                         SC_REFERENCE_SPACING)
 from zdock.train import loss_basin, loss_margin_hard_negatives, loss_param_prior
 
 KS = (1, 5, 10, 50, 100)
@@ -144,7 +145,10 @@ def normalized_scores(f: Feats, alpha, iface, beta) -> torch.Tensor:
     0.5). Centering and dividing by a detached positive scalar cannot change
     pose order, so the trained parameters rank exactly as the raw score does."""
     s = score_from_feats(f, alpha, iface, beta)
-    scale = s.detach().std().clamp_min(1.0)
+    # `std()` of a 1-element tensor is NaN and `clamp_min` propagates it, so a
+    # single one-pose complex would NaN the loss and Adam would permanently
+    # poison alpha and iface. `unbiased=False` returns 0 there instead.
+    scale = s.detach().std(unbiased=False).clamp_min(1.0)
     return (s - s.detach().mean()) / scale
 
 
@@ -182,7 +186,7 @@ def mine_complex(prot, alpha, iface, beta0, charge0, args, round_idx: int,
                 charge_score_lut=charge0,
                 n_random_rot=args.mine_random_rot, n_cone=args.mine_cone,
                 ntop=args.mine_ntop, seed=args.seed + 1000 * round_idx,
-                rot_chunk_size=rot_chunk,
+                rot_chunk_size=rot_chunk, spacing=args.spacing,
             )
             alpha_d = torch.zeros((), device=device, dtype=dtype)
             iface_d = iface_ij(device=device, dtype=dtype, flat=True)
@@ -192,6 +196,7 @@ def mine_complex(prot, alpha, iface, beta0, charge0, args, round_idx: int,
                 poses, prot.lig_radius, prot.lig_sasa,
                 prot.lig_atomtype_id, prot.lig_charge_id,
                 alpha_d, iface_d, beta0, charge0,
+                lig_xyz_for_grid=prot.lig_ref, spacing=args.spacing,
                 frame_chunk_size=frame_chunk, return_components=True,
             )
             rmsd, dockq = label_decoys(prot, poses, pose_chunk=pose_chunk)
@@ -275,9 +280,13 @@ def mean_objective(feats, alpha, iface, alpha0, iface0, beta0, args,
     for f in feats:
         g = f.to(device)
         s = normalized_scores(g, alpha, iface, beta0)
-        total = total + loss_basin(s, g.dockq, temperature=args.basin_temp)
+        # Forward the pool's own threshold: the loss functions default to 0.23
+        # independently of --dockq-threshold, so the two would silently diverge
+        # the moment that flag is passed.
+        total = total + loss_basin(s, g.dockq, temperature=args.basin_temp,
+                                   positive_threshold=args.dockq_thr)
         total = total + args.lambda_margin * loss_margin_hard_negatives(
-            s, g.dockq, margin=args.margin)
+            s, g.dockq, margin=args.margin, positive_threshold=args.dockq_thr)
     total = total / max(1, len(feats))
     return total + args.lambda_prior * loss_param_prior(
         alpha, iface, charge_dummy, alpha0, iface0, charge_dummy)
@@ -424,7 +433,16 @@ def select_split(args):
     def eligible(pid: str) -> bool:
         if status.get(pid, {}).get("status") != "ok":
             return False
-        if max_vox and voxels.get(pid, 0) > max_vox:
+        # Fail CLOSED on a missing voxel entry. `voxels.get(pid, 0)` treated an
+        # absent id as 0 voxels, i.e. always eligible, so extending the prep
+        # cache would let new complexes bypass the size cutoff entirely and
+        # break the "identical filter for every N and seed" guarantee.
+        if max_vox and pid not in voxels:
+            raise SystemExit(
+                f"{pid} is 'ok' in the prep manifest but absent from "
+                f"{args.grid_voxels}; re-run scripts/compute_grid_sizes.py so "
+                f"the size filter is applied to every candidate")
+        if max_vox and voxels[pid] > max_vox:
             return False
         return True
 
@@ -497,7 +515,14 @@ def main() -> None:
     ap.add_argument("--min-steps", type=int, default=1500, dest="min_steps")
     ap.add_argument("--alpha-lr", type=float, default=1e-5, dest="alpha_lr")
     ap.add_argument("--iface-lr", type=float, default=5e-4, dest="iface_lr")
-    ap.add_argument("--alpha-max", type=float, default=0.1, dest="alpha_max")
+    # alpha0 is a CLI knob and alpha_max defaults to 10*alpha0 so the box
+    # constraint can never sit below the initial value. The old hardcoded
+    # (0.01, max 0.1) pair capped alpha a factor of 10 BELOW the 1.0 that
+    # Chen et al. 2003 Eq. (2) implies, i.e. the optimum was outside the
+    # feasible set and "training did not help" was confounded with it.
+    ap.add_argument("--alpha0", type=float, default=0.01, dest="alpha0")
+    ap.add_argument("--alpha-max", type=float, default=0.0, dest="alpha_max",
+                    help="0 = 10 * alpha0")
     ap.add_argument("--batch-size", type=int, default=16, dest="batch_size")
     ap.add_argument("--lambda-margin", type=float, default=0.5, dest="lambda_margin")
     ap.add_argument("--lambda-prior", type=float, default=0.1, dest="lambda_prior")
@@ -514,6 +539,10 @@ def main() -> None:
     # memory again but costs ~29% more time.
     ap.add_argument("--frame-chunk", type=int, default=200, dest="frame_chunk")
     ap.add_argument("--rot-chunk", type=int, default=8, dest="rot_chunk")
+    # One spacing for BOTH the search that generates the pool and the scorer
+    # that featurises it. These used to disagree (3.0 vs 1.2), so the top-N cut
+    # was made under a different objective from the one being trained.
+    ap.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
     ap.add_argument("--dockq-budget", type=int, default=50_000_000,
                     dest="dockq_budget",
                     help="max elements in the dense DockQ (chunk,N_rec,N_lig) tensor")
@@ -525,6 +554,11 @@ def main() -> None:
     ap.add_argument("--mine-cone", type=int, default=400, dest="mine_cone")
     ap.add_argument("--mine-ntop", type=int, default=1500, dest="mine_ntop")
     args = ap.parse_args()
+    if args.alpha_max <= 0:
+        args.alpha_max = 10.0 * args.alpha0
+    assert args.alpha_max >= args.alpha0, (
+        f"--alpha-max {args.alpha_max} is below --alpha0 {args.alpha0}: "
+        "the initial value would be outside the feasible set")
 
     t_start = time.time()
     device = torch.device(args.device)
@@ -536,7 +570,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     skip_log = open(run_dir / "skipped.jsonl", "w", buffering=1)
 
-    alpha0 = torch.tensor(0.01, device=device, dtype=dtype)
+    alpha0 = torch.tensor(args.alpha0, device=device, dtype=dtype)
     beta0 = torch.tensor(3.0, device=device, dtype=dtype)
     iface0 = iface_ij(device=device, dtype=dtype, flat=True)
     charge0 = default_charge_score(device=device, dtype=dtype)
@@ -598,8 +632,16 @@ def main() -> None:
         """Return ``(Feats, meta)`` on success or ``(None, meta)`` on failure."""
         prot_cpu = load_prepared(args.prep_cache, pid)
         if prot_cpu is None:
-            return None, {"stage": "cache_load", "reason": "missing",
-                          "n_rec": -1, "n_lig": -1}
+            # `load_prepared` returns None for a MISSING **or CORRUPT** entry,
+            # and the rescue pass only retries `stage == "mine"`. Silently
+            # skipping here would drop the complex from the fit set while
+            # `len(fit_ids) == n_fit` still held (that assertion checks the id
+            # list, not the loaded pool), i.e. the run would quietly train at
+            # N-1. The prep cache is meant to be complete, so this is fatal.
+            raise SystemExit(
+                f"prep cache entry for {pid} is missing or unreadable under "
+                f"{args.prep_cache}. Re-prepare it (scripts/prep_pinder_cache.py "
+                f"--force) rather than running at a silently reduced N.")
         meta = {"stage": "mine", "n_rec": prot_cpu.n_rec, "n_lig": prot_cpu.n_lig}
         prot = None
         try:

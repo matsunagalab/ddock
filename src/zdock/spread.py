@@ -18,16 +18,22 @@ The five public APIs:
 Grid shape is `(nx, ny, nz)` — the same convention as docking.jl. Index
 ordering in `scatter_add` is `flat = ix * ny * nz + iy * nz + iz`.
 
-Index semantics match Julia's `ceil((x - x_min) / dx)` exactly: the *1-based*
-Julia cell index is mapped to *0-based* Python by subtracting 1. If an atom
-sits exactly on `x_min` that produces index -1; bounds check drops it.
+Atoms are assigned to their **nearest** grid point (`round((x - x_min) / dx)`),
+not to the point below them — see `_nearest_cell_indices` for why the original
+Julia `ceil(...) - 1` binning was a half-cell bias and what it cost.
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
+
+#: Restore the Julia reference's `ceil((x - x_min)/dx) - 1` floor binning. Only
+#: for bit-exact comparison against the pre-2026-07 behaviour; see
+#: `_nearest_cell_indices`.
+_LEGACY_FLOOR_BINNING = os.environ.get("ZDOCK_LEGACY_FLOOR_BINNING", "") == "1"
 
 
 def _nearest_cell_indices(
@@ -36,17 +42,38 @@ def _nearest_cell_indices(
     y_grid: torch.Tensor,
     z_grid: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return per-atom nearest (ix, iy, iz) in 0-based Python indexing,
-    matching Julia's `ceil((x - x_min)/dx)` after the 1→0 index shift."""
+    """Return per-atom **nearest** (ix, iy, iz) in 0-based Python indexing.
+
+    `generate_grid` places grid points at `x_min + i*h`, so the nearest point to
+    `x` is `round((x - x_min)/h)`. The Julia reference used
+    `ceil((x - x_min)/h) - 1`, which is a **floor**: it always picks the point
+    at or below the atom. That is a systematic `-h/2` displacement per axis
+    (measured on 1KXQ: mean signed offset (-0.629, -0.603, -0.598) Å at
+    h = 1.2 Å), and since every receptor grid is built from true atom positions
+    while all three ligand grids (IFACE `L`, PSC `Re[L]`, ELEC `Q_L`) go through
+    this function, it misregistered the two partners by half a cell. The FFT
+    translates by whole cells, so the search could not recover it. Measured
+    effect on the IFACE term at the paper's 1.2 Å: the exact pair sum -432.31
+    was reproduced as -288.40 (33.3% low) under floor and -4.3% low under
+    nearest.
+
+    Set the environment variable ``ZDOCK_LEGACY_FLOOR_BINNING=1`` to restore the
+    Julia behaviour for bit-exact comparison against the old reference.
+    """
     dx = (x_grid[1] - x_grid[0]).item()
     dy = (y_grid[1] - y_grid[0]).item()
     dz = (z_grid[1] - z_grid[0]).item()
     x_min = x_grid[0].item()
     y_min = y_grid[0].item()
     z_min = z_grid[0].item()
-    ix = torch.ceil((xyz[:, 0] - x_min) / dx).long() - 1
-    iy = torch.ceil((xyz[:, 1] - y_min) / dy).long() - 1
-    iz = torch.ceil((xyz[:, 2] - z_min) / dz).long() - 1
+    if _LEGACY_FLOOR_BINNING:
+        ix = torch.ceil((xyz[:, 0] - x_min) / dx).long() - 1
+        iy = torch.ceil((xyz[:, 1] - y_min) / dy).long() - 1
+        iz = torch.ceil((xyz[:, 2] - z_min) / dz).long() - 1
+        return ix, iy, iz
+    ix = torch.round((xyz[:, 0] - x_min) / dx).long()
+    iy = torch.round((xyz[:, 1] - y_min) / dy).long()
+    iz = torch.round((xyz[:, 2] - z_min) / dz).long()
     return ix, iy, iz
 
 

@@ -47,6 +47,7 @@ import torch  # noqa: E402
 
 from zdock.dockq import dockq_batch, ligand_rmsd_to_native  # noqa: E402
 from zdock.prep_cache import load_prepared  # noqa: E402
+from zdock.score import SC_REFERENCE_SPACING  # noqa: E402
 from zdock.rotation_grid import random_quaternions, rotation_cone  # noqa: E402
 from zdock.search import _rotate_batch  # noqa: E402
 
@@ -103,10 +104,12 @@ def main() -> None:
     ap.add_argument("--out", default="data/scaling/eval_search/ceiling.csv")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--n-rot", type=int, default=1900, dest="n_rot")
-    ap.add_argument("--n-cone", type=int, default=400, dest="n_cone")
+    # 0 = the honest condition. A non-zero cone seeds the rotation set with
+    # orientations near q*, which leaks the answer into the candidate set.
+    ap.add_argument("--n-cone", type=int, default=0, dest="n_cone")
     ap.add_argument("--cone-deg", type=float, default=25.0, dest="cone_deg")
     ap.add_argument("--rot-seed", type=int, default=12345, dest="rot_seed")
-    ap.add_argument("--spacing", type=float, default=3.0)
+    ap.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
     ap.add_argument("--dockq-budget", type=int, default=50_000_000, dest="dockq_budget")
     ap.add_argument("--dockq-threshold", type=float, default=0.23, dest="dockq_thr")
     ap.add_argument("--limit", type=int, default=0)

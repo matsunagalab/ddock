@@ -24,6 +24,7 @@ import torch
 
 from zdock.atomtypes import charge_score as default_charge_score
 from zdock.atomtypes import iface_ij
+from zdock.score import SC_REFERENCE_SPACING
 from zdock.dataset import (
     generate_decoys,
     label_decoys,
@@ -183,7 +184,7 @@ def main() -> None:
     p.add_argument("--n-cone", type=int, default=400, dest="n_cone")
     p.add_argument("--cone-deg", type=float, default=25.0, dest="cone_deg")
     p.add_argument("--ntop", type=int, default=2000)
-    p.add_argument("--spacing", type=float, default=3.0)
+    p.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
     p.add_argument("--rot-chunk-size", type=int, default=32, dest="rot_chunk_size")
     p.add_argument("--rmsd-threshold", type=float, default=5.0, dest="rmsd_threshold")
     p.add_argument("--seed", type=int, default=0)

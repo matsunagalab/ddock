@@ -71,10 +71,12 @@ def mann_whitney_auc(scores: torch.Tensor, pos: torch.Tensor) -> float:
     # average ranks (1-based, ascending) with tie correction
     order = torch.argsort(scores)
     ranks = torch.empty_like(scores, dtype=torch.float64)
-    ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float64)
+    ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float64,
+                                device=scores.device)
     uniq, inv, counts = torch.unique(scores, return_inverse=True, return_counts=True)
     if int((counts > 1).sum()):
-        rank_sum = torch.zeros(uniq.numel(), dtype=torch.float64)
+        rank_sum = torch.zeros(uniq.numel(), dtype=torch.float64,
+                               device=scores.device)
         rank_sum.index_add_(0, inv, ranks)
         ranks = (rank_sum / counts.to(torch.float64))[inv]
     r_pos = float(ranks[pos].sum())

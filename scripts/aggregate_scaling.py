@@ -49,12 +49,19 @@ def main() -> None:
     for d in sorted(runs_dir.glob("N*_seed*")):
         n = int(d.name.split("_")[0][1:])
         seed = int(d.name.split("seed")[1])
+        # Collect the split BEFORE the completed-round check: a broken split in
+        # an in-flight run must still be caught by the structural checks below.
+        sp_path = d / "split.json"
+        if sp_path.exists():
+            sp = json.loads(sp_path.read_text())
+            splits[(n, seed)] = (set(sp["fit_ids"]), set(sp["val_ids"]))
         rounds = {}
         for f in sorted(d.glob("round*_metrics.json")):
             r = json.loads(f.read_text())
             rounds[r["round"]] = r
         if not rounds:
-            print(f"[skip] {d.name}: no completed round yet")
+            print(f"[skip] {d.name}: no completed round yet "
+                  f"(split still checked)")
             continue
         base = d / "baseline_test.json"
         runs[(n, seed)] = {
@@ -63,8 +70,6 @@ def main() -> None:
             "coverage": json.loads((d / "coverage.json").read_text())
             if (d / "coverage.json").exists() else None,
         }
-        sp = json.loads((d / "split.json").read_text())
-        splits[(n, seed)] = (set(sp["fit_ids"]), set(sp["val_ids"]))
 
     if not runs:
         raise SystemExit(f"no completed runs under {runs_dir}")
@@ -95,6 +100,10 @@ def main() -> None:
                 print(f"  FAIL N={n}: split differs between seeds"); ok = False
     print(f"  fit/val disjoint, TEST-clean, nested across N: "
           f"{'OK' if ok else 'PROBLEMS FOUND'}")
+    if not ok:
+        # Exit non-zero: printing and then writing the CSVs anyway meant a
+        # pipeline could not tell a violated run from a clean one.
+        raise SystemExit("structural checks FAILED — refusing to aggregate")
 
     # ---- per-run table ----------------------------------------------------
     rows = []

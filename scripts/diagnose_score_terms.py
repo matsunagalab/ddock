@@ -56,7 +56,8 @@ from zdock.atomtypes import iface_ij  # noqa: E402
 from zdock.dockq import dockq_batch, ligand_rmsd_to_native  # noqa: E402
 from zdock.prep_cache import load_prepared  # noqa: E402
 from zdock.rotation_grid import random_quaternions, rotation_cone  # noqa: E402
-from zdock.score import SC_REFERENCE_SPACING, docking_score_elec  # noqa: E402
+from zdock.score import (SC_REFERENCE_SPACING, docking_score_elec,  # noqa: E402
+                         iface_score_matrix)
 from zdock.search import _rotate_batch  # noqa: E402
 
 #: Chen & Weng 2002 Eq. (6): "The default values for scaling factors are
@@ -66,6 +67,13 @@ REPO_BETA = 3.0
 
 
 def auc(scores: torch.Tensor, pos: torch.Tensor) -> float:
+    """Mann-Whitney AUC with **midrank tie correction**.
+
+    Several of the quantities scored here are integer contact counts, i.e.
+    maximally tied inputs. Without the midrank block an all-tied vector returns
+    0.70 instead of 0.50 and the result depends on the input order (five random
+    permutations of one dataset gave 0.859-0.871).
+    """
     n_pos, n_neg = int(pos.sum()), int((~pos).sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
@@ -73,6 +81,13 @@ def auc(scores: torch.Tensor, pos: torch.Tensor) -> float:
     ranks = torch.empty_like(scores, dtype=torch.float64)
     ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float64,
                                device=scores.device)
+    uniq, inv, counts = torch.unique(scores, return_inverse=True,
+                                     return_counts=True)
+    if int((counts > 1).sum()):
+        rank_sum = torch.zeros(uniq.numel(), dtype=torch.float64,
+                               device=scores.device)
+        rank_sum.index_add_(0, inv, ranks)
+        ranks = (rank_sum / counts.to(torch.float64))[inv]
     u = float(ranks[pos].sum()) - n_pos * (n_pos + 1) / 2.0
     return u / (n_pos * n_neg)
 
@@ -218,7 +233,10 @@ def main() -> None:
             del prot, prot_cpu, poses
             continue
         sc, T, el = components(prot, poses, alpha1, iface, beta1, charge, args)
-        imat = iface.view(12, 12).T
+        # The score the FFT search ranks by applies IFACE_SIGN; reconstructing
+        # from the raw table gives the NEGATION of the real IFACE term and
+        # silently relabels every downstream column.
+        imat = iface_score_matrix(iface)
         ones = torch.ones_like(imat)
         IF = (imat * T).sum(dim=(-2, -1))
         CNT = (ones * T).sum(dim=(-2, -1))          # pure contact count
@@ -231,7 +249,9 @@ def main() -> None:
                "auc_SC": auc(sc, pos), "auc_IFACE": auc(IF, pos),
                "auc_ELEC": auc(el, pos),
                "auc_COUNT": auc(CNT, pos),          # near-native = more contacts?
-               "auc_NEG_IFACE": auc(-IF, pos)}      # is the table sign-flipped?
+               # control: what the AUC would be with the sign convention
+               # reversed. `auc_IFACE` is the term actually scored.
+               "auc_FLIPPED_IFACE": auc(-IF, pos)}
         # --- contact-count-matched comparison -------------------------------
         # Near-native poses make a large complementary interface while a decoy
         # dropped onto a convex surface only grazes it, so the raw comparison
@@ -250,7 +270,7 @@ def main() -> None:
             pb = pos[b]
             row["match_auc_COUNT"] = auc(CNT[b], pb)
             row["match_auc_IFACE"] = auc(IF[b], pb)
-            row["match_auc_NEG_IFACE"] = auc(-IF[b], pb)
+            row["match_auc_FLIPPED_IFACE"] = auc(-IF[b], pb)
             row["match_auc_SC"] = auc(sc[b], pb)
         else:
             for k in ("COUNT", "IFACE", "NEG_IFACE", "SC"):
@@ -272,7 +292,7 @@ def main() -> None:
             row[f"absmean_bEL[{name}]"] = float((b * el).abs().mean())
         rows.append(row)
         print(f"  [{pid[:30]:<30}] AUC  SC={row['auc_SC']:.3f} "
-              f"IFACE={row['auc_IFACE']:.3f} -IFACE={row['auc_NEG_IFACE']:.3f} "
+              f"IFACE={row['auc_IFACE']:.3f} flip={row['auc_FLIPPED_IFACE']:.3f} "
               f"count={row['auc_COUNT']:.3f} | bal-IF={row['auc[a=balanced, -IFACE]']:.3f}",
               flush=True)
         del prot, prot_cpu, poses
@@ -299,7 +319,7 @@ def main() -> None:
     print(f"     contact count  Sum n_ij     {mean('auc_COUNT'):8.4f}  "
           f"(near-native should have MORE contacts)")
     print(f"     +IFACE         Sum e_ij n_ij{mean('auc_IFACE'):8.4f}")
-    print(f"     -IFACE        -Sum e_ij n_ij{mean('auc_NEG_IFACE'):8.4f}")
+    print(f"     flipped IFACE +Sum e_ij n_ij{mean('auc_FLIPPED_IFACE'):8.4f}")
     print("\n2c) SC / IFACE BALANCE")
     print(f"     alpha making |a*S_SC| = |S_IFACE|: {mean('alpha_balanced'):.4f} "
           f"(repo/paper use 0.01)")

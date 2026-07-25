@@ -63,6 +63,12 @@ class DockQComponents:
     i_rmsd: torch.Tensor
     l_rmsd: torch.Tensor
     dockq: torch.Tensor
+    #: Number of reference receptor-ligand atom contacts the Fnat term was
+    #: computed against. 0 means the two chains do not touch in the reference,
+    #: so Fnat is undefined and `dockq` is the 2-term renormalisation; a small
+    #: value (< ~20) means Fnat is coarsely quantised. Callers doing corpus
+    #: statistics should record or skip these.
+    n_native_contacts: int = -1
 
 
 def native_contacts(
@@ -158,10 +164,13 @@ def dockq_batch(
         rec_xyz, native_lig_xyz, cutoff=contact_cutoff,
     )                                               # (N_rec, N_lig) bool
     n_native = native_contact_mask.sum().to(dtype)
-    # Fnat denominator; fall back to 1 to avoid div-by-zero for complexes
-    # with no detectable native contacts (would only happen with wildly
-    # wrong cutoffs or a broken pseudo-native). The dockq score itself
-    # then becomes iRMSD + LRMSD only.
+    # Fnat denominator; fall back to 1 to avoid div-by-zero for complexes with
+    # no detectable native contacts. This happens for real inputs — 2 of 150
+    # cached PINDER complexes have zero receptor-ligand contacts, one with a
+    # 106 Å minimum inter-chain distance — so it must not fail silently: with
+    # `fnat = 0` the sum is still divided by 3 and the *exact native pose*
+    # scores 0.667 instead of 1.0. We renormalise over the two well-defined
+    # terms instead and expose the count so callers can skip the complex.
     n_native_safe = torch.where(
         n_native > 0, n_native, torch.ones_like(n_native),
     )
@@ -207,10 +216,16 @@ def dockq_batch(
     scale_l = torch.tensor(_DOCKQ_LRMSD_SCALE, dtype=dtype, device=device)
     term_i = 1.0 / (1.0 + (i_rmsd / scale_i).pow(2))
     term_l = 1.0 / (1.0 + (l_rmsd / scale_l).pow(2))
-    dockq = (fnat + term_i + term_l) / 3.0
+    if n_native.item() == 0:
+        # Renormalise over the two defined terms so a perfect pose still
+        # scores 1.0. Recorded via `n_native` on the result.
+        dockq = (term_i + term_l) / 2.0
+    else:
+        dockq = (fnat + term_i + term_l) / 3.0
 
     return DockQComponents(
         fnat=fnat, i_rmsd=i_rmsd, l_rmsd=l_rmsd, dockq=dockq,
+        n_native_contacts=int(n_native.item()),
     )
 
 

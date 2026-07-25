@@ -15,16 +15,16 @@ Convention (audited — see `PORT_PLAN_FFT.md`):
     coordinates to produce the docked pose.
 
     For the complex SC grid Z_R = R_real + i·R_imag, Z_L = L_real +
-    i·L_imag, the docking_score_elec's SC term at a fixed pose is
-        Σ_cell [real(Z_R · Z_L) − imag(Z_R · Z_L)]
+    i·L_imag, docking_score_elec's SC term at a fixed pose is Chen & Weng
+    2003 Eq. (4), the REAL PART ONLY:
+        Σ_cell real(Z_R · Z_L) = Σ_cell [R_real·L_real − R_imag·L_imag]
+    i.e. favourable atom-pair count minus clash penalty, higher = better.
     The FFT generalisation over translations uses the complex
     cross-correlation G = ifft(fft(Z_R) · conj(fft(conj(Z_L)))), which
-    for any complex Z_L equals Σ_m Z_R[m] · Z_L[m − t] (no conjugation
-    of Z_L inside the sum — the outer conj+conj cancels for this
-    purpose). Then score_sc(t) = real(G[t]) − imag(G[t]).
-
-This file implements Phase 1 of `PORT_PLAN_FFT.md`: SC term only. DS,
-IFACE, ELEC follow in Phase 2.
+    for any complex Z_L equals Σ_m Z_R[m] · Z_L[m − t]. Then
+        score_sc(t) = real(G[t]).
+    (The older `real(G) − imag(G)` form belongs to the Chen & Weng 2002 GSC
+    encoding, which this file no longer implements.)
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from .score import (
     IFACE_PAIR_OFFSET,
     IFACE_SIGN,
     iface_score_matrix,
+    ligand_partial_charge,
     SC_REFERENCE_SPACING,
     SC_RHO,
     _grouped_spread_nearest_add,
@@ -145,10 +146,10 @@ def _build_ligand_sc_grid_single(
     """Ligand ``L_SC`` for a single pose, Chen & Weng 2002 Eq. (1).
 
     Mirrors the batched construction in `docking_score_elec` /
-    `_build_ligand_sc_grids_vectorised`: real and imaginary parts are mutually
-    exclusive (surface overwrites core), then the core's open boundary becomes
-    surface. Matching this exactly is required for Phase 1 V-SC parity against
-    `docking_score_elec`.
+    `_build_ligand_sc_grids_vectorised`: `Im` is the clash channel of
+    :func:`zdock.score.sc_encode` (surface takes precedence over core) and `Re`
+    is one count at each ligand atom's nearest grid point. Matching this exactly
+    is required for V-SC parity against `docking_score_elec`.
     """
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
     device = lig_xyz.device
@@ -194,6 +195,7 @@ def _build_ligand_sc_grids_batch(
     z_grid: torch.Tensor,
     *,
     surface_threshold: float = 1.0,
+    sc_rho=SC_RHO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched ligand SC grid construction — see
     `_build_ligand_sc_grids_vectorised` for the fast path used by
@@ -213,6 +215,7 @@ def _build_ligand_sc_grids_batch(
     for b in range(B):
         Lr, Li = _build_ligand_sc_grid_single(
             lig_xyz_rot[b], lig_radius, lig_surf, x_grid, y_grid, z_grid,
+            sc_rho=sc_rho,
         )
         L_real[b] = Lr
         L_imag[b] = Li
@@ -335,7 +338,7 @@ def _build_ligand_elec_grids_vectorised(
 
     xyz_flat = lig_xyz_rot.reshape(-1, 3)
     frame_idx = torch.arange(B, device=device).repeat_interleave(N_lig)
-    lig_q = partial_charge_per_atom(lig_charge_id, charge_score_lut)
+    lig_q = ligand_partial_charge(lig_charge_id, charge_score_lut)
     weights_flat = lig_q.unsqueeze(0).expand(B, -1).reshape(-1)
 
     grid = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
@@ -438,10 +441,13 @@ def _build_receptor_elec_grid(
     *,
     rcut_elec: float = 8.0,
 ) -> torch.Tensor:
-    """Coulomb-mode receptor potential grid matching
-    ``docking_score_elec`` (score.py lines 454-467). V[cell] = Σ_j
-    q_j / |cell − r_j|, zeroed inside the receptor SC shape (Chen 2002
-    §2.2). Returns (nx, ny, nz) real.
+    """Coulomb-mode receptor potential grid matching ``docking_score_elec``.
+
+    V[cell] = Σ_j q_j / |cell − r_j|, zeroed *inside the receptor's own atoms*
+    (Chen 2002 §2.2). The occupancy test is on ``R_imag`` only — see the long
+    comment in ``score.py``'s ``docking_score_elec``; ``R_real`` is the PSC
+    pair-count channel and using it here deleted the entire interface shell.
+    Returns (nx, ny, nz) real.
     """
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
     device = rec_xyz.device
@@ -451,7 +457,7 @@ def _build_receptor_elec_grid(
     spread_neighbors_coulomb(
         V, rec_xyz, rec_q, rcut_elec, x_grid, y_grid, z_grid,
     )
-    open_mask = ((R_real == 0) & (R_imag == 0)).to(dtype)
+    open_mask = (R_imag <= 0).to(dtype)
     return V * open_mask
 
 
@@ -470,7 +476,7 @@ def _build_ligand_elec_grid_single(
     nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
     device = lig_xyz.device
     dtype = lig_xyz.dtype
-    lig_q = partial_charge_per_atom(lig_charge_id, charge_score_lut)
+    lig_q = ligand_partial_charge(lig_charge_id, charge_score_lut)
     # _grouped_spread_nearest_add requires grouping; use a single-group
     # (group=0) view and collect into a 1-slab grid.
     grid = torch.zeros((1, nx, ny, nz), device=device, dtype=dtype)
@@ -683,8 +689,6 @@ def docking_search(
     buf_quat = torch.zeros((ntop,), device=device, dtype=torch.long)
     buf_flat = torch.zeros((ntop,), device=device, dtype=torch.long)
 
-    # Precompute ligand partial charges (scalars per atom — rotation-invariant).
-    lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score_lut)
     lig_surf = lig_sasa > surface_threshold
 
     for chunk_start in range(0, n_rot, rot_chunk_size):
@@ -769,6 +773,14 @@ def docking_search(
         buf_scores = all_scores[order]
         buf_quat = all_quat[order]
         buf_flat = all_flat[order]
+
+    # Drop the `-inf` pre-fill. With `trans_per_rotation=1` only `n_rot`
+    # candidates are ever generated, so an `ntop` larger than that would
+    # otherwise return placeholders that decode to quaternion 0 at translation
+    # (0, 0, 0) — the reference ligand on the receptor centroid — and callers
+    # would count them as real poses in recall / top-K statistics.
+    real = torch.isfinite(buf_scores)
+    buf_scores, buf_quat, buf_flat = buf_scores[real], buf_quat[real], buf_flat[real]
 
     tz = buf_flat % nz
     ty = (buf_flat // nz) % ny
@@ -963,7 +975,7 @@ def docking_search_sc(
         # Scatter each rotated ligand into SC grids.
         L_real, L_imag = _build_ligand_sc_grids_batch(
             lig_rot, lig_radius, lig_sasa, x_grid, y_grid, z_grid,
-            surface_threshold=surface_threshold,
+            surface_threshold=surface_threshold, sc_rho=sc_rho,
         )
         Z_L = (L_real + 1j * L_imag).to(complex_dtype)
 
@@ -1011,8 +1023,10 @@ def docking_search_sc(
         buf_quat = all_quat[order]
         buf_flat = all_flat[order]
 
-    # 6. Decode flat cell indices to signed cartesian translations.
-    V = nx * ny * nz
+    # 6. Decode flat cell indices to signed cartesian translations. Drop the
+    #    `-inf` pre-fill first (see `docking_search`).
+    real = torch.isfinite(buf_scores)
+    buf_scores, buf_quat, buf_flat = buf_scores[real], buf_quat[real], buf_flat[real]
     tz = buf_flat % nz
     ty = (buf_flat // nz) % ny
     tx = (buf_flat // (ny * nz)) % nx
@@ -1040,8 +1054,14 @@ def docking_score_sc_direct(
 ) -> torch.Tensor:
     """Naive O(V²) cross-correlation for test reference.
 
-    score_sc(t) = Σ_cell [R_r·L_r − R_i·L_i − R_r·L_i − R_i·L_r]
-                         evaluated with L shifted by +t.
+    Chen & Weng 2003 Eq. (4), real part only — the same combination
+    `docking_search_sc` and `docking_score_elec` use:
+
+        score_sc(t) = Σ_cell [R_r·L_r − R_i·L_i]   with L shifted by +t.
+
+    (The two extra cross terms `− R_r·L_i − R_i·L_r` of the Chen & Weng 2002
+    GSC form were removed: they made this "reference" test a different score
+    from the one production computes.)
 
     Returns a (nx, ny, nz) tensor of scores indexed cyclically (index 0 =
     zero translation, large indices wrap around to negative translations,
@@ -1056,7 +1076,6 @@ def docking_score_sc_direct(
                 # L shifted cyclically by (tx, ty, tz): L_shifted[cell] = L[cell - t]
                 Ls_real = torch.roll(L_real, shifts=(tx, ty, tz), dims=(0, 1, 2))
                 Ls_imag = torch.roll(L_imag, shifts=(tx, ty, tz), dims=(0, 1, 2))
-                s = (R_real * Ls_real - R_imag * Ls_imag
-                     - R_real * Ls_imag - R_imag * Ls_real).sum()
+                s = (R_real * Ls_real - R_imag * Ls_imag).sum()
                 out[tx, ty, tz] = s
     return out

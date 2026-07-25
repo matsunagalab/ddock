@@ -38,7 +38,8 @@ from zdock.atomtypes import iface_ij
 from zdock.data import list_proteins, load_training_dataset
 from zdock.dataset import generate_decoys, label_decoys, prepare_protein_from_pdb
 from zdock.evaluate import evaluate_ranking
-from zdock.score import docking_score_elec, iface_score_matrix
+from zdock.score import (docking_score_elec, iface_score_matrix,
+                         SC_REFERENCE_SPACING)
 from zdock.train import loss_basin, loss_margin_hard_negatives, loss_param_prior
 
 
@@ -71,7 +72,8 @@ def score_from_feats(f, alpha, iface_flat, beta):
 
 
 @torch.no_grad()
-def featurize_poses(prot, poses, name, beta0, charge0, chunk):
+def featurize_poses(prot, poses, name, beta0, charge0, chunk,
+                    spacing=SC_REFERENCE_SPACING):
     """Compute (parameter-independent) features + labels for arbitrary poses."""
     alpha_d = torch.zeros((), device=poses.device, dtype=poses.dtype)
     iface_d = iface_ij(device=poses.device, dtype=poses.dtype, flat=True)
@@ -81,6 +83,9 @@ def featurize_poses(prot, poses, name, beta0, charge0, chunk):
         poses, prot.lig_radius, prot.lig_sasa,
         prot.lig_atomtype_id, prot.lig_charge_id,
         alpha_d, iface_d, beta0, charge0,
+        # PreparedProtein carries lig_ref; the shard-loaded ProteinInputs does
+        # not, and its poses are already in the oriented frame.
+        lig_xyz_for_grid=getattr(prot, "lig_ref", None), spacing=spacing,
         frame_chunk_size=chunk, return_components=True,
     )
     rmsd, dockq = label_decoys(prot, poses)
@@ -120,7 +125,10 @@ def normalized_scores(f, alpha, iface, beta):
     used by FFT search and evaluation.
     """
     s = score_from_feats(f, alpha, iface, beta)
-    scale = s.detach().std().clamp_min(1.0)
+    # `std()` of a 1-element tensor is NaN and `clamp_min` propagates it, so a
+    # single one-pose complex would NaN the loss and Adam would permanently
+    # poison alpha and iface. `unbiased=False` returns 0 there instead.
+    scale = s.detach().std(unbiased=False).clamp_min(1.0)
     return (s - s.detach().mean()) / scale
 
 
@@ -154,9 +162,11 @@ def mean_objective(feats, alpha, iface, alpha0, iface0, beta0, args,
     total = torch.zeros((), device=alpha.device, dtype=alpha.dtype)
     for f in feats:
         s = normalized_scores(f, alpha, iface, beta0)
-        total = total + loss_basin(s, f.dockq, temperature=args.basin_temp)
+        # Forward the pool's own threshold (the losses default to 0.23).
+        total = total + loss_basin(s, f.dockq, temperature=args.basin_temp,
+                                   positive_threshold=args.dockq_thr)
         total = total + args.lambda_margin * loss_margin_hard_negatives(
-            s, f.dockq, margin=args.margin)
+            s, f.dockq, margin=args.margin, positive_threshold=args.dockq_thr)
     total = total / max(1, len(feats))
     return total + args.lambda_prior * loss_param_prior(
         alpha, iface, charge_dummy, alpha0, iface0, charge_dummy)
@@ -219,7 +229,7 @@ def train_params(train_feats, val_feats, alpha, iface, alpha0, iface0, beta0,
 
 def load_test_feats(patterns, beta0, charge0, device, dtype, chunk, cache):
     if cache and os.path.exists(cache):
-        blob = torch.load(cache, map_location=device)
+        blob = torch.load(cache, map_location=device, weights_only=True)
         return [Feats(d["name"], d["sc"].to(dtype), d["T"].to(dtype),
                       d["elec"].to(dtype), d["rmsd"].to(dtype), d["dockq"].to(dtype))
                 for d in blob]
@@ -280,7 +290,14 @@ def main() -> None:
     ap.add_argument("--epochs-per-round", type=int, default=1500, dest="epochs_per_round")
     ap.add_argument("--alpha-lr", type=float, default=1e-5, dest="alpha_lr")
     ap.add_argument("--iface-lr", type=float, default=5e-4, dest="iface_lr")
-    ap.add_argument("--alpha-max", type=float, default=0.1, dest="alpha_max")
+    # alpha0 is a CLI knob and alpha_max defaults to 10*alpha0 so the box
+    # constraint can never sit below the initial value. The old hardcoded
+    # (0.01, max 0.1) pair capped alpha a factor of 10 BELOW the 1.0 that
+    # Chen et al. 2003 Eq. (2) implies, i.e. the optimum was outside the
+    # feasible set and "training did not help" was confounded with it.
+    ap.add_argument("--alpha0", type=float, default=0.01, dest="alpha0")
+    ap.add_argument("--alpha-max", type=float, default=0.0, dest="alpha_max",
+                    help="0 = 10 * alpha0")
     ap.add_argument("--batch-size", type=int, default=16, dest="batch_size")
     ap.add_argument("--lambda-margin", type=float, default=0.5, dest="lambda_margin")
     ap.add_argument("--lambda-prior", type=float, default=0.1, dest="lambda_prior")
@@ -292,6 +309,8 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--min-delta", type=float, default=1e-4, dest="min_delta")
     ap.add_argument("--frame-chunk", type=int, default=400, dest="frame_chunk")
+    # Must be the same for the search and the featuriser — see run_pinder_scaling.
+    ap.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
     ap.add_argument("--rmsd-threshold", type=float, default=5.0, dest="rmsd_thr")
     ap.add_argument("--dockq-threshold", type=float, default=0.23, dest="dockq_thr")
     ap.add_argument("--pool-cap", type=int, default=4000, dest="pool_cap")
@@ -302,13 +321,18 @@ def main() -> None:
     ap.add_argument("--checkpoint-dir", default="data/shards_pinder/hardneg_checkpoints",
                     dest="checkpoint_dir")
     args = ap.parse_args()
+    if args.alpha_max <= 0:
+        args.alpha_max = 10.0 * args.alpha0
+    assert args.alpha_max >= args.alpha0, (
+        f"--alpha-max {args.alpha_max} is below --alpha0 {args.alpha0}: "
+        "the initial value would be outside the feasible set")
 
     device = torch.device(args.device)
     dtype = torch.float64 if device.type == "cpu" else torch.float32
     ks = (1, 5, 10, 50, 100)
     gen = torch.Generator().manual_seed(args.seed)
 
-    alpha0 = torch.tensor(0.01, device=device, dtype=dtype)
+    alpha0 = torch.tensor(args.alpha0, device=device, dtype=dtype)
     beta0 = torch.tensor(3.0, device=device, dtype=dtype)
     iface0 = iface_ij(device=device, dtype=dtype, flat=True)
     charge0 = default_charge_score(device=device, dtype=dtype)
@@ -350,8 +374,10 @@ def main() -> None:
                     charge_score_lut=charge0,
                     n_random_rot=args.mine_random_rot, n_cone=args.mine_cone,
                     ntop=args.mine_ntop, seed=args.seed + rnd,
+                    spacing=args.spacing,
                 )
-                nf = featurize_poses(prot, poses, prot.name, beta0, charge0, args.frame_chunk)
+                nf = featurize_poses(prot, poses, prot.name, beta0, charge0,
+                                     args.frame_chunk, spacing=args.spacing)
                 del poses
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
