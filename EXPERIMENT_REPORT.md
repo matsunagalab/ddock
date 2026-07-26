@@ -2941,6 +2941,18 @@ IFACE パラメータの差し替えで再現し、PSC 差し替え単独では�
 **「化学的な対ポテンシャルを学習した」という主張は現時点の証拠より強い。**
 低次元の行＋列モデルを独立に学習する対照が必要である。
 
+> **訂正（2026-07-27、§5.14.12）。** 直前の段落の「144成分の特異的な対相互作用は
+> 単独では有意でない（p=0.18）」を根拠に pair specificity の必要性を疑うのは
+> **誤りである**。$p=0.18$ は「pair residual **のみ**が baseline を上回るか」の
+> 検定であって、「pair residual を additive に**加える**増分」ではない。
+> 低次元モデルを独立に学習する対照（この段落が要求したもの）を §5.14.12 で実施した
+> 結果、**additive(23) → full(144) の増分は 3 seed とも exact McNemar $p=0.0215$、
+> AUC で Wilcoxon $p\sim10^{-7}$ と有意である**。
+> 「改善の約58%が1体的成分で再現できる」は正しいままだが、
+> **「144成分は不要」は誤り**である。残り約42%を担う121次元の pair residual の寄与は
+> 有意である。あわせて、1体的成分は12次元の対称 additive で足り、
+> 23次元へ増やしても改善は無い（完全な null）。
+
 ##### 残る限界（§5.14.7 の指摘を含む）
 
 - **bound-bound** である（250/250 が同一 PDB 由来）。unbound は未測定。
@@ -2966,6 +2978,627 @@ IFACE パラメータの差し替えで再現し、PSC 差し替え単独では�
 3. **unbound pilot**——IFACE gain がドメインを越えるか
 4. `absorb()` の契約を決めてから **mining round 1**
 5. レシピ凍結後に **N の scaling law**
+
+#### 5.14.9 実験1設計: IFACE の低次元対照（2026-07-26、実行前）
+
+**問いを2つに分ける。**
+
+1. **適応自由度の問い**: 公開済み IFACE 表 $e_0$ は固定して保持したまま、
+   学習差分に144自由度が必要か。それとも
+   $\Delta e_{ij}=g+r_i+c_j$ の additive subspace だけで十分か。
+2. **pair specificity の問い**: 最終スコアそのものに pair-specific residual が
+   必要か。
+
+提案中の $e=e_0+g+r_i+c_j$ が直接答えるのは **1だけ**である。両モデルとも
+$e_0$ の144成分と、その double-centered pair residual を配備時に保持するため、
+低次元更新が full 更新と同等でも「化学的pair potentialは不要」
+「最終モデルに144成分は不要」とは結論できない。問い2には、$e_0$ 自身を
+additive subspace へ射影し、pair residual を除いた最終モデルを別に評価する。
+
+##### パラメータ化と識別性
+
+$$
+\mathcal A=\{\Delta E=g\mathbf1\mathbf1^\top
+ +r\mathbf1^\top+\mathbf1c^\top:
+\mathbf1^\top r=\mathbf1^\top c=0\}.
+$$
+
+raw 25変数には2次元の gauge
+（$r\leftarrow r+a$, $c\leftarrow c+b$, $g\leftarrow g-a-b$）があり、
+関数空間の次元は **23**。priorを有効な144表に課せば予測値は一意になるが、
+optimizerには平坦方向と座標スケール差が残る。特に同じ learning rate で
+raw $g,r,c$ をAdam更新すると、$g$ の勾配は144セル、各 $r_i,c_j$ は12セルの
+勾配和になり、full 144座標と最適化条件が揃わない。
+
+したがって $\sum r=\sum c=0$ は課す。実装は毎stepの事後centeringより、
+12次元の zero-sum orthonormal contrast $U\in\mathbb R^{12\times11}$ を用いる
+23次元の直交基底を推奨する:
+
+$$
+\Delta E=
+\theta_g{\mathbf1\mathbf1^\top\over12}
+{(U\theta_r)\mathbf1^\top\over\sqrt{12}}
+{\mathbf1(U\theta_c)^\top\over\sqrt{12}}.
+$$
+
+このとき
+$\|\Delta E\|_F^2=\theta_g^2+\|\theta_r\|^2+\|\theta_c\|^2$ で、
+識別性と座標スケールを同時に揃えられる。簡易実装としてraw $r,c$ をforward時に
+zero-centerすることもできるが、2つのnull座標とAdamのmomentは残る。
+
+##### prior と最適化の公平性
+
+主比較では両モデルに同じ**関数空間ノルム**
+
+$$\lambda\|\Delta E\|_F^2$$
+
+を課す。次元数に応じて $\lambda$ を25/144倍する操作はしない。
+現在の `loss_param_prior(p.iface_vec(), p0.iface_vec())` はこの定義に合う。
+zero-sum gaugeでは同じpriorは
+$\lambda(144g^2+12\|r\|^2+12\|c\|^2)$ であり、
+raw coefficient norm $\lambda(g^2+\|r\|^2+\|c\|^2)$ は別のpriorなので使わない。
+
+ただし同じ $\lambda$ は「既存のfullモデルと同じ摂動コスト」という対照であって、
+各モデルに最良の汎化性能を与えるとは限らない。以下を分ける:
+
+- **主解析**: 現在の $\lambda=0.1$、同じloss、同じfit/validation split。
+- **感度解析**: 両モデルそれぞれ同じ事前規定gridから $\lambda$ とlearning rateを
+  validationだけで選ぶ。探索した候補数と予算を揃える。
+
+full IFACE-only は1500 stepでearly stopせず終了しており、まだ改善中だった可能性がある。
+同じstep数は同じ最適化品質を意味しないため、両モデルともvalidation曲線がplateauする
+十分大きな上限を与え、同じearly-stopping ruleを用いる。低次元側だけ収束が速い状態を
+capacity差と誤認しない。
+
+現 `_val_loss()` はpriorを含む `mean_objective()` をそのままcheckpoint選択に使う。
+これは「予測validation loss」ではなく「validation loss + parameter preference」であり、
+$\lambda$ 比較時に小ノルムを評価側でも再度優遇する。既存条件を忠実に再現する主解析では
+両モデルに同じ規則を使うが、best-achievable比較では学習目的にpriorを残しつつ、
+checkpoint/$\lambda$選択はpriorを除いたvalidation ranking lossで行う感度解析を設ける。
+この規則を変える場合はfull 144も同じコードで再学習し、過去checkpointと混ぜない。
+
+##### 比較条件
+
+最低限の直交したモデル族は次のとおり。
+
+| 条件 | 最終表 | 答える問い |
+|---|---|---|
+| fixed baseline | $e_0$ | 学習なし |
+| scalar update | $e_0+g$ | 接触数スケールだけで十分か |
+| additive update | $e_0+\mathcal A$ | 23更新自由度で十分か |
+| residual update | $e_0+\mathcal R$ | pair-specific更新だけで効くか |
+| full update | $e_0+\mathcal A+\mathcal R$ | 144更新自由度の上限 |
+| absolute additive | $P_\mathcal A(e_0)+\mathcal A$ | 最終スコアにpair residualが必要か |
+
+$\mathcal R$ は行和・列和がゼロの double-centered residual（121次元）で、
+$\mathcal A$ とFrobenius内積で直交する。物理的な受容体/リガンド交換対称性も別軸で
+確認する。PINDERのR/L役割が任意または組成依存なら、非対称な $r_i,c_j$ は
+datasetの役割規約を利用できるため、
+$\Delta e_{ij}=g+a_i+a_j$（12実効次元）と role-swap augmentation を含める。
+対称fullは78次元、対称double-centered residualは66次元である。
+
+rank-1 residualはこの直交分解の後に行う。$uv^\top$ は非凸でscale/rotationの
+識別性も加わり、「低次元だから勝った」のか「最適化に失敗した」のか分けにくいため、
+最初の対照としては不適切。
+
+##### 統計と判定
+
+- 固定プール236件はscreening、主評価は同じHopf gridによる**全249件
+  end-to-end success@1**。複合体が統計単位で、poseを独立標本として数えない。
+- full対low-dimensionalの最終予測を同じ複合体で比較する exact paired McNemar は、
+  モデルがnestedでも有効。nestednessが問題になるのは学習likelihoodの尤度比検定であり、
+  held-out 0/1予測のpaired比較ではない。
+- 「fullが有意に良い」は `full vs additive` の直接McNemarと、paired差のCIで評価する。
+  baselineとの差が各々有意でも、両者の差を示したことにはならない。
+- post-hoc residual-onlyのbaseline比 $p=0.18$ は、residualの**additiveへの増分**を
+  検定していない。また「+4.7/+8.0 pp = 59%」は非線形なargmax指標の差の比で、
+  分散説明率や因果的寄与率ではない。いずれも実験動機であって判定結果には使わない。
+- 「fullが有意でない」だけでは144自由度が不要とは言えない。
+  事前に非劣性margin $\delta$（例: end-to-end success@1で1〜2 pp）を定め、
+  $p_\mathrm{additive}-p_\mathrm{full}$ のpaired cluster bootstrapまたはpaired
+  score CIの下限が $-\delta$ を上回ることを要求する。249件では狭いmarginの
+  非劣性は低powerになりうるため、必要なら未使用評価複合体を増やす。
+- 3 seedは同じ学習集合・同じpoolのoptimizer反復であり、$n=3$の独立な統計標本ではない。
+  seedの集約法をvalidationだけで事前規定し、別master-list orderまたは
+  training-complex bootstrapで学習標本不確実性を測る。
+- 現PINDER-S TESTは設計に反復利用済みなので、ここでのp値は探索的。
+  $\lambda$、loss、model familyを凍結後、未使用outer cohortで確認する。
+
+##### 実験順序
+
+低次元性の結論はlossに条件付く。worst-positive marginがfull residualだけに
+境界positiveの癖を学ばせている可能性があるため、実験1とmargin ablationを完全に
+直列化しない。安価な固定pool学習で
+
+$$
+\{\text{additive},\text{full}\}\times
+\{\text{current margin},\text{marginなし/quality-aware}\}
+$$
+
+の2×2を先に行い、dimension×loss interactionを見る。その後validationだけで
+レシピを凍結し、選んだ条件をend-to-end評価する。
+
+続いて unbound pilot、mining契約の修正とround-1 pilot、最後に複数master-list orderの
+N scalingとする。miningを最終pipelineに含めるか決めずにN scalingを先に行うと、
+round-0専用のscaling curveになる。現 `hard-negative-only` round 1 は新positiveを捨て、
+round-0でpositiveゼロの複合体を救わないことを比較の前提に明記する。
+
+**データ・split・loss・seed・hardware・commands。** 本節は設計レビューであり新規runは
+行っていない。提案実験は§5.14.8と同じfit 220 / validation 55、search由来poseのみ、
+PSC固定（$\alpha=1,\rho=3.5$）、basin + margin + priorを出発点とする。
+optimizer seed 0/1/2に加え、学習標本の反復を別途設ける。固定pool段階はCPU/GPUいずれでも
+同一倍精度特徴を使用し、end-to-endは同じHopf nside=3、spacing 1.2 Å、top-1500で行う。
+実装とコマンドはパラメータ化・loss gridを確定してから記録する。
+
+**結論と限界。** additive更新がfull更新に非劣性でも証明されるのは
+「このデータ・loss・公開済み $e_0$ 周りでは23の適応自由度で足りる」までである。
+pair chemistry自体の不要性にはabsolute-additive対照と未使用cohortが必要である。
+
+#### 5.14.10 次元×margin factorialの学習完了とTEST解析規則（2026-07-27、評価中）
+
+full（144）/ additive（23）/ symmetric additive（12）×
+$\lambda_\mathrm{margin}=0.5/0.0$ × optimizer seed 0/1/2 の18 runが完走した。
+全条件で `--freeze-psc --loss-prov search --alpha0 1.0 --n-fit 220 --rounds 0`、
+1500 step、fit 220 / validation 55 / TEST 249。round-0 pool、split、PSC、lossの
+margin以外、priorは同一。新規学習の失敗、skip、OOMは報告されていない。
+
+| 次元 | val loss m5 / m0（3 seed平均） | $\|\Delta e\|$ m5 / m0 |
+|---|---:|---:|
+| full 144 | 2.7243 / 2.2491 | 1.561 / 1.583 |
+| additive 23 | 2.7952 / 2.3228 | 1.218 / 1.244 |
+| symmetric 12 | 2.7763 / 2.3028 | 1.087 / 1.127 |
+
+m5とm0は異なる目的関数なのでval lossの絶対値を比較しない。同じmargin内ではfullが
+最小だが、これはtraining familyがnestedであることと整合し、held-out top-1の優越性を
+単独では示さない。
+
+seed 0 / m5 の固定TEST pool（探索由来positiveを持つ236件）:
+
+| 条件 | success@1 | AUC | best DockQ@1 | baselineとの勝/敗 |
+|---|---:|---:|---:|---:|
+| baseline | 69.5% | 0.8696 | 0.4457 | — |
+| full | 77.5% | 0.8933 | 0.4893 | 21/2 |
+| additive | 74.2% | 0.8852 | 0.4743 | 12/1 |
+| symmetric | 73.3% | 0.8847 | 0.4674 | 10/1 |
+
+seed 0 / m5 の additive→full の直接差は McNemar $p=0.0215$、
+per-complex AUC差は Wilcoxon $p=2.1\times10^{-7}$。これはseed 0における
+探索的なfullの増分であり、残りseed・margin評価前の中間結果である。
+
+**seed集計規則。** TEST複合体はseed間で同一なので、3×236を独立標本としてpoolしない。
+各条件のmean ± SDはoptimizer感度の記述量として示す。各seedで同じseed同士をpairedに
+比較し、効果量・勝敗・p値3本をすべて報告し、最小pだけを選ばず範囲と方向一致を見る。
+seedをまたぐ単一p値は出さない。median parameterを事後に作ると新しい未規定modelに
+なるため採用しない。3-seed平均score ensembleを配備modelとして事前定義する場合に限り、
+複合体あたり1予測へ集約して1回のpaired検定を行う。
+
+**margin比較規則。** まず同じvalidation poolを、training objectiveとは独立な共通metric
+（success@1、best DockQ@1、AUCなど）で再採点してm5/m0を選ぶ。TESTで選択する場合は
+探索的method comparisonと明記する。TEST上で3次元すべてのm5対m0を主張するなら、
+primary endpointをsuccess@1に固定し、3つのMcNemar pへHolm補正を適用する。
+AUC/best DockQ/K>1はsecondaryとし、同じfamilyで追加の有意性主張をしない。
+
+このfactorialが直接答えるmarginの問いは、**PSC固定下でworst-positive marginを加えると
+IFACE学習と次元差がどう変わるか**である。PSC悪化の原因がmarginかは、PSCが全runで
+凍結されているため未回答。そこを検証する最小追加は、full IFACEで
+PSC trainable/frozen × m5/m0 の2×2である。
+
+best-positive marginは1 poseだけで条件を満たしbasin lossと役割が重なるため、現時点では
+追加しない。m0が全次元でm5以上ならmarginを削除して終了する。m5が一貫して有利だが
+full/additive差または失敗例がworst-positiveに集中する場合だけ、validationで選ぶ
+1つのrobust variant（例: positive scoreの下位10〜25%を捨てたquantile/CVaR margin）
+を事前固定して追加する。TEST結果を見てbest/quantileを両方探索しない。
+
+**評価進行状況。** 本節記載時点でseed 0 / m5以外の15 TEST評価が実行中。
+未完了値から結論・model選択は行わない。全18セル完了後、上記規則で結果、null、
+seed不一致を含めて追記する。主な限界は同一split/同一poolのoptimizer seedのみ、
+反復利用済みPINDER-S、固定pool条件付き236件である。最終候補は全249件end-to-endと
+未使用cohortで確認する。
+
+#### 5.14.11 TESTを見る前の validation 選択（2026-07-27）
+
+§5.14.10 の margin 比較規則に従い、**TEST を見る前に** validation split を
+training objective と独立な共通指標で再採点した。margin 0.5 と 0.0 は異なる
+目的関数を最適化しているので validation *loss* は比較できないが、
+success@1 / AUC / best DockQ@1 は比較できる。
+
+round-0 の pool cache は seed 非依存なので1回読めば全 run に使える。
+`split.json["val_ids"]`（55件）だけが seed ごとに異なる。
+探索由来 pose のみ（`prov == 0`）で採点した。
+
+**実装**: `scratchpad/val_select.py`（下記コマンド節）。
+success@1 は探索 pose 集合を持つ **55件すべて** で数える。探索が近native pose を
+1つも返さなかった複合体は「未定義」ではなく失敗であり、これを落とすと
+success@1 が水増しされ、しかも33件しか残らない。AUC と best DockQ@1 は
+定義できる33件に限る。
+
+| 次元 | margin | val success@1 (n=55) | val AUC (n=33) | val bestDQ@1 (n=33) |
+|---|---|---:|---:|---:|
+| baseline | — | 23.6% | 0.7148 | 0.2992 |
+| full 144 | **0.5** | 25.5% | **0.7603** | 0.3161 |
+| full 144 | 0.0 | 25.5% | 0.7561 | 0.3159 |
+| additive 23 | 0.5 | 25.5% | 0.7418 | 0.3133 |
+| additive 23 | 0.0 | 25.5% | 0.7367 | 0.3157 |
+| symmetric 12 | 0.5 | 25.5% | 0.7439 | 0.3133 |
+| symmetric 12 | 0.0 | 25.5% | 0.7389 | 0.3184 |
+
+（3 seed 平均。seed 間の差は AUC 第4位以下で、表示桁ではほぼ動かない。）
+
+**measured facts**
+
+- **validation の success@1 は18条件すべてで完全に同一**である。
+  13/55 → 14/55 で、反転した複合体は1件のみ、勝敗は全条件 1勝0敗、
+  exact McNemar $p=1$。**n=55 では primary endpoint として解像度がない。**
+  codex が推奨した「validation で success@1 を primary にして選ぶ」は、
+  この split サイズでは実行できない。
+- 解像度があるのは **AUC のみ**。margin 0.5 が3次元すべてで 0.0 を上回る
+  （$+0.0042$ / $+0.0051$ / $+0.0050$）。次元は両 margin で
+  **full > symmetric > additive** の順。
+- **best DockQ@1 は逆向きの弱い証拠**を出す。additive と symmetric では
+  m0 のほうがわずかに良い（$+0.0024$ / $+0.0051$）。full ではほぼ同点。
+
+**選択（事前規定の規則に従った結果）**: primary が使えないので AUC を選択指標
+とし、**margin = 0.5、次元 = full** を選ぶ。ただしこれは**単一指標による選択**
+であって、best DockQ@1 は低次元側で逆を示す。この不一致を隠さずに記録する。
+
+**この validation split は TEST と交換可能ではない（重要な caveat）**
+
+| | 訓練/検証プール | TEST プール |
+|---|---:|---:|
+| 探索が近native poseを返した割合 | **65.8%** (181/275) | **94.8%** (236/249) |
+| baseline success@1 | 23.6% | 69.5% |
+| baseline AUC | 0.7148 | 0.8696 |
+
+同じ mining 設定（Hopf nside=3、spacing 1.2 Å、top-1500、±1セル列挙）で
+作ったにもかかわらず、訓練/検証側は探索 recall が 29 pp 低く、baseline の
+success@1 は 3分の1である。したがって
+
+- validation は TEST よりはるかに難しい複合体集合であり、
+  validation で選んだ設定が TEST で最適である保証は弱い。
+- §5.14.8 以降の TEST 上の数値を「難易度中立な汎化性能」と読んではならない。
+
+原因は未特定である。仮説: (a) PINDER の train split と PINDER-S の
+test split では複合体の大きさ・種類の分布が違う、(b) `--max-grid-voxels`
+による大複合体のスキップが TEST 側を系統的に易しくしている、
+(c) 訓練側 prep cache に §5.12 と同種の幾何破綻が残っている。
+
+**(c) は排除された（測定済み）。** `scripts/check_prep_cache.py` を訓練側
+cache（master list の先頭275件）に対して実行した:
+
+```
+data/scaling/prep_cache: 275 complexes checked (0 missing)
+  closest receptor-ligand contact: median 2.66 A, min 0.24 A, p90 3.13 A
+  STERICALLY IMPOSSIBLE (< 2.0 A): 9/275
+  >90% of receptor atoms within 4.5 A of the ligand: 0/275
+  native pose not reproduced by (q*, t*) to 0.01 A: 0/275
+```
+
+中央値 2.66 Å は修復後 TEST の 2.72 Å と同水準で、§5.12 のような全件破綻はない。
+立体的に不可能な9件は**すべて既に `data/scaling/excluded_bad_geometry.txt` に
+載っており（9/9）、3 seed いずれの fit 220 / validation 55 にも1件も入っていない**
+（0/220、0/55）。`--exclude-bad-geometry` が意図どおり効いている。
+したがって recall ギャップはデータ破綻では説明できず、(a)/(b) は未検証のまま残る。
+
+除外された9件（受容体-リガンド最短重原子距離）:
+6r6h (0.24 Å)、6b23 (0.28)、2x31 (0.51)、6hiv (0.69)、3j16 (1.33)、
+5jpq (1.45)、6xyw (1.80)、8fm9 (1.82)、6swa (1.83)。
+（訓練 master list は 4000件、うち83件が同ファイルで除外済み。）
+
+#### 5.14.12 実験1の結果: 3×2×3 factorial の TEST 評価（2026-07-27）
+
+18セルすべての固定 TEST プール評価が完了した。§5.14.10 の集計規則に従い、
+3×236 をプールせず、mean ± SD は optimizer 感度の記述量として、
+検定は seed ごとに3本すべて報告する。
+
+**設定。** `--freeze-psc --loss-prov search --alpha0 1.0 --n-fit 220 --rounds 0`、
+1500 step（全 run で early stop せず完走）、$\lambda_\mathrm{prior}=0.1$、
+prior は関数空間ノルム $\lambda\|\Delta E\|_F^2$。
+評価は `data/shards_pinder/test_pool_reachable.pt`、`--prov search`、
+DockQ 閾値 0.23、249件中 **236件**が対比較可能（13件は positive か negative が無い）。
+baseline は公開パラメータ（$\alpha=1.0$, $\rho=3.5$、学習なし）で
+success@1 69.5%、AUC 0.8696、best DockQ@1 0.4457、first-hit 1.098%。
+
+##### 主表（3 seed 平均 ± SD、236複合体）
+
+| 次元 | dof | margin | success@1 | AUC | best DockQ@1 | first-hit % |
+|---|---:|---|---:|---:|---:|---:|
+| baseline | 0 | — | 69.49% | 0.8696 | 0.4457 | 1.098 |
+| **full** | **144** | **0.5** | **77.54 ± 0.00%** | **0.8924 ± 0.0009** | **0.4893 ± 0.0001** | **0.545 ± 0.007** |
+| full | 144 | 0.0 | 75.85 ± 0.00% | 0.8828 ± 0.0011 | 0.4807 ± 0.0003 | 0.624 ± 0.011 |
+| additive | 23 | 0.5 | 74.15 ± 0.00% | 0.8840 ± 0.0010 | 0.4743 ± 0.0000 | 0.668 ± 0.008 |
+| additive | 23 | 0.0 | 74.58 ± 0.00% | 0.8730 ± 0.0013 | 0.4739 ± 0.0000 | 0.802 ± 0.017 |
+| symmetric | 12 | 0.5 | 73.59 ± 0.24% | 0.8832 ± 0.0013 | 0.4682 ± 0.0007 | 0.639 ± 0.014 |
+| symmetric | 12 | 0.0 | 73.87 ± 0.24% | 0.8718 ± 0.0015 | 0.4666 ± 0.0027 | 0.773 ± 0.021 |
+
+**6条件すべてが baseline を有意に上回る**（seed ごとの exact McNemar
+$p = 6.6\times10^{-5}$〜$0.012$、勝敗は 10勝1敗〜21勝2敗）。
+success@1 の optimizer seed 依存性は full/additive で **ちょうど 0**、
+symmetric で ±0.24 pp（1複合体）である。
+
+##### 主要対比: additive(23) → full(144)、margin = 0.5
+
+margin は §5.14.11 の validation で選んだ（TEST を見る前）。
+
+| seed | success@1 | 勝/敗 | McNemar p | AUC | Wilcoxon p |
+|---:|---|---|---:|---|---:|
+| 0 | 74.15% → 77.54% | 9勝1敗 | **0.0215** | 0.8852 → 0.8933 (+0.0081) | $2.1\times10^{-7}$ |
+| 1 | 74.15% → 77.54% | 9勝1敗 | **0.0215** | 0.8832 → 0.8916 (+0.0084) | $5.9\times10^{-8}$ |
+| 2 | 74.15% → 77.54% | 9勝1敗 | **0.0215** | 0.8837 → 0.8923 (+0.0086) | $7.6\times10^{-8}$ |
+
+3 seed で完全に一致する（同じ TEST 複合体なので独立な3検定ではない）。
+効果量は **$+3.39$ pp、複合体 paired bootstrap 95% CI $[+0.85, +5.93]$ pp**
+（seed 0、20000回）。
+best DockQ@1 は $+0.015$ だが Wilcoxon $p = 0.10$〜$0.14$ で**有意ではない**。
+first-hit 順位は $-0.0011$〜$-0.0014$、$p = 2$〜$3\times10^{-5}$。
+
+##### 副次対比: symmetric(12) → additive(23) は検出されず
+
+| seed | success@1 | 勝/敗 | McNemar p | AUC delta | Wilcoxon p |
+|---:|---|---|---:|---:|---:|
+| 0 | 73.31% → 74.15% | 2勝0敗 | 0.50 | +0.0005 | 0.47 |
+| 1 | 73.73% → 74.15% | 2勝1敗 | 1.00 | +0.0010 | 0.23 |
+| 2 | 73.73% → 74.15% | 2勝1敗 | 1.00 | +0.0010 | 0.19 |
+
+**非対称な追加11自由度の利益は検出されず、観測差は小さい**
+（$+0.85$ pp、bootstrap 95% CI $[+0.00, +2.12]$ pp）。
+**これは同等性の証明ではない。** §5.14.9 が事前に挙げた非劣性 margin
+$\delta = 1$〜$2$ pp に対して、CI 上限 $+2.12$ pp は $\delta=2$ をわずかに超える。
+つまり「12次元で足りる」とはまだ言えず、「差が検出できなかった」までである。
+
+一方 symmetric → full は 11勝1〜2敗、$p = 0.006$〜$0.022$、
+$+4.24$ pp（CI $[+1.69, +7.20]$ pp）である。
+この設定で検出可能な利益をもたらしているのは、行/列の非対称性でも一様成分でもなく
+**double-centered pair residual（121次元）**である。
+
+##### §5.14.8 の主張の訂正
+
+§5.14.8 は post-hoc 分解で「144成分の特異的な対相互作用は単独では有意でない
+（$p=0.18$）」と書いた。**この検定は問いに答えていない。** $p=0.18$ は
+「pair residual **のみ**（additive 成分を捨てた差分）が baseline を上回るか」
+であって、「pair residual を additive に**加える**増分」ではない。
+正しい増分検定は上の主要対比であり、**3 seed とも $p = 0.0215$ で有意**、
+AUC では $p \sim 10^{-7}$〜$10^{-8}$ である。
+この指摘は codex（gpt-5.6, herdr 経由）による。
+
+**訂正後の言明**: 「改善の大半は1体的な additive 成分で再現できる」は依然として
+正しい（baseline 超過分の $\frac{74.15-69.49}{77.54-69.49}=58\%$）。
+しかし「144成分は不要」という含意は誤りである。正しい言明は
+
+> **pair-specific な更新自由度は、additive 更新に対して固定プール success@1 を
+> $+3.39$ pp 改善した（9勝1敗、exact McNemar $p=0.0215$、
+> bootstrap 95% CI $[+0.85, +5.93]$ pp、3 seed 一致）。**
+
+である。**「pair chemistry そのものが必要」とは言えない**: additive モデルも
+公開済み $e_0$ の pair residual を配備時にそのまま保持しているため、
+この実験が示すのは「$e_0$ の周りの**更新**に pair 自由度が要る」ことに限られる。
+これを分離するには §5.14.9 の absolute-additive 対照
+（$e_0$ 自身を additive 部分空間へ射影）が必要で、未実施である。
+また「58% / 42%」は非線形な argmax 指標の差の比であって、分散説明率でも
+因果的寄与率でもない。
+
+##### margin の効果（実験2の主部）
+
+各次元内で margin 0.0 → 0.5 を直接対比較した。
+
+| 次元 | success@1 | 勝/敗 (seed 0/1/2) | McNemar p | AUC delta | Wilcoxon p |
+|---|---|---|---:|---:|---:|
+| full 144 | 75.85% → 77.54% (+1.69) | 4勝0敗 ×3 | 0.125 ×3 | +0.0094〜0.0098 | $\sim10^{-31}$ |
+| additive 23 | 74.58% → 74.15% (−0.42) | 1勝2敗 ×3 | 1.00 ×3 | +0.0108〜0.0112 | $\sim10^{-32}$ |
+| symmetric 12 | 73.87% → 73.59% (−0.28) | 0勝2敗 / 1勝1敗 / 1勝1敗 | 0.50 / 1.00 / 1.00 | +0.0112〜0.0116 | $\sim10^{-32}$ |
+
+primary endpoint を success@1 に固定し、3次元へ Holm 補正（seed 0）:
+full 補正後 $p=0.375$、symmetric $p=1$、additive $p=1$。
+
+success@1 差の paired bootstrap 95% CI（seed 0、pp）:
+full $+1.69\,[+0.42, +3.39]$、additive $-0.42\,[-1.69, +0.85]$、
+symmetric $-0.85\,[-2.12, +0.00]$。
+**full の CI は 0 を含まないが、exact McNemar は $p=0.125$ である。**
+不一致は不一致ペアが4件しかないためで、この領域では bootstrap 区間が
+楽観的すぎる。**判定は exact 検定を採る。**
+
+**measured facts**
+
+- **margin は success@1 をどの次元でも有意に変えない。** full での $+1.69$ pp は
+  4勝0敗で、補正前でも $p=0.125$ である（exact McNemar は片方向4件では
+  $0.125$ が最小 p であり、この効果量では原理的に有意になり得ない）。
+- **一方 AUC は3次元すべてで一貫して改善する**
+  （平均 $+0.009$〜$+0.012$、中央値 $\approx +0.006$、
+  改善/悪化/不変がおよそ 195〜201 / 18〜25 / 14〜17 件）。
+  Wilcoxon $p$ は $10^{-31}$ 台だが、**これは効果量ではなく符号の一貫性**を
+  反映している。SciPy でも同じ桁で計算 artifact ではないが、
+  以後 $p < 10^{-20}$ と丸めて扱う。示しているのは
+  **全 positive-negative ペアにわたる広域順位の改善**であって、
+  top-1 の改善ではない。両者は分離して読む必要がある。
+  first-hit 順位も同様に3次元すべてで改善する（$p = 10^{-4}$ 台）が、
+  **中央値の変化は 0** で、変化した約12〜15%の複合体に集中している。
+- **次元と margin で符号の異なるパターンを観測した**: margin は full の
+  success@1 を上げ (+1.69 pp)、低次元では下げる (−0.42 / −0.85 pp)。
+  差の差は $+2.12$ pp（6対1、$p=0.125$）で、**交互作用が有意に示されたわけではない。**
+
+**解釈（仮説、未検証）**: worst-positive margin は「最悪の positive をも
+negative より上に押し上げる」制約であり、144次元の自由度があれば
+境界 positive 専用の補正を学習できるが、12〜23次元では他の複合体を犠牲に
+するしかない。観測された符号パターンと整合するが、証明はしていない。
+
+##### 結論
+
+以下はすべて**固定プール上の success@1、探索的に反復利用された PINDER-S TEST、
+bound-bound、PSC 凍結**という条件付きの言明である。
+
+1. **6条件すべてが公開パラメータを上回る**（21勝2敗〜10勝1敗、
+   seed 0 の6比較を Holm 補正しても全条件 $p<0.05$）。
+   IFACE のみの再学習で success@1 は 69.5% → 最良 77.5%。
+2. **pair-specific な更新自由度は additive 更新に対して $+3.39$ pp の改善を与える**
+   （9勝1敗、$p=0.0215$、CI $[+0.85,+5.93]$ pp、3 seed 一致）。
+   §5.14.8 の「$p=0.18$ だから144成分は不要」という示唆を訂正する。
+   ただし**pair chemistry そのものの必要性は未証明**である（両モデルとも
+   $e_0$ の pair residual を保持している）。
+3. **非対称な追加11自由度（sym 12 → add 23）の利益は検出されなかった**
+   （$+0.85$ pp、CI $[+0.00,+2.12]$ pp）。**同等性の証明ではない。**
+4. **margin は広域順位（AUC を約 $+0.01$）を一貫して改善したが、
+   success@1 の改善は未確立**である（全次元で非有意、低次元では点推定が悪化）。
+5. **working choice は full 144 + $\lambda_\mathrm{margin}=0.5$**。
+   validation AUC で TEST を見る前に選んだ候補であり、**確定した最良モデルではない**。
+   validation/TEST の難易度シフトと TEST の反復利用のため、次段階の候補として扱う。
+
+##### 限界と、明記すべき不都合な結果
+
+- **bound-bound のみ。** unbound は未測定。
+- **固定プール上の再ランキング**であり、end-to-end 再探索ではない。
+  §5.14.8 では固定プールの結論が end-to-end で保存されたが（77.5% → 73.5%）、
+  今回の6条件で end-to-end を回したのは full+m5 のみ（= §5.14.8 の条件）である。
+  **低次元条件と m0 条件の end-to-end は未評価。**
+- **PINDER-S TEST は多数の設計判断に反復使用済み**で、p 値は探索的である。
+  未使用 cohort での確認は未実施。
+- **additive → full の best DockQ@1 は非有意**（$+0.015$、$p=0.10$〜$0.14$）。
+  success@1 と AUC は動いたが、上位1件の構造品質そのものは確立していない。
+- **first-hit 改善は中央値 0** であり、変化した約12〜15%の複合体に集中している。
+  「全体的に浅く見つかるようになった」ではない。
+- **validation は33件で選択を担っており、しかも TEST と順序が反転する**:
+  validation では sym > add、TEST では add > sym。選択の根拠は薄い。
+- **search-only loss で勾配を出す fit 複合体は 148/220** である（残り72件は
+  探索由来 positive を持たず、損失に寄与しない）。実効的な学習サンプルは
+  公称の 2/3 である。
+- **全 run が 1500 step の上限に到達**しており、収束 plateau は未確認。
+  「低次元側だけ収束が速い」を capacity 差と誤認していない保証はない。
+- **3 seed は optimizer seed のみ**で、学習標本の不確実性ではない。
+  success@1 の seed SD が full/additive でちょうど 0 なのは安定性の証拠だが、
+  同じ fit 220 / 同じ round-0 プールを共有しているためでもある。
+  master-list order 変更または training-complex bootstrap が必要である。
+- **validation split は TEST と交換可能でない**（§5.14.11、探索 recall 65.8% vs 94.8%）。
+- **margin が PSC 学習を悪化させたか**は未回答である。18 run すべてで PSC は凍結
+  されている。最小追加は full IFACE × {PSC trainable, frozen} × {m5, m0} の 2×2。
+- **absolute-additive 対照**（$e_0$ 自身を additive 部分空間へ射影）は未実施。
+
+##### 次段階（codex と合意した順序）
+
+1. margin を 0.5 に凍結。best-positive / quantile margin は**走らせない**
+   （m5 が一貫して有利なので削除条件は満たさないが、追加variantを
+   TEST を見てから選ぶのは post-hoc になる）。
+2. `absorb()` の契約を決めてから mining round 1。
+3. レシピ凍結後に N の scaling law（複数の master-list order で）。
+
+##### コマンド
+
+**「margin 0.5 / 0.0」は $\lambda_\mathrm{margin}$ である。** margin 幅そのもの
+（`--margin`）は全 run で 1.0 に固定されており、変えたのは margin 項の重み
+$\lambda_\mathrm{margin} \in \{0.5, 0.0\}$ である。$\lambda_\mathrm{margin}=0$ は
+margin 項の除去に等しい。
+
+```bash
+# 学習 18本（GPU 0/3/6 に分散）
+for mode in full add sym; do
+  for lm in 0.5 0.0; do
+    tag=$([ "$lm" = 0.5 ] && echo m5 || echo m0)
+    for seed in 0 1 2; do
+      uv run python scripts/run_pinder_scaling.py \
+          --n-fit 220 --rounds 0 --seed "$seed" \
+          --freeze-psc --loss-prov search --alpha0 1.0 \
+          --iface-mode "$mode" --lambda-margin "$lm" \
+          --pool-cache data/scaling/pool_cache \
+          --exclude-bad-geometry data/scaling/excluded_bad_geometry.txt \
+          --exclude-homodimer \
+          --out-dir "data/scaling/runs_${mode}_${tag}"
+    done
+  done
+done
+```
+
+その他のハイパーパラメータ（全 run 共通）:
+`--margin 1.0 --lambda-prior 0.1 --iface-lr 5e-4 --alpha-lr 1e-3
+--basin-temp 0.5 --batch-size 16 --epoch-passes 100 --min-steps 1500
+--patience 8 --rot-set hopf --hopf-nside 3 --spacing 1.2 --mine-ntop 1500
+--trans-cells 1 --near-rot 8 --max-grid-voxels 31250000 --dockq-thr 0.23`。
+
+```bash
+# TEST 評価 18セル
+uv run python scripts/compare_conditions.py \
+    --pool data/shards_pinder/test_pool_reachable.pt \
+    --ckpt data/scaling/runs_<mode>_<tag>/N220_seed<s>/round0_ckpt.pt \
+    --prov search --out-dir data/scaling/compare_fact_<mode>_<tag>_seed<s>
+
+# 集計・対比較・validation 選択
+python scripts/agg_fact.py      # -> data/scaling/factorial_summary.json
+python scripts/contrast.py      # 直接対比較と Holm 補正
+uv run python scripts/val_select.py   # -> data/scaling/val_selection.json
+
+# 訓練 cache の幾何検査
+uv run python scripts/check_prep_cache.py \
+    --cache-dir data/scaling/prep_cache \
+    --ids-file data/scaling/master_ids.txt --limit 275
+```
+
+**hardware**: 学習は1 run あたり GPU peak 0.016〜0.032 GiB、
+train 1985〜3044 秒（load average 25〜77 の共有機、他ユーザの負荷で3〜4倍変動）。
+TEST 評価は CPU のみ、4並列で1セルあたり約4〜5分。
+
+#### 5.14.13 §5.14.12 の批判的レビューと主張境界（2026-07-27）
+
+§5.14.12 の数表と直接対比は整合している。ただし結論2〜4には以下の限定が必要である。
+
+1. **baseline比較。** 「6条件すべてがbaselineを上回る」はsuccess@1についての
+   固定プール上の事実である。seed 0の6本を1 familyとしてHolm補正すると、raw pは
+   $6.6\times10^{-5}, 4.9\times10^{-4}, 9.8\times10^{-4},
+   1.5\times10^{-3}, 3.4\times10^{-3}, 1.17\times10^{-2}$ で、
+   6条件すべてが補正後も0.05未満に残る。したがって結論は維持できるが、
+   **Holm補正済み、固定プール、探索的PINDER-S** と明記する。
+2. **pair specificity。** additive→full は事前に定めた主要対比で、
+   success@1 $+3.39$ pp、9勝1敗、McNemar $p=0.0215$。
+   complex bootstrap 95% CIは **+0.85〜+5.93 pp**
+   （`scripts/contrast.py --ci`、20000 resample、seed 0。
+   別実装・別 resample 数では上限が +6.4 pp 程度まで動く）で、pair-specificな
+   **更新自由度がこの固定プールで増分性能を持つ**ことを支持する。
+   一方、両モデルとも公開済み $e_0$ のpair residualを保持し、低次元条件の
+   end-to-endも未評価なので、無限定な「pair specificityは必要」は強すぎる。
+   「残り42%をpair residualが担う」も非線形argmax差の記述比にすぎず、
+   因果的寄与率として扱わない。
+3. **symmetric→additive。** 非有意差は同等性ではない。seed 0の観測差は
+   additive優位 $+0.85$ pp、bootstrap 95% CIは約 **0〜+2.12 pp**。
+   事前候補だった非劣性margin 2 ppを厳密には満たさない。
+   したがって「12次元で足りる」「完全null」ではなく、
+   **非対称な11自由度の利益は今回の236件では検出されず、差は小さい**
+   と書く。symmetric additive自体はbaselineを約4 pp上回っており、
+   1体的成分が無意味という結果でもない。
+4. **margin interaction。** fullで$+1.69$ pp、additiveで$-0.42$ ppという
+   difference-in-differencesは$+2.12$ ppだが、複合体ごとの符号は6対1
+   （残り229件は0）で、対応する二側符号検定は $p=0.125$、
+   bootstrap CI下限も0付近である。「interactionがある」は未確立で、
+   **符号の異なるinteraction patternを観測した**に留める。
+
+**AUCの極小pの監査。** seed 0のm0→m5 AUC差は、
+full/additive/symmetricで平均 $+0.0094/+0.0108/+0.0112$、
+中央値 $+0.0062/+0.0059/+0.0065$。符号は
+201/18/17、198/24/14、195/25/16（改善/悪化/不変）で、
+SciPy Wilcoxonでも $p=5.5\times10^{-32},1.2\times10^{-32},9.2\times10^{-33}$。
+したがって数値実装の人工物ではなく広範な符号一貫性である。ただしAUCは全
+positive-negative pairの広域順位で、primary top-1はnull。p値は `<10^{-20}` 程度に
+丸め、平均・中央値・符号数を併記して実用効果と分ける。
+
+first-hit差はAUCほど全体的ではない。中央値は3次元すべて0で、
+改善/悪化/不変はfull 24/5/207、additive 30/6/200、
+symmetric 29/7/200（seed 0）。したがって「first-hitも改善」は平均と
+signed-rankでは支持されるが、**変化した約12〜15%の複合体に集中した効果**である。
+
+**隠してはならないnull/不都合な結果。**
+
+- full→additiveのbest DockQ@1増分は非有意（$p=0.10$〜0.14）。
+- marginのsuccess@1効果は全次元で非有意で、低次元では点推定が僅かに悪化する。
+- validationのAUCは33件だけでモデル選択を担い、success@1は解像度ゼロ。
+  さらにvalidationでは symmetric > additive、TESTでは additive > symmetric と
+  低次元間の順序が反転する。
+- search-only lossへ実際に勾配を出すfit複合体は148/220で、名目Nより小さい。
+  全18 runが1500 step上限まで走りearly stopしていないため、最適化plateauも未確認。
+- full+m5以外のend-to-end、absolute-additive、unbound、未使用TESTは未評価。
+
+**推奨する最終表現。**
+
+- 「pair-specificな更新自由度は、additive更新に対して固定プールsuccess@1を
+  +3.39 pp改善した（primary paired $p=0.0215$）。」
+- 「非対称additiveの追加11自由度には検出可能な利益がなかったが、
+  12次元との非劣性は未証明。」
+- 「marginはglobal AUCを一貫して約0.01改善したが、success@1改善は未確立。」
+- working choiceはvalidation AUCで事前選択したfull+m5。ただしvalidation/test shiftと
+  反復利用TESTのため、確定モデルではなく次段階の候補とする。
 
 ---
 

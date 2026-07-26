@@ -200,7 +200,8 @@ class Params:
     NAMES = ("alpha", "rho", "iface", "log_clash")
 
     def __init__(self, alpha, rho, iface, log_clash=None, mode="rho",
-                 train_psc=True):
+                 train_psc=True, iface_mode="full", iface0=None,
+                 rowcol=None):
         self.alpha, self.rho, self.iface = alpha, rho, iface
         #: False freezes alpha and the clash weights at their initial (published)
         #: values and trains only the 144 pair terms. The cross-swap of a
@@ -215,6 +216,74 @@ class Params:
             log_clash = (alpha.detach() * rho.detach().pow(k)).log()
         self.log_clash = log_clash          # (3,) log of the three weights
         self.mode = mode
+        #: How the learned DIFFERENCE from the published table is parametrised.
+        #:
+        #: "full"   -- all 144 pair terms free.
+        #: "add"    -- additive, `g + r_i + c_j`, 23 free directions.
+        #: "sym"    -- symmetric additive, `g + a_i + a_j`, 12 free directions.
+        #:
+        #: A post-hoc decomposition of the full fit put 59% of its gain
+        #: (+4.7 of +8.0 pp) in the additive subspace while the 144 pair
+        #: residuals alone were not significant (p = 0.18), so "the model
+        #: learned a chemical pair potential" needs the low-dimensional model
+        #: fitted from scratch as a control, not read off a projection.
+        #:
+        #: That control has now been run (report section 5.14.12, 3 x 2 x 3
+        #: cells on the frozen TEST pool). The p = 0.18 above was the wrong
+        #: test -- it asked whether the residual ALONE beats the baseline, not
+        #: whether it adds anything to the additive fit. Trained from scratch:
+        #: success@1 73.6% (sym 12), 74.2% (add 23), 77.5% (full 144) against a
+        #: 69.5% baseline. sym -> add is a flat null (2 wins, p >= 0.5); the
+        #: increment that matters is add -> full, 9 wins 1 loss, exact McNemar
+        #: p = 0.0215 in all three seeds. So the one-body part needs only 12
+        #: directions, and the pair residual is doing real work after all.
+        #:
+        #: The coefficients live in an ORTHONORMAL zero-sum basis, not as raw
+        #: (g, r, c). Two reasons. (a) `g + r_i + c_j` has a 2-dimensional
+        #: gauge -- `r += a, c += b, g -= a+b` leaves the matrix unchanged --
+        #: so raw coefficients leave flat directions for the optimiser.
+        #: (b) With raw coefficients a single learning rate is not comparable
+        #: across models: `g`'s gradient sums 144 cells, each `r_i` sums 12,
+        #: and each entry of the full model sums 1. In this basis
+        #: `||dE||_F^2 = ||theta||^2`, so identifiability, the prior and the
+        #: learning-rate scale are all fixed at once, and the additive model is
+        #: a metric subspace of the full one rather than merely a linear one.
+        #:
+        #: `sym` is the physically primary control: the published table is
+        #: exactly symmetric, so asymmetric `r_i != c_j` could be exploiting
+        #: PINDER's receptor/ligand role convention rather than chemistry.
+        self.iface_mode = iface_mode
+        self.iface0 = iface0                # frozen published table (rowcol)
+        self.rowcol = rowcol                # (25,) = [g, r(12), c(12)]
+
+    #: free directions per mode
+    N_COEF = {"full": 144, "add": 23, "sym": 12}
+
+    @staticmethod
+    def _zero_sum_basis(n, device, dtype):
+        """Orthonormal basis (n, n-1) of {v : sum v = 0} (Helmert)."""
+        m = torch.eye(n, device=device, dtype=dtype) - 1.0 / n
+        q, _ = torch.linalg.qr(m[:, : n - 1])
+        return q
+
+    def iface_vec(self) -> torch.Tensor:
+        """The 144-vector actually contracted with T, in any mode."""
+        if self.iface_mode == "full":
+            return self.iface
+        th = self.rowcol
+        dev, dt = th.device, th.dtype
+        V = self._zero_sum_basis(12, dev, dt)            # (12, 11), orthonormal
+        J = torch.ones(12, 12, device=dev, dtype=dt)
+        d = th[0] * (J / 12.0)                            # ||J/12||_F = 1
+        if self.iface_mode == "sym":
+            a = V @ th[1:12]                              # zero-sum, ||a|| = 1
+            # ||a (x) 1 + 1 (x) a||_F^2 = 24 ||a||^2 for zero-sum a
+            d = d + (a.unsqueeze(1) + a.unsqueeze(0)) / (24.0 ** 0.5)
+        else:                                             # "add"
+            r = V @ th[1:12]
+            c = V @ th[12:23]
+            d = d + r.unsqueeze(1) / (12.0 ** 0.5) + c.unsqueeze(0) / (12.0 ** 0.5)
+        return self.iface0 + d.reshape(-1)
 
     def clash_weights(self) -> torch.Tensor:
         """``(w_ss, w_sc, w_cc)``, differentiable in whichever mode is active."""
@@ -224,10 +293,16 @@ class Params:
             return self.alpha * self.rho.pow(k)
         return self.log_clash.exp()
 
+    def _kw(self, fn):
+        return dict(mode=self.mode, train_psc=self.train_psc,
+                    iface_mode=self.iface_mode,
+                    iface0=None if self.iface0 is None else fn(self.iface0),
+                    rowcol=None if self.rowcol is None else fn(self.rowcol))
+
     def clone(self) -> "Params":
-        return Params(self.alpha.detach().clone(), self.rho.detach().clone(),
-                      self.iface.detach().clone(),
-                      self.log_clash.detach().clone(), self.mode, self.train_psc)
+        f = lambda t: t.detach().clone()
+        return Params(f(self.alpha), f(self.rho), f(self.iface),
+                      f(self.log_clash), **self._kw(f))
 
     def cpu(self) -> "Params":
         """Detached CPU copy that KEEPS the mode.
@@ -236,17 +311,18 @@ class Params:
         rebuilt a `rho`-mode object and scored a `free`-mode run with the wrong
         clash weights.
         """
-        return Params(self.alpha.detach().cpu(), self.rho.detach().cpu(),
-                      self.iface.detach().cpu(), self.log_clash.detach().cpu(),
-                      self.mode, self.train_psc)
+        f = lambda t: t.detach().cpu()
+        return Params(f(self.alpha), f(self.rho), f(self.iface),
+                      f(self.log_clash), **self._kw(f))
 
     def tensors(self):
         """Only what this mode actually optimises."""
+        pair = [self.iface] if self.iface_mode == "full" else [self.rowcol]
         if not self.train_psc:
-            return [self.iface]
+            return pair
         if self.mode == "rho":
-            return [self.alpha, self.rho, self.iface]
-        return [self.alpha, self.log_clash, self.iface]
+            return [self.alpha, self.rho] + pair
+        return [self.alpha, self.log_clash] + pair
 
     def requires_grad_(self, flag=True):
         for t in self.tensors():
@@ -256,7 +332,13 @@ class Params:
     def state_dict(self):
         d = {n: getattr(self, n).detach().cpu() for n in self.NAMES}
         d["psc_mode"] = self.mode
+        d["iface_mode"] = self.iface_mode
         d["clash_weights"] = self.clash_weights().detach().cpu()
+        # always store the effective 144-vector so every evaluator is
+        # parametrisation-agnostic
+        d["iface"] = self.iface_vec().detach().cpu()
+        if self.rowcol is not None:
+            d["rowcol"] = self.rowcol.detach().cpu()
         return d
 
     @classmethod
@@ -264,14 +346,19 @@ class Params:
         a = torch.tensor(args.alpha0, device=device, dtype=dtype)
         r = torch.tensor(args.rho0, device=device, dtype=dtype)
         k = torch.tensor(cls.CLASH_POWERS, device=device, dtype=dtype)
-        return cls(a, r, iface_ij(device=device, dtype=dtype, flat=True),
-                   (a * r.pow(k)).log(), getattr(args, "psc_mode", "rho"),
-                   not getattr(args, "freeze_psc", False))
+        e0 = iface_ij(device=device, dtype=dtype, flat=True)
+        im = getattr(args, "iface_mode", "full")
+        return cls(a, r, e0, (a * r.pow(k)).log(),
+                   getattr(args, "psc_mode", "rho"),
+                   not getattr(args, "freeze_psc", False),
+                   iface_mode=im, iface0=e0.clone(),
+                   rowcol=torch.zeros(cls.N_COEF.get(im, 144),
+                                      device=device, dtype=dtype))
 
     def summary(self, p0: "Params") -> dict:
         w = self.clash_weights()
         out = {"alpha": float(self.alpha), "rho": float(self.rho),
-               "d_iface_norm": float((self.iface - p0.iface).norm()),
+               "d_iface_norm": float((self.iface_vec() - p0.iface_vec()).norm()),
                "w_ss": float(w[0]), "w_sc": float(w[1]), "w_cc": float(w[2])}
         if self.mode == "free":
             # If the paper's collinearity still held, these three would agree.
@@ -283,7 +370,7 @@ class Params:
 
 
 def score_from_feats(f: Feats, p: Params, beta) -> torch.Tensor:
-    imat = iface_score_matrix(p.iface)
+    imat = iface_score_matrix(p.iface_vec())
     if f.sc.ndim == 2:
         # (F, 4) = (c_pair, n_ss, n_sc, n_cc). The clash weights come from
         # `Params`, so `rho` and `free` mode share one scoring path.
@@ -380,7 +467,7 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
         try:
             if args.pool == "reachable":
                 poses, prov = generate_pool_reachable(
-                    prot, alpha=p.alpha, iface_ij_flat=p.iface, beta=beta0,
+                    prot, alpha=p.alpha, iface_ij_flat=p.iface_vec(), beta=beta0,
                     charge_score_lut=charge0, quats=quats,
                     ntop=args.mine_ntop, spacing=args.spacing,
                     rot_chunk_size=rot_chunk,
@@ -388,7 +475,7 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
                 )
             else:                                    # legacy (section 5.6) recipe
                 poses, _ = generate_decoys(
-                    prot, alpha=p.alpha, iface_ij_flat=p.iface, beta=beta0,
+                    prot, alpha=p.alpha, iface_ij_flat=p.iface_vec(), beta=beta0,
                     charge_score_lut=charge0,
                     n_random_rot=args.mine_random_rot, n_cone=args.mine_cone,
                     ntop=args.mine_ntop, seed=args.seed + 1000 * round_idx,
@@ -525,8 +612,10 @@ def mean_objective(feats, p: Params, p0: Params, beta0, args,
     total = total / max(1, len(feats))
     # rho is regularised towards its published initial value on the same
     # quadratic footing as alpha and the pair table.
-    prior = loss_param_prior(p.alpha, p.iface, charge_dummy,
-                             p0.alpha, p0.iface, charge_dummy)
+    # Regularise the LEARNED DIFFERENCE, so the same lambda means the same
+    # thing whether the difference lives in 144 dimensions or in 25.
+    prior = loss_param_prior(p.alpha, p.iface_vec(), charge_dummy,
+                             p0.alpha, p0.iface_vec(), charge_dummy)
     # Anchor whichever clash parametrisation is live. Both are in log space
     # (rho enters as log w_k = log alpha + k log rho), so the two priors are on
     # the same footing and the modes stay comparable.
@@ -549,7 +638,8 @@ def train_params(fit_feats, val_feats, p: Params, p0: Params, beta0,
     validation loss only. Returns the trajectory for the report."""
     p.requires_grad_(True)
     charge_dummy = torch.zeros(0, device=device, dtype=dtype)
-    groups = [{"params": [p.iface], "lr": args.iface_lr}]
+    pair = p.iface if p.iface_mode == "full" else p.rowcol
+    groups = [{"params": [pair], "lr": args.iface_lr}]
     if p.train_psc:
         groups.append({"params": [p.alpha], "lr": args.alpha_lr})
         groups.append({"params": [p.rho], "lr": args.rho_lr} if p.mode == "rho"
@@ -921,6 +1011,15 @@ def main() -> None:
                     action=argparse.BooleanOptionalAction, default=True,
                     help="cache (c_pair, n_ss, n_sc, n_cc) so rho is trainable")
     # --- trainable parameters -------------------------------------------
+    ap.add_argument("--iface-mode", choices=("full", "add", "sym"),
+                    default="full", dest="iface_mode",
+                    help="full: all 144 pair terms. add: additive update "
+                         "g + r_i + c_j (23 free directions). sym: symmetric "
+                         "additive g + a_i + a_j (12) -- the physically primary "
+                         "control, since the published table is symmetric. "
+                         "Coefficients are in an orthonormal zero-sum basis so "
+                         "the prior and the learning rate mean the same thing "
+                         "in every mode.")
     ap.add_argument("--freeze-psc", dest="freeze_psc", action="store_true",
                     help="hold alpha and the clash weights at the published "
                          "values and train only the 144 pair terms")
@@ -1308,7 +1407,7 @@ def main() -> None:
                   f"{len(fit_pools)} fit complexes have NO reachable positive "
                   f"- that is a hard ceiling on what training can do")
         print(f"  alpha={float(p.alpha):.4f} rho={float(p.rho):.4f} ||dIface||="
-              f"{float((p.iface-p0.iface).norm()):.3f} "
+              f"{float((p.iface_vec()-p0.iface_vec()).norm()):.3f} "
               f"val_loss={stats['best_val_loss']:.4f} "
               f"steps={stats['steps_run']}/{n_steps} skipped={n_skipped} "
               f"peakGPU={peak_mem:.1f} GiB")
