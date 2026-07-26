@@ -288,7 +288,12 @@ def main() -> None:
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--epochs-per-round", type=int, default=1500, dest="epochs_per_round")
-    ap.add_argument("--alpha-lr", type=float, default=1e-5, dest="alpha_lr")
+    # The old 1e-5 was picked when alpha0 was 0.01, i.e. a relative step of
+    # 1e-3. alpha0 is now a knob, so scale with it to keep that relative
+    # step; a fixed 1e-5 against alpha0 = 1.0 is 100x too small and the
+    # parameter simply does not move.
+    ap.add_argument("--alpha-lr", type=float, default=0.0, dest="alpha_lr",
+                    help="0 = 1e-3 * alpha0")
     ap.add_argument("--iface-lr", type=float, default=5e-4, dest="iface_lr")
     # alpha0 is a CLI knob and alpha_max defaults to 10*alpha0 so the box
     # constraint can never sit below the initial value. The old hardcoded
@@ -321,6 +326,8 @@ def main() -> None:
     ap.add_argument("--checkpoint-dir", default="data/shards_pinder/hardneg_checkpoints",
                     dest="checkpoint_dir")
     args = ap.parse_args()
+    if args.alpha_lr <= 0:
+        args.alpha_lr = 1e-3 * args.alpha0
     if args.alpha_max <= 0:
         args.alpha_max = 10.0 * args.alpha0
     assert args.alpha_max >= args.alpha0, (

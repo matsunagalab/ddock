@@ -56,10 +56,10 @@ import torch  # noqa: E402
 
 from zdock.atomtypes import charge_score as default_charge_score  # noqa: E402
 from zdock.atomtypes import iface_ij  # noqa: E402
-from zdock.score import SC_REFERENCE_SPACING  # noqa: E402
+from zdock.score import SC_REFERENCE_SPACING, SC_RHO  # noqa: E402
 from zdock.dockq import dockq_batch, ligand_rmsd_to_native  # noqa: E402
 from zdock.prep_cache import load_prepared  # noqa: E402
-from zdock.rotation_grid import random_quaternions  # noqa: E402
+from zdock.rotation_grid import hopf_quaternions, random_quaternions  # noqa: E402
 from zdock.search import _rotate_batch, docking_search  # noqa: E402
 
 KS = (1, 5, 10, 50, 100)
@@ -85,12 +85,20 @@ def _label(prot, poses, budget):
 
 
 @torch.no_grad()
-def evaluate_complex(prot, alpha, iface, beta, charge, args):
+def evaluate_complex(prot, alpha, iface, beta, charge, args, rho=SC_RHO):
     device = prot.rec_xyz.device
     dtype = prot.rec_xyz.dtype
-    # Uniform rotations, fixed seed, no native-orientation cone.
-    quats = random_quaternions(args.n_rot, seed=args.rot_seed, device=device,
-                               dtype=dtype)
+    # No native-orientation cone. Default to the SAME Hopf grid the training
+    # pools were built on -- comparing a re-search on a different rotation set
+    # against a pool built on this one would confound the parameters with the
+    # sampling. Hopf nside=3 covers SO(3) to ~18.5 deg at 1944 points against
+    # ~28.3 deg for the same number of uniform-random orientations.
+    if args.rot_set == "hopf":
+        quats = hopf_quaternions(args.hopf_nside, device=device, dtype=dtype)
+        quats = quats / quats.norm(dim=-1, keepdim=True)
+    else:
+        quats = random_quaternions(args.n_rot, seed=args.rot_seed, device=device,
+                                   dtype=dtype)
 
     # Parameter-independent ceiling: best sampled rotation at the ideal
     # translation. Bounds what any scorer could achieve with this rotation set.
@@ -108,7 +116,7 @@ def evaluate_complex(prot, alpha, iface, beta, charge, args):
                 prot.rec_atomtype_id, prot.rec_charge_id,
                 prot.lig_ref, prot.lig_radius, prot.lig_sasa,
                 prot.lig_atomtype_id, prot.lig_charge_id,
-                quats, alpha=alpha, iface_ij_flat=iface, beta=beta,
+                quats, alpha=alpha, iface_ij_flat=iface, beta=beta, sc_rho=rho,
                 charge_score_lut=charge, spacing=args.spacing,
                 ntop=args.ntop, rot_chunk_size=rot_chunk)
             break
@@ -157,12 +165,17 @@ def _mean(rows, key, mask=None):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", default="", help="checkpoint; omit for default ZDOCK")
+    ap.add_argument("--alpha0", type=float, default=1.0)
+    ap.add_argument("--rho0", type=float, default=SC_RHO)
     ap.add_argument("--label", default="")
     ap.add_argument("--test-ids", default="data/pinder_test_ids.txt", dest="test_ids")
     ap.add_argument("--prep-cache", default="data/scaling/prep_cache_test",
                     dest="prep_cache")
     ap.add_argument("--out-dir", default="data/scaling/eval_search", dest="out_dir")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--rot-set", choices=("hopf", "uniform"), default="hopf",
+                    dest="rot_set")
+    ap.add_argument("--hopf-nside", type=int, default=3, dest="hopf_nside")
     ap.add_argument("--n-rot", type=int, default=1900, dest="n_rot",
                     help="uniform rotations (matches the mining budget of "
                          "1500 random + 400 cone, but with no cone)")
@@ -176,6 +189,8 @@ def main() -> None:
     ap.add_argument("--rmsd-threshold", type=float, default=5.0, dest="rmsd_thr")
     ap.add_argument("--dockq-threshold", type=float, default=0.23, dest="dockq_thr")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--shard", default="0/1",
+                    help="i/n -- evaluate every n-th id starting at i, so several GPUs can split one condition")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -190,16 +205,27 @@ def main() -> None:
         blob = torch.load(args.ckpt, map_location="cpu", weights_only=True)
         alpha = blob["alpha"].to(device=device, dtype=dtype)
         iface = blob["iface"].to(device=device, dtype=dtype)
+        # rho is trainable since 2026-07-25; a checkpoint that lacks it predates
+        # that and was fitted with rho frozen at the published value.
+        rho = blob.get("rho", torch.tensor(SC_RHO)).to(device=device, dtype=dtype)
     else:
-        alpha = torch.tensor(0.01, device=device, dtype=dtype)
+        # 1.0, not 0.01: Chen et al. 2003 Eq. (2) has no alpha at all (the PSC
+        # scale is set by rho), and measured on the poses a ranker must
+        # discriminate among, alpha = 1.02 equalises std(S_PSC) and
+        # std(S_IFACE). 0.01 belongs to the older GSC formulation and puts PSC
+        # at 1% of IFACE.
+        alpha = torch.tensor(args.alpha0, device=device, dtype=dtype)
         iface = iface0.clone()
-    print(f"[{label}] alpha={float(alpha):.4f} "
+        rho = torch.tensor(args.rho0, device=device, dtype=dtype)
+    print(f"[{label}] alpha={float(alpha):.4f} rho={float(rho):.4f} "
           f"||dIface||={float((iface - iface0).norm()):.3f}", flush=True)
 
     ids = [ln.strip() for ln in Path(args.test_ids).read_text().splitlines()
            if ln.strip()]
     if args.limit:
         ids = ids[: args.limit]
+    si, sn = (int(x) for x in args.shard.split("/"))
+    ids = ids[si::sn]
 
     rows, skipped = [], []
     t0 = time.time()
@@ -210,7 +236,8 @@ def main() -> None:
             continue
         try:
             prot = prot_cpu.to(device, dtype=dtype)
-            rows.append(evaluate_complex(prot, alpha, iface, beta, charge, args))
+            rows.append(evaluate_complex(prot, alpha, iface, beta, charge, args,
+                                         rho=rho))
         except torch.cuda.OutOfMemoryError as exc:
             skipped.append({"id": pid, "n_rec": prot_cpu.n_rec,
                             "n_lig": prot_cpu.n_lig,
@@ -237,7 +264,8 @@ def main() -> None:
     rec = [r for r in rows if r["recall"]]
     summary = {
         "label": label, "n_evaluated": n, "n_skipped": len(skipped),
-        "alpha": float(alpha), "d_iface_norm": float((iface - iface0).norm()),
+        "alpha": float(alpha), "rho": float(rho),
+        "d_iface_norm": float((iface - iface0).norm()),
         "n_rot": args.n_rot, "ntop": args.ntop, "rot_seed": args.rot_seed,
         # parameter-independent: what the rotation sampling permits at all
         "ceiling_frac_dockq_ok": sum(r["ceiling_dockq"] >= args.dockq_thr

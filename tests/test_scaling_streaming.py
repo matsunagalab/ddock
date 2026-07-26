@@ -132,7 +132,7 @@ def test_corrupt_cache_entry_is_a_miss(tmp_path):
 # --------------------------------------------------------------------------
 # CPU vs GPU feature agreement (the streaming correctness claim)
 # --------------------------------------------------------------------------
-def _features(prot, poses):
+def _features(prot, poses, *, psc_decompose=False):
     dev, dt = prot.rec_xyz.device, prot.rec_xyz.dtype
     return docking_score_elec(
         prot.rec_xyz, prot.rec_radius, prot.rec_sasa,
@@ -144,6 +144,7 @@ def _features(prot, poses):
         torch.tensor(3.0, device=dev, dtype=dt),
         default_charge_score(device=dev, dtype=dt),
         frame_chunk_size=4, return_components=True,
+        psc_decompose=psc_decompose,
     )
 
 
@@ -166,22 +167,30 @@ def test_cpu_and_gpu_features_agree():
         assert torch.allclose(a, b, rtol=2e-4, atol=float(1e-4 * denom)), name
 
 
-def test_score_decomposition_matches_full_score():
+@pytest.mark.parametrize("rho_train", [1.0, 3.5, 6.0])
+def test_score_decomposition_matches_full_score(rho_train):
     """`score_from_feats` must reproduce `docking_score_elec` — the whole
-    streaming pool is useless if the cached decomposition drifts."""
+    streaming pool is useless if the cached decomposition drifts.
+
+    The features are cached ONCE at rho = 3.5 and then re-scored at a different
+    rho; that must still agree with a direct re-scoring at that rho. This is the
+    property that makes rho trainable from cached features at all.
+    """
     mod = _load_run_module()
     prot = _toy_protein(dtype=torch.float64)
     rng = np.random.default_rng(5)
     poses = torch.as_tensor(
         prot.lig_ref.numpy()[None] + rng.normal(scale=2.0, size=(4, 1, 3)),
         dtype=torch.float64)
-    sc, T, elec = _features(prot, poses)
+    sc, T, elec = _features(prot, poses, psc_decompose=True)
+    assert sc.shape == (poses.shape[0], 4), "expected the (F, 4) PSC terms"
     n = sc.shape[0]
     f = mod.Feats("TOY", sc, T, elec, torch.zeros(n, dtype=torch.float64),
                   torch.zeros(n, dtype=torch.float64),
                   torch.zeros(n, dtype=torch.int16))
 
     alpha = torch.tensor(0.031, dtype=torch.float64)
+    rho = torch.tensor(rho_train, dtype=torch.float64)
     iface = iface_ij(dtype=torch.float64, flat=True) + 0.05
     beta = torch.tensor(3.0, dtype=torch.float64)
     charge = default_charge_score(dtype=torch.float64)
@@ -190,9 +199,59 @@ def test_score_decomposition_matches_full_score():
         prot.rec_atomtype_id, prot.rec_charge_id,
         poses, prot.lig_radius, prot.lig_sasa,
         prot.lig_atomtype_id, prot.lig_charge_id,
-        alpha, iface, beta, charge, frame_chunk_size=4)
-    got = mod.score_from_feats(f, alpha, iface, beta)
+        alpha, iface, beta, charge, frame_chunk_size=4, sc_rho=rho)
+    got = mod.score_from_feats(f, mod.Params(alpha, rho, iface), beta)
     assert torch.allclose(got, full, rtol=1e-8, atol=1e-8)
+
+
+def test_rho_receives_gradient_through_cached_features():
+    """rho is the whole reason the pool stores 4 scalars instead of 1."""
+    mod = _load_run_module()
+    prot = _toy_protein(dtype=torch.float64)
+    rng = np.random.default_rng(7)
+    poses = torch.as_tensor(
+        prot.lig_ref.numpy()[None] + rng.normal(scale=2.0, size=(6, 1, 3)),
+        dtype=torch.float64)
+    sc, T, elec = _features(prot, poses, psc_decompose=True)
+    n = sc.shape[0]
+    f = mod.Feats("TOY", sc, T, elec, torch.zeros(n, dtype=torch.float64),
+                  torch.zeros(n, dtype=torch.float64),
+                  torch.zeros(n, dtype=torch.int16))
+    p = mod.Params(torch.tensor(1.0, dtype=torch.float64),
+                   torch.tensor(3.5, dtype=torch.float64),
+                   iface_ij(dtype=torch.float64, flat=True)).requires_grad_(True)
+    mod.score_from_feats(f, p, torch.tensor(3.0, dtype=torch.float64)).sum().backward()
+    for t in p.tensors():                      # what THIS mode optimises
+        assert t.grad is not None and bool((t.grad != 0).any())
+
+    # 'free' mode drops Chen & Weng's w_k = alpha*rho^k collinearity, so the
+    # three clash weights must each receive their own gradient.
+    pf = mod.Params(torch.tensor(1.0, dtype=torch.float64),
+                    torch.tensor(3.5, dtype=torch.float64),
+                    iface_ij(dtype=torch.float64, flat=True),
+                    mode="free").requires_grad_(True)
+    mod.score_from_feats(f, pf, torch.tensor(3.0, dtype=torch.float64)).sum().backward()
+    # Each weight gets its own gradient wherever its feature column is
+    # non-zero. (The toy complex has no core atoms, so n_sc = n_cc = 0 and
+    # those two legitimately receive none -- that is data, not a dead path.)
+    assert pf.log_clash.grad is not None
+    present = (sc[:, 1:4].abs().sum(0) > 0)
+    assert torch.equal(pf.log_clash.grad != 0, present), (
+        pf.log_clash.grad, sc[:, 1:4].abs().sum(0))
+    # and the gradient is exactly -w_k * sum_f n_k(f)  (d/d log w_k of -w_k n_k)
+    expected = -pf.clash_weights().detach() * sc[:, 1:4].sum(0)
+    assert torch.allclose(pf.log_clash.grad, expected, rtol=1e-10)
+
+    # and at the shared starting point the two modes must score identically
+    a = mod.Params(torch.tensor(1.0, dtype=torch.float64),
+                   torch.tensor(3.5, dtype=torch.float64),
+                   iface_ij(dtype=torch.float64, flat=True), mode="rho")
+    b = mod.Params(torch.tensor(1.0, dtype=torch.float64),
+                   torch.tensor(3.5, dtype=torch.float64),
+                   iface_ij(dtype=torch.float64, flat=True), mode="free")
+    beta = torch.tensor(3.0, dtype=torch.float64)
+    assert torch.allclose(mod.score_from_feats(f, a, beta),
+                          mod.score_from_feats(f, b, beta), atol=1e-12)
 
 
 # --------------------------------------------------------------------------
@@ -219,10 +278,12 @@ def test_normalized_scores_preserve_pose_ranking():
                   torch.zeros(n, dtype=torch.float64),
                   torch.zeros(n, dtype=torch.int16))
     alpha = torch.tensor(0.02, dtype=torch.float64)
+    rho = torch.tensor(3.5, dtype=torch.float64)
     iface = iface_ij(dtype=torch.float64, flat=True)
     beta = torch.tensor(3.0, dtype=torch.float64)
-    raw = mod.score_from_feats(f, alpha, iface, beta)
-    norm = mod.normalized_scores(f, alpha, iface, beta)
+    p = mod.Params(alpha, rho, iface)
+    raw = mod.score_from_feats(f, p, beta)
+    norm = mod.normalized_scores(f, p, beta)
     assert torch.equal(raw.argsort(), norm.argsort())
 
 
@@ -233,9 +294,10 @@ def test_cap_pool_keeps_every_positive():
     dockq[:40] = 0.5                       # 40 positives
     f = _fake_feats(mod, "X", n, dockq, 0)
     alpha = torch.tensor(0.01, dtype=torch.float64)
+    rho = torch.tensor(3.5, dtype=torch.float64)
     iface = iface_ij(dtype=torch.float64, flat=True)
     beta = torch.tensor(3.0, dtype=torch.float64)
-    capped = mod.cap_pool(f, 100, alpha, iface, beta, 0.23)
+    capped = mod.cap_pool(f, 100, mod.Params(alpha, rho, iface), beta, 0.23)
     assert capped.n == 100
     assert int((capped.dockq >= 0.23).sum()) == 40
 
@@ -255,7 +317,9 @@ def test_mining_appends_negatives_without_growing_positives():
     pool.cat(mined2.index((mined2.dockq < 0.23).nonzero(as_tuple=True)[0]))
     assert int((pool.dockq >= 0.23).sum()) == n_pos_before
     c = pool.counts(0.23)
-    assert c == {"n": 160, "n_pos": 10, "n_rand_neg": 90, "n_hard_neg": 60}
+    assert c == {"n": 160, "n_pos": 10, "n_rand_neg": 90, "n_hard_neg": 60,
+                 # prov defaults to 0 (= search) for a hand-built Feats
+                 "n_pos_from_search": 10, "n_pos_enumerated": 0}
 
 
 def test_iface_coverage_counts_complexes_not_poses():
@@ -295,6 +359,10 @@ class _Args:
     def __init__(self, **kw):
         kw.setdefault("max_grid_voxels", 0)
         kw.setdefault("grid_voxels", "")
+        # the fixture ids are not PINDER-shaped, so homodimer detection is a
+        # no-op here; the flag still has to exist for `eligible`
+        kw.setdefault("exclude_homodimer", False)
+        kw.setdefault("exclude_bad_geometry", "")
         self.__dict__.update(kw)
 
 

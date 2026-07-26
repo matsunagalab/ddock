@@ -60,11 +60,16 @@ def load_prepared(
     *,
     device: torch.device | str = "cpu",
     dtype: torch.dtype | None = None,
+    recenter_ligand: bool = True,
 ) -> PreparedProtein | None:
     """Return the cached protein on ``device``, or ``None`` if absent.
 
     A truncated / half-written file (possible if a worker was killed) is
     treated as a cache miss rather than raising.
+
+    ``recenter_ligand`` applies :meth:`PreparedProtein.recenter_ligand`, an
+    exact frame correction for caches written with the old signed-weight
+    decentering. Pass ``False`` only to reproduce pre-fix behaviour.
     """
     path = cache_path(cache_dir, pid)
     if not path.exists():
@@ -80,6 +85,13 @@ def load_prepared(
             f"prep cache collision: {path} holds {blob.get('id')!r}, asked {pid!r}"
         )
     prot = PreparedProtein.from_state_dict(blob["state"])
+    if recenter_ligand:
+        # Caches written before 2026-07-25 hold a lig_ref decentered by a
+        # SIGNED-weight centroid, which can sit thousands of Angstrom from the
+        # origin and destroys reachability (see
+        # PreparedProtein.recenter_ligand). The correction is exact, so it is
+        # applied on read rather than forcing a 2,900-complex re-preparation.
+        prot = prot.recenter_ligand()
     if device != "cpu" or dtype is not None:
         prot = prot.to(device, dtype=dtype)
     return prot

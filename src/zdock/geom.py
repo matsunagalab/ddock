@@ -106,13 +106,15 @@ def decenter(
 def orient(
     xyz: torch.Tensor,
     mass: torch.Tensor | None = None,
+    *,
+    decenter_weighted: bool = False,
 ) -> torch.Tensor:
     """Rotate a decentered molecule so that its principal axes of inertia
     align with the Cartesian axes (longest axis → x, shortest → z).
 
     Port of `MDToolbox.orient!` (src/structure.jl lines 156–205):
 
-      1. Decenter (mass-weighted if provided).
+      1. Decenter — **geometrically, never mass-weighted**. See below.
       2. Build the symmetric inertia tensor I (3×3).
       3. `svd(I)` gives singular vectors in *descending* order of singular
          value; Julia takes `F.Vt[end:-1:1, :]` so the row order is
@@ -132,7 +134,28 @@ def orient(
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError(f"xyz must be (N, 3), got {tuple(xyz.shape)}")
 
-    centered = decenter(xyz, mass)
+    # Decenter GEOMETRICALLY even when weights are supplied. The caller's
+    # "mass" for the docking ligand is a column of the IFACE pair table, and
+    # 6 of its 12 entries are negative, so `sum(w)` can approach zero and the
+    # weighted centroid diverges: measured over 300 cached PINDER complexes,
+    # |centroid| exceeded 10 A for 121 of them and reached 22,708 A for
+    # 4ez1__B1_Q8WSF8--4ez1__F1_P69657 (sum(w) = 0.002).
+    #
+    # That is not cosmetic. The search rotates `lig_ref` about the ORIGIN, so a
+    # displaced centroid amplifies the rotation grid's discretisation error
+    # into a translation error by the lever arm |c|: for 4ez1 the nearest grid
+    # rotation is 13.9 deg off q*, which moves the centroid by 2,704 A, while
+    # the translation search can only correct a couple of cells. Measured
+    # consequence: that complex's best reachable DockQ was 0.000, and all 8 of
+    # the 300 complexes with no reachable positive at all had large |centroid|
+    # (median 78 A) against 6 A for the reachable ones.
+    #
+    # The weights still define the inertia tensor below, which is what `orient`
+    # is actually for; only the origin changes.
+    #
+    # `decenter_weighted=True` restores the Julia reference's behaviour and
+    # exists only for the port-fidelity test.
+    centered = decenter(xyz, mass if decenter_weighted else None)
     dtype = centered.dtype
     device = centered.device
 
@@ -170,6 +193,31 @@ def orient(
 
     # Project: new_xyz[atom, :] = p_axis @ centered[atom, :]
     return centered @ p_axis.T
+
+
+def grid_shape(
+    receptor_xyz: torch.Tensor,
+    ligand_xyz: torch.Tensor,
+    *,
+    spacing: float = 1.2,
+) -> tuple[int, int, int]:
+    """The ``(nx, ny, nz)`` :func:`generate_grid` would produce, without
+    allocating it.
+
+    Needed because the corpus has an extreme tail: the largest complexes reach
+    ~1e10 voxels at 3.0 A, i.e. ~2e11 at 1.2 A, and merely *asking*
+    ``generate_grid`` for the axes materialises two zero grids of that size and
+    gets the process SIGKILLed. Anything that only wants to know how big a
+    complex is -- the size filter, the cost model -- must use this instead.
+    """
+    size_ligand = float(ligand_xyz[:, 0].max() - ligand_xyz[:, 0].min())
+    out = []
+    for a in range(3):
+        v = receptor_xyz[:, a]
+        lo = float(v.min()) - size_ligand - spacing
+        hi = float(v.max()) + size_ligand + spacing
+        out.append(int(math.floor((hi - lo) / spacing)) + 1)
+    return out[0], out[1], out[2]
 
 
 def generate_grid(

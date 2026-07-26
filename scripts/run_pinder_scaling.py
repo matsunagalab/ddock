@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -65,11 +66,13 @@ import torch  # noqa: E402
 
 from zdock.atomtypes import charge_score as default_charge_score
 from zdock.atomtypes import iface_ij
-from zdock.dataset import generate_decoys, label_decoys
+from zdock.dataset import generate_decoys, generate_pool_reachable, label_decoys
 from zdock.evaluate import evaluate_ranking
+from zdock.geom import grid_shape
 from zdock.prep_cache import load_prepared
 from zdock.score import (docking_score_elec, iface_score_matrix,
-                         SC_REFERENCE_SPACING)
+                         psc_score_from_terms, SC_REFERENCE_SPACING, SC_RHO)
+from zdock.rotation_grid import hopf_quaternions, random_quaternions
 from zdock.train import loss_basin, loss_margin_hard_negatives, loss_param_prior
 
 KS = (1, 5, 10, 50, 100)
@@ -85,11 +88,20 @@ class Feats:
     default-parameter candidate set), which is what lets us report pool
     composition (positives / random negatives / hard negatives) and assert that
     mining never grows the positive set.
+
+    ``prov`` records *how* the pose was proposed: 0 = returned by the FFT
+    search, 1 = enumerated on the search's own lattice near the native pose
+    (see ``generate_pool_reachable``). Both are reachable; the flag exists so
+    the report can say how many positives the search found unaided.
+
+    ``sc`` is ``(F, 4)`` — the rho-independent PSC decomposition
+    ``(c_pair, n_ss, n_sc, n_cc)`` — when the pool was built with
+    ``--psc-decompose`` (the default), and ``(F,)`` for legacy caches.
     """
 
-    __slots__ = ("name", "sc", "T", "elec", "rmsd", "dockq", "origin")
+    __slots__ = ("name", "sc", "T", "elec", "rmsd", "dockq", "origin", "prov")
 
-    def __init__(self, name, sc, T, elec, rmsd, dockq, origin):
+    def __init__(self, name, sc, T, elec, rmsd, dockq, origin, prov=None):
         self.name = name
         self.sc = sc
         self.T = T
@@ -97,6 +109,7 @@ class Feats:
         self.rmsd = rmsd
         self.dockq = dockq
         self.origin = origin
+        self.prov = (torch.zeros_like(origin) if prov is None else prov)
 
     @property
     def n(self) -> int:
@@ -111,7 +124,8 @@ class Feats:
                      self.elec.to(device, non_blocking=non_blocking),
                      self.rmsd.to(device, non_blocking=non_blocking),
                      self.dockq.to(device, non_blocking=non_blocking),
-                     self.origin.to(device, non_blocking=non_blocking))
+                     self.origin.to(device, non_blocking=non_blocking),
+                     self.prov.to(device, non_blocking=non_blocking))
 
     def cat(self, other: "Feats") -> None:
         self.sc = torch.cat([self.sc, other.sc])
@@ -120,31 +134,172 @@ class Feats:
         self.rmsd = torch.cat([self.rmsd, other.rmsd])
         self.dockq = torch.cat([self.dockq, other.dockq])
         self.origin = torch.cat([self.origin, other.origin])
+        self.prov = torch.cat([self.prov, other.prov])
 
     def index(self, idx) -> "Feats":
         return Feats(self.name, self.sc[idx], self.T[idx], self.elec[idx],
-                     self.rmsd[idx], self.dockq[idx], self.origin[idx])
+                     self.rmsd[idx], self.dockq[idx], self.origin[idx],
+                     self.prov[idx])
 
     def counts(self, dockq_thr: float) -> dict:
         pos = self.dockq >= dockq_thr
         r0 = self.origin == 0
+        search = self.prov == 0
         return {"n": self.n,
                 "n_pos": int(pos.sum()),
                 "n_rand_neg": int((~pos & r0).sum()),
-                "n_hard_neg": int((~pos & ~r0).sum())}
+                "n_hard_neg": int((~pos & ~r0).sum()),
+                "n_pos_from_search": int((pos & search).sum()),
+                "n_pos_enumerated": int((pos & ~search).sum())}
 
 
-def score_from_feats(f: Feats, alpha, iface_flat, beta) -> torch.Tensor:
-    imat = iface_score_matrix(iface_flat)
-    return alpha * f.sc + (imat * f.T).sum(dim=(-2, -1)) + beta * f.elec
+class Params:
+    """The trainable scoring parameters, bundled so adding one does not mean
+    re-threading every signature in this file.
+
+    The score is exactly linear in a 148-dimensional reparametrisation
+    (verified numerically to 5e-12)::
+
+        S = alpha*c_pair - (w_ss*n_ss + w_sc*n_sc + w_cc*n_cc)
+              + sum_ij M_ij(e) T_ij + beta*S_ELEC
+
+    Chen & Weng 2003 do not treat the three clash weights as free: they set
+    ``Im in {0, rho, rho**2}``, so ``w_k = alpha * rho**k`` for k = 2, 3, 4.
+    In log space that is the statement that the three log-weights are
+    **collinear**::
+
+        log w_k = log alpha + k * log rho          (2 degrees of freedom)
+
+    ``--psc-mode``:
+
+    * ``rho``  -- keep the collinearity. 146 trainable parameters
+      (alpha, rho, 144 pair terms). Faithful to the paper.
+    * ``free`` -- drop it: the three log-weights move independently. 148
+      parameters. The published penalty *ratios* 1 : rho : rho**2 between
+      surface-surface, surface-core and core-core become a hypothesis the fit
+      can reject rather than an assumption.
+
+    Both modes start from exactly the same point (``w_k = alpha0 * rho0**k``),
+    so the comparison isolates the constraint. Weights are carried as logs:
+    that keeps them positive (a clash must cost, never pay), makes the learning
+    rate scale-free across weights spanning 12 to 150, and makes ``rho`` mode a
+    literal linear subspace of ``free`` mode.
+
+    ``beta`` and the 11 charges are deliberately NOT trained. After the ELEC
+    mask/sign fixes they do receive gradient, but measured on the poses a ranker
+    must actually discriminate among (1KXQ, Hopf nside=3, top-500),
+    std(beta*S_ELEC) = 1.0 against std(S_IFACE) = 104 and std(S_PSC) = 102 --
+    ELEC moves ~1% of the ranking, and beta = 3 is the published value.
+    """
+
+    #: exponents of rho for (surface-surface, surface-core, core-core)
+    CLASH_POWERS = (2.0, 3.0, 4.0)
+
+    #: every stored tensor. Which of them a given mode actually optimises is
+    #: `tensors()`, not this.
+    NAMES = ("alpha", "rho", "iface", "log_clash")
+
+    def __init__(self, alpha, rho, iface, log_clash=None, mode="rho",
+                 train_psc=True):
+        self.alpha, self.rho, self.iface = alpha, rho, iface
+        #: False freezes alpha and the clash weights at their initial (published)
+        #: values and trains only the 144 pair terms. The cross-swap of a
+        #: jointly-trained checkpoint showed the whole top-1 gain sitting in the
+        #: IFACE block (+17 complexes of 236) while the PSC block alone cost 4,
+        #: so the narrow claim "learning the pair potential helps" needs the PSC
+        #: side held fixed rather than inferred from a post-hoc swap.
+        self.train_psc = train_psc
+        if log_clash is None:               # derive the paper's collinear point
+            k = torch.tensor(self.CLASH_POWERS, device=rho.device,
+                             dtype=rho.dtype)
+            log_clash = (alpha.detach() * rho.detach().pow(k)).log()
+        self.log_clash = log_clash          # (3,) log of the three weights
+        self.mode = mode
+
+    def clash_weights(self) -> torch.Tensor:
+        """``(w_ss, w_sc, w_cc)``, differentiable in whichever mode is active."""
+        if self.mode == "rho":
+            k = torch.tensor(self.CLASH_POWERS, device=self.rho.device,
+                             dtype=self.rho.dtype)
+            return self.alpha * self.rho.pow(k)
+        return self.log_clash.exp()
+
+    def clone(self) -> "Params":
+        return Params(self.alpha.detach().clone(), self.rho.detach().clone(),
+                      self.iface.detach().clone(),
+                      self.log_clash.detach().clone(), self.mode, self.train_psc)
+
+    def cpu(self) -> "Params":
+        """Detached CPU copy that KEEPS the mode.
+
+        `cap_pool` used to be handed `Params(alpha, rho, iface)`, which silently
+        rebuilt a `rho`-mode object and scored a `free`-mode run with the wrong
+        clash weights.
+        """
+        return Params(self.alpha.detach().cpu(), self.rho.detach().cpu(),
+                      self.iface.detach().cpu(), self.log_clash.detach().cpu(),
+                      self.mode, self.train_psc)
+
+    def tensors(self):
+        """Only what this mode actually optimises."""
+        if not self.train_psc:
+            return [self.iface]
+        if self.mode == "rho":
+            return [self.alpha, self.rho, self.iface]
+        return [self.alpha, self.log_clash, self.iface]
+
+    def requires_grad_(self, flag=True):
+        for t in self.tensors():
+            t.requires_grad_(flag)
+        return self
+
+    def state_dict(self):
+        d = {n: getattr(self, n).detach().cpu() for n in self.NAMES}
+        d["psc_mode"] = self.mode
+        d["clash_weights"] = self.clash_weights().detach().cpu()
+        return d
+
+    @classmethod
+    def initial(cls, args, device, dtype):
+        a = torch.tensor(args.alpha0, device=device, dtype=dtype)
+        r = torch.tensor(args.rho0, device=device, dtype=dtype)
+        k = torch.tensor(cls.CLASH_POWERS, device=device, dtype=dtype)
+        return cls(a, r, iface_ij(device=device, dtype=dtype, flat=True),
+                   (a * r.pow(k)).log(), getattr(args, "psc_mode", "rho"),
+                   not getattr(args, "freeze_psc", False))
+
+    def summary(self, p0: "Params") -> dict:
+        w = self.clash_weights()
+        out = {"alpha": float(self.alpha), "rho": float(self.rho),
+               "d_iface_norm": float((self.iface - p0.iface).norm()),
+               "w_ss": float(w[0]), "w_sc": float(w[1]), "w_cc": float(w[2])}
+        if self.mode == "free":
+            # If the paper's collinearity still held, these three would agree.
+            # Reporting them makes a violation visible rather than buried.
+            k = torch.tensor(self.CLASH_POWERS, device=w.device, dtype=w.dtype)
+            out["implied_rho"] = [float(x) for x in
+                                  (w / self.alpha.clamp_min(1e-12)).pow(1.0 / k)]
+        return out
 
 
-def normalized_scores(f: Feats, alpha, iface, beta) -> torch.Tensor:
+def score_from_feats(f: Feats, p: Params, beta) -> torch.Tensor:
+    imat = iface_score_matrix(p.iface)
+    if f.sc.ndim == 2:
+        # (F, 4) = (c_pair, n_ss, n_sc, n_cc). The clash weights come from
+        # `Params`, so `rho` and `free` mode share one scoring path.
+        sc = p.alpha * f.sc[:, 0] - (f.sc[:, 1:4] * p.clash_weights()).sum(-1)
+    else:
+        # legacy (F,) cache with rho already baked in: no gradient to rho.
+        sc = p.alpha * f.sc
+    return sc + (imat * f.T).sum(dim=(-2, -1)) + beta * f.elec
+
+
+def normalized_scores(f: Feats, p: Params, beta) -> torch.Tensor:
     """Ranking-preserving per-complex standardization, used *only* inside the
     loss (see §5.5: raw score std is 5e2-2e3 while the basin temperature is
     0.5). Centering and dividing by a detached positive scalar cannot change
     pose order, so the trained parameters rank exactly as the raw score does."""
-    s = score_from_feats(f, alpha, iface, beta)
+    s = score_from_feats(f, p, beta)
     # `std()` of a 1-element tensor is NaN and `clamp_min` propagates it, so a
     # single one-pose complex would NaN the loss and Adam would permanently
     # poison alpha and iface. `unbiased=False` returns 0 there instead.
@@ -161,8 +316,44 @@ def _adaptive_pose_chunk(n_rec: int, n_lig: int, budget_elems: int) -> int:
     return int(max(1, min(64, budget_elems // per)))
 
 
+def _adaptive_frame_chunk(n_voxels: int, budget_elems: int, cap: int) -> int:
+    """Featurisation builds ``L_count`` of shape ``(chunk * 12, nx, ny, nz)``.
+
+    That is **twelve grids per pose**, so at the paper's 1.2 A spacing it, not
+    the FFT search, is what exhausts the card: a 22.5M-voxel complex needs
+    100 GiB at ``frame_chunk=100`` and still 25 GiB at 25. A fixed default
+    profiled at the old 3.0 A spacing therefore killed the large complexes
+    systematically -- measured on the first TEST pool build, 83 of 250 were lost
+    to OOM and their voxel median was 4.1M against 1.7M for the survivors, i.e.
+    exactly the survivorship bias the size cutoff exists to avoid.
+
+    Scaling the chunk with the grid volume instead makes the peak roughly
+    constant across the corpus.
+    """
+    per = max(1, 12 * n_voxels)
+    return int(max(1, min(cap, budget_elems // per)))
+
+
+def search_quaternions(args, round_idx: int, device, dtype):
+    """The rotation set the FFT search runs over.
+
+    Hopf (default): a deterministic, near-optimal covering of SO(3) with a
+    measured covering radius of ~18.5 deg at 1944 points, against ~28.3 deg for
+    the same number of uniform-random orientations. It carries no dependence on
+    the native orientation, which is the point -- the previous recipe mixed a
+    25 deg cone around q* into the *search* set and thereby leaked the answer
+    into the candidate pool.
+    """
+    if args.rot_set == "hopf":
+        q = hopf_quaternions(args.hopf_nside, device=device, dtype=dtype)
+        return q / q.norm(dim=-1, keepdim=True)
+    return random_quaternions(args.mine_random_rot,
+                              seed=args.seed + 1000 * round_idx,
+                              device=device, dtype=dtype)
+
+
 @torch.no_grad()
-def mine_complex(prot, alpha, iface, beta0, charge0, args, round_idx: int,
+def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
                  *, rot_chunk: int | None = None, frame_chunk: int | None = None,
                  pose_chunk: int | None = None):
     """FFT-search + label + featurize one complex; return host-side ``Feats``.
@@ -174,22 +365,41 @@ def mine_complex(prot, alpha, iface, beta0, charge0, args, round_idx: int,
     device = prot.rec_xyz.device
     dtype = prot.rec_xyz.dtype
     rot_chunk = args.rot_chunk if rot_chunk is None else rot_chunk
-    frame_chunk = args.frame_chunk if frame_chunk is None else frame_chunk
+    nx, ny, nz = grid_shape(prot.rec_xyz, prot.lig_ref, spacing=args.spacing)
+    n_voxels = nx * ny * nz
+    if frame_chunk is None:
+        frame_chunk = min(args.frame_chunk,
+                          _adaptive_frame_chunk(n_voxels, args.feature_budget,
+                                                args.frame_chunk))
     if pose_chunk is None:
         pose_chunk = _adaptive_pose_chunk(prot.n_rec, prot.n_lig, args.dockq_budget)
+    quats = search_quaternions(args, round_idx, device, dtype)
 
     last_exc = None
     for attempt in range(args.oom_retries + 1):
         try:
-            poses, _ = generate_decoys(
-                prot, alpha=alpha, iface_ij_flat=iface, beta=beta0,
-                charge_score_lut=charge0,
-                n_random_rot=args.mine_random_rot, n_cone=args.mine_cone,
-                ntop=args.mine_ntop, seed=args.seed + 1000 * round_idx,
-                rot_chunk_size=rot_chunk, spacing=args.spacing,
-            )
+            if args.pool == "reachable":
+                poses, prov = generate_pool_reachable(
+                    prot, alpha=p.alpha, iface_ij_flat=p.iface, beta=beta0,
+                    charge_score_lut=charge0, quats=quats,
+                    ntop=args.mine_ntop, spacing=args.spacing,
+                    rot_chunk_size=rot_chunk,
+                    n_near_rot=args.near_rot, trans_cells=args.trans_cells,
+                )
+            else:                                    # legacy (section 5.6) recipe
+                poses, _ = generate_decoys(
+                    prot, alpha=p.alpha, iface_ij_flat=p.iface, beta=beta0,
+                    charge_score_lut=charge0,
+                    n_random_rot=args.mine_random_rot, n_cone=args.mine_cone,
+                    ntop=args.mine_ntop, seed=args.seed + 1000 * round_idx,
+                    rot_chunk_size=rot_chunk, spacing=args.spacing,
+                )
+                prov = torch.zeros(poses.shape[0], device=device,
+                                   dtype=torch.int16)
             alpha_d = torch.zeros((), device=device, dtype=dtype)
             iface_d = iface_ij(device=device, dtype=dtype, flat=True)
+            # `psc_decompose` caches (c_pair, n_ss, n_sc, n_cc) instead of the
+            # collapsed S_PSC so that rho stays trainable from these features.
             sc, T, elec = docking_score_elec(
                 prot.rec_xyz, prot.rec_radius, prot.rec_sasa,
                 prot.rec_atomtype_id, prot.rec_charge_id,
@@ -198,12 +408,14 @@ def mine_complex(prot, alpha, iface, beta0, charge0, args, round_idx: int,
                 alpha_d, iface_d, beta0, charge0,
                 lig_xyz_for_grid=prot.lig_ref, spacing=args.spacing,
                 frame_chunk_size=frame_chunk, return_components=True,
+                psc_decompose=args.psc_decompose,
             )
             rmsd, dockq = label_decoys(prot, poses, pose_chunk=pose_chunk)
             out = Feats(prot.name, sc.cpu(), T.cpu(), elec.cpu(),
                         rmsd.cpu(), dockq.cpu(),
-                        torch.full((sc.shape[0],), round_idx, dtype=torch.int16))
-            del poses, sc, T, elec, rmsd, dockq
+                        torch.full((sc.shape[0],), round_idx, dtype=torch.int16),
+                        prov.cpu())
+            del poses, prov, sc, T, elec, rmsd, dockq
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             return out
@@ -224,11 +436,11 @@ def mine_complex(prot, alpha, iface, beta0, charge0, args, round_idx: int,
 # --------------------------------------------------------------------------
 # pool bookkeeping
 # --------------------------------------------------------------------------
-def cap_pool(f: Feats, cap: int, alpha, iface, beta, dockq_thr: float) -> Feats:
+def cap_pool(f: Feats, cap: int, p: Params, beta, dockq_thr: float) -> Feats:
     """Keep every positive + the hardest (highest-scoring) current negatives."""
     if f.n <= cap:
         return f
-    s = score_from_feats(f, alpha, iface, beta)
+    s = score_from_feats(f, p, beta)
     pos = (f.dockq >= dockq_thr).nonzero(as_tuple=True)[0]
     neg = (f.dockq < dockq_thr).nonzero(as_tuple=True)[0]
     n_keep = max(0, cap - pos.numel())
@@ -244,14 +456,14 @@ def cap_pool(f: Feats, cap: int, alpha, iface, beta, dockq_thr: float) -> Feats:
 # evaluation (streams complexes to the GPU one at a time)
 # --------------------------------------------------------------------------
 @torch.no_grad()
-def aggregate(feats_list, alpha, iface_flat, beta, device, rmsd_thr, dockq_thr):
+def aggregate(feats_list, p: Params, beta, device, rmsd_thr, dockq_thr):
     n = max(1, len(feats_list))
     succ_r = {k: 0 for k in KS}
     succ_d = {k: 0 for k in KS}
     top1 = 0.0
     for f in feats_list:
         g = f.to(device)
-        s = score_from_feats(g, alpha, iface_flat, beta)
+        s = score_from_feats(g, p, beta)
         rep = evaluate_ranking(s, g.rmsd, g.dockq, ks=KS,
                                rmsd_threshold=rmsd_thr, dockq_threshold=dockq_thr)
         for k in KS:
@@ -274,12 +486,35 @@ def _fmt(tag, sr, sd, t1):
 # --------------------------------------------------------------------------
 # training
 # --------------------------------------------------------------------------
-def mean_objective(feats, alpha, iface, alpha0, iface0, beta0, args,
+def loss_view(f: Feats, loss_prov: str) -> Feats:
+    """The subset of a complex's pool the LOSS is allowed to see.
+
+    ``"search"`` keeps only poses the FFT search actually returned. The
+    enumerated near-native poses stay in the pool for reachability accounting
+    and for reporting, but they are not available at inference, and training on
+    them is what destroyed the first N=220 run: they are 96% of the positives
+    (median 180 of 199 per fit complex against 3 from the search), so the loss
+    was dominated by "rank a hand-placed near-native pose above a search pose".
+    The cheapest way to satisfy that is to switch the shape term off -- alpha
+    went to 0.0014 -- after which the score is essentially a contact count. That
+    separates enumerated from searched poses beautifully and is useless for
+    choosing among poses the search actually offers: measured on 236 TEST
+    complexes, success@1 fell 69.5% -> 34.7% (McNemar p = 4e-21, 86 complexes
+    lost against 4 gained) while the same checkpoint *improved* on the pooled
+    metric that includes the enumerated poses (65.9% -> 76.7%).
+    """
+    if loss_prov != "search":
+        return f
+    keep = (f.prov == 0).nonzero(as_tuple=True)[0]
+    return f.index(keep)
+
+
+def mean_objective(feats, p: Params, p0: Params, beta0, args,
                    charge_dummy, device):
-    total = torch.zeros((), device=alpha.device, dtype=alpha.dtype)
+    total = torch.zeros((), device=p.alpha.device, dtype=p.alpha.dtype)
     for f in feats:
-        g = f.to(device)
-        s = normalized_scores(g, alpha, iface, beta0)
+        g = loss_view(f, args.loss_prov).to(device)
+        s = normalized_scores(g, p, beta0)
         # Forward the pool's own threshold: the loss functions default to 0.23
         # independently of --dockq-threshold, so the two would silently diverge
         # the moment that flag is passed.
@@ -288,66 +523,91 @@ def mean_objective(feats, alpha, iface, alpha0, iface0, beta0, args,
         total = total + args.lambda_margin * loss_margin_hard_negatives(
             s, g.dockq, margin=args.margin, positive_threshold=args.dockq_thr)
     total = total / max(1, len(feats))
-    return total + args.lambda_prior * loss_param_prior(
-        alpha, iface, charge_dummy, alpha0, iface0, charge_dummy)
+    # rho is regularised towards its published initial value on the same
+    # quadratic footing as alpha and the pair table.
+    prior = loss_param_prior(p.alpha, p.iface, charge_dummy,
+                             p0.alpha, p0.iface, charge_dummy)
+    # Anchor whichever clash parametrisation is live. Both are in log space
+    # (rho enters as log w_k = log alpha + k log rho), so the two priors are on
+    # the same footing and the modes stay comparable.
+    prior = prior + ((p.log_clash - p0.log_clash).pow(2).sum()
+                     if p.mode == "free" else (p.rho - p0.rho).pow(2))
+    return total + args.lambda_prior * prior
 
 
 @torch.no_grad()
-def _val_loss(val_feats, alpha, iface, alpha0, iface0, beta0, args,
+def _val_loss(val_feats, p: Params, p0: Params, beta0, args,
               charge_dummy, device):
-    return float(mean_objective(val_feats, alpha, iface, alpha0, iface0, beta0,
+    return float(mean_objective(val_feats, p, p0, beta0,
                                 args, charge_dummy, device))
 
 
-def train_params(fit_feats, val_feats, alpha, iface, alpha0, iface0, beta0,
+def train_params(fit_feats, val_feats, p: Params, p0: Params, beta0,
                  args, device, dtype, gen, n_steps, val_every,
                  optimizer_state=None):
     """Continue from the current parameters; select a checkpoint on the fixed
     validation loss only. Returns the trajectory for the report."""
-    alpha.requires_grad_(True)
-    iface.requires_grad_(True)
+    p.requires_grad_(True)
     charge_dummy = torch.zeros(0, device=device, dtype=dtype)
-    opt = torch.optim.Adam([
-        {"params": [alpha], "lr": args.alpha_lr},
-        {"params": [iface], "lr": args.iface_lr},
-    ])
+    groups = [{"params": [p.iface], "lr": args.iface_lr}]
+    if p.train_psc:
+        groups.append({"params": [p.alpha], "lr": args.alpha_lr})
+        groups.append({"params": [p.rho], "lr": args.rho_lr} if p.mode == "rho"
+                      else {"params": [p.log_clash], "lr": args.rho_lr})
+    opt = torch.optim.Adam(groups)
     if optimizer_state is not None:
         opt.load_state_dict(optimizer_state)
     bs = min(args.batch_size, len(fit_feats))
 
-    best_val = _val_loss(val_feats, alpha, iface, alpha0, iface0, beta0, args,
-                         charge_dummy, device)
-    best_params = (alpha.detach().clone(), iface.detach().clone())
+    best_val = _val_loss(val_feats, p, p0, beta0, args, charge_dummy, device)
+    best_params = p.clone()
     best_opt = copy.deepcopy(opt.state_dict())
     traj = [{"step": 0, "fit_loss": float("nan"), "val_loss": best_val,
-             "grad_norm": float("nan"), "accepted": 1,
-             "alpha": float(alpha), "d_iface": float((iface - iface0).norm())}]
+             "grad_norm": float("nan"), "accepted": 1, **p.summary(p0)}]
     stale = 0
     step = 0
     grad_norms = []
     for step in range(n_steps):
         opt.zero_grad()
         batch = torch.randperm(len(fit_feats), generator=gen)[:bs].tolist()
-        total = mean_objective([fit_feats[i] for i in batch], alpha, iface,
-                               alpha0, iface0, beta0, args, charge_dummy, device)
+        total = mean_objective([fit_feats[i] for i in batch], p, p0, beta0,
+                               args, charge_dummy, device)
         total.backward()
-        gn = float(torch.nn.utils.clip_grad_norm_([alpha, iface], args.grad_clip))
+        gn = float(torch.nn.utils.clip_grad_norm_(p.tensors(), args.grad_clip))
         grad_norms.append(gn)
         opt.step()
         with torch.no_grad():
-            alpha.clamp_(min=0.0, max=args.alpha_max)
+            if p.train_psc:
+                p.alpha.clamp_(min=0.0, max=args.alpha_max)
+            # rho must stay strictly positive: at rho = 0 the open-space mask
+            # `(im <= 0)` in psc_grids flips and S_PSC jumps discontinuously
+            # (measured 259.0 vs the quartic's 152.0), so the cached quartic
+            # stops being the true score there.
+            if not p.train_psc:
+                pass                       # alpha and the clash weights frozen
+            elif p.mode == "rho":
+                p.rho.clamp_(min=args.rho_min, max=args.rho_max)
+            else:
+                # keep every clash weight inside the range the constrained
+                # model could have reached, so 'free' cannot win by escaping
+                # to a regime 'rho' was forbidden from
+                k = torch.tensor(Params.CLASH_POWERS, device=p.log_clash.device,
+                                 dtype=p.log_clash.dtype)
+                lo = (p.alpha.detach().clamp_min(1e-12).log()
+                      + k * math.log(args.rho_min))
+                hi = (p.alpha.detach().clamp_min(1e-12).log()
+                      + k * math.log(args.rho_max))
+                p.log_clash.clamp_(min=float(lo.min()), max=float(hi.max()))
 
         if step % val_every == 0 or step == n_steps - 1:
-            val = _val_loss(val_feats, alpha, iface, alpha0, iface0, beta0,
-                            args, charge_dummy, device)
+            val = _val_loss(val_feats, p, p0, beta0, args, charge_dummy, device)
             accepted = val < best_val - args.min_delta
             traj.append({"step": step + 1, "fit_loss": float(total.detach()),
                          "val_loss": val, "grad_norm": gn,
-                         "accepted": int(accepted), "alpha": float(alpha),
-                         "d_iface": float((iface - iface0).norm())})
+                         "accepted": int(accepted), **p.summary(p0)})
             if accepted:
                 best_val = val
-                best_params = (alpha.detach().clone(), iface.detach().clone())
+                best_params = p.clone()
                 best_opt = copy.deepcopy(opt.state_dict())
                 stale = 0
             else:
@@ -356,13 +616,17 @@ def train_params(fit_feats, val_feats, alpha, iface, alpha0, iface0, beta0,
                     break
 
     with torch.no_grad():
-        alpha.copy_(best_params[0])
-        iface.copy_(best_params[1])
+        for n in Params.NAMES:
+            getattr(p, n).copy_(getattr(best_params, n))
     opt.load_state_dict(best_opt)
+    at_bound = {"alpha_at_bound": bool(float(p.alpha) in (0.0, args.alpha_max)),
+                "rho_at_bound": bool(p.mode == "rho" and float(p.rho)
+                                     in (args.rho_min, args.rho_max))}
     stats = {"best_val_loss": best_val, "steps_run": step + 1,
              "mean_grad_norm": sum(grad_norms) / max(1, len(grad_norms)),
-             "max_grad_norm": max(grad_norms) if grad_norms else float("nan")}
-    return alpha.detach(), iface.detach(), stats, traj, opt.state_dict()
+             "max_grad_norm": max(grad_norms) if grad_norms else float("nan"),
+             **at_bound}
+    return p, stats, traj, opt.state_dict()
 
 
 # --------------------------------------------------------------------------
@@ -401,6 +665,30 @@ def iface_coverage(feats_list) -> dict:
 # --------------------------------------------------------------------------
 # dataset selection (deterministic, nested)
 # --------------------------------------------------------------------------
+def is_homodimer(pinder_id: str) -> bool:
+    """Both partners are the same UniProt entry.
+
+    PINDER ids look like ``8b3p__GA1_P69540--8b3p__PA1_P69540``; the trailing
+    underscore-separated field of each half is the UniProt accession.
+
+    Why this matters for training: the DockQ in this repository uses a fixed
+    per-atom correspondence with no chain-permutation maximisation, so for a
+    symmetric complex a pose that places the ligand on the *equivalent* partner
+    site is scored against the wrong copy. Measured on 14 such complexes, the
+    role-swapped pose -- which is the native complex atom-for-atom up to a rigid
+    motion -- scores DockQ 1.000 for the 3 exact-C2 cases and **0.005-0.020 for
+    the 11 non-involutory ones**. Roughly 20% of the corpus is same-UniProt and
+    ~79% of those are non-C2, so ~15% of complexes admit perfectly correct poses
+    that this metric labels as negatives. That is not noise, it is label noise
+    pointing the wrong way: the loss is told to *down*-rank a correct pose.
+    Excluding them is the cheap control until a symmetry-aware DockQ exists.
+    """
+    halves = pinder_id.split("--")
+    if len(halves) != 2:
+        return False
+    return halves[0].rsplit("_", 1)[-1] == halves[1].rsplit("_", 1)[-1]
+
+
 def select_split(args):
     """First ``n_total`` *usable* master-list clusters, split 80/20 by stride.
 
@@ -421,6 +709,17 @@ def select_split(args):
     # excluding on observed OOM, which would depend on transient GPU pressure
     # and silently break the nested-subset design.
     max_vox = getattr(args, "max_grid_voxels", 0)
+    # Complexes whose reference structure is not physically possible (receptor
+    # and ligand heavy atoms closer than 2 A) or whose analytic native pose does
+    # not reproduce native_lig. Produced by scripts/check_prep_cache.py; 83 of
+    # 2900 in the current corpus. Training on them tells the model that an
+    # interpenetrated pose is correct.
+    bad_geometry: set[str] = set()
+    if args.exclude_bad_geometry and Path(args.exclude_bad_geometry).exists():
+        bad_geometry = {ln.strip() for ln
+                        in Path(args.exclude_bad_geometry).read_text().splitlines()
+                        if ln.strip()}
+
     voxels: dict[str, int] = {}
     if max_vox:
         vpath = Path(args.grid_voxels)
@@ -432,6 +731,10 @@ def select_split(args):
 
     def eligible(pid: str) -> bool:
         if status.get(pid, {}).get("status") != "ok":
+            return False
+        if pid in bad_geometry:
+            return False
+        if args.exclude_homodimer and is_homodimer(pid):
             return False
         # Fail CLOSED on a missing voxel entry. `voxels.get(pid, 0)` treated an
         # absent id as 0 voxels, i.e. always eligible, so extending the prep
@@ -467,15 +770,23 @@ def select_split(args):
     return sel, fit_ids, val_ids, status, info
 
 
-def load_test_feats(path, dtype):
+def load_test_feats(path, dtype, *, require_psc_terms: bool):
     blob = torch.load(path, map_location="cpu", weights_only=True)
     out = []
     for d in blob:
         n = d["sc"].shape[0]
+        if require_psc_terms and d["sc"].ndim != 2:
+            raise SystemExit(
+                f"{path} holds a collapsed (F,) S_PSC, but rho is being "
+                f"trained, which needs the (F, 4) decomposition. That cache "
+                f"also predates the PSC/ELEC/binning fixes and the reachable "
+                f"pool recipe, so it is not comparable with the fit pools "
+                f"either. Rebuild it with scripts/build_test_pool.py.")
         out.append(Feats(d["name"], d["sc"].to(dtype), d["T"].to(dtype),
                          d["elec"].to(dtype), d["rmsd"].to(dtype),
                          d["dockq"].to(dtype),
-                         torch.zeros(n, dtype=torch.int16)))
+                         torch.zeros(n, dtype=torch.int16),
+                         d.get("prov", torch.zeros(n, dtype=torch.int16))))
     return out
 
 
@@ -500,6 +811,15 @@ def main() -> None:
     # p95 of the corpus. Cost and peak VRAM scale with the FFT lattice volume;
     # the tail reaches 1.2e10 voxels, and a single 4.1e6-voxel complex stalled
     # four jobs for >20 min even after the OOM ladder dropped to rot_chunk=1.
+    ap.add_argument("--exclude-bad-geometry",
+                    default="data/scaling/excluded_bad_geometry.txt",
+                    dest="exclude_bad_geometry",
+                    help="ids whose reference structure is sterically "
+                         "impossible; '' disables")
+    ap.add_argument("--exclude-homodimer", dest="exclude_homodimer",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="drop same-UniProt complexes: the symmetry-blind DockQ "
+                         "labels ~15%% of them with correct poses as negatives")
     ap.add_argument("--max-grid-voxels", type=int, default=2_000_000,
                     dest="max_grid_voxels",
                     help="drop complexes whose FFT lattice exceeds this many "
@@ -508,12 +828,31 @@ def main() -> None:
                     dest="test_cache")
     ap.add_argument("--test-ids", default="data/pinder_test_ids.txt", dest="test_ids")
     ap.add_argument("--out-dir", default="data/scaling/runs", dest="out_dir")
+    # The round-0 pool is determined by the selection and the BASELINE
+    # parameters, and `select_split` has no RNG -- so every --seed mines exactly
+    # the same thing. Caching it turns "3 seeds" from 3x the GPU cost into 1x
+    # plus three cheap training runs, and lets hyperparameters be re-tried
+    # without re-mining. Mining rounds >= 1 are NOT cached: they depend on the
+    # parameters reached so far, hence on the seed.
+    ap.add_argument("--mine-shard", default="0/1", dest="mine_shard",
+                    help="i/n -- mine every n-th remaining complex starting at "
+                         "i, writing a shard-specific cache file, so several "
+                         "GPUs can build one round-0 pool in parallel")
+    ap.add_argument("--mine-only", dest="mine_only", action="store_true",
+                    help="mine and cache, then exit before training")
+    ap.add_argument("--pool-cache", default="data/scaling/pool_cache",
+                    dest="pool_cache", help="'' disables")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # optimization (identical to the stabilized §5.5 configuration)
     ap.add_argument("--epoch-passes", type=int, default=100, dest="epoch_passes",
                     help="optimizer steps = max(min_steps, passes * ceil(N/bs))")
     ap.add_argument("--min-steps", type=int, default=1500, dest="min_steps")
-    ap.add_argument("--alpha-lr", type=float, default=1e-5, dest="alpha_lr")
+    # The old 1e-5 was picked when alpha0 was 0.01, i.e. a relative step of
+    # 1e-3. alpha0 is now a knob, so scale with it to keep that relative
+    # step; a fixed 1e-5 against alpha0 = 1.0 is 100x too small and the
+    # parameter simply does not move.
+    ap.add_argument("--alpha-lr", type=float, default=0.0, dest="alpha_lr",
+                    help="0 = 1e-3 * alpha0")
     ap.add_argument("--iface-lr", type=float, default=5e-4, dest="iface_lr")
     # alpha0 is a CLI knob and alpha_max defaults to 10*alpha0 so the box
     # constraint can never sit below the initial value. The old hardcoded
@@ -537,12 +876,71 @@ def main() -> None:
     # complex from 35.6 to 24.7 GiB at identical wall time (the search is
     # launch-bound, not bandwidth-bound, at this size); rot_chunk 4 halves
     # memory again but costs ~29% more time.
-    ap.add_argument("--frame-chunk", type=int, default=200, dest="frame_chunk")
-    ap.add_argument("--rot-chunk", type=int, default=8, dest="rot_chunk")
+    # These were profiled at the OLD 3.0 A default. At the paper's 1.2 A a grid
+    # has (3.0/1.2)^3 = 15.6x the cells, so peak VRAM scales with it: a
+    # median-size complex (2.0M voxels) already peaks at 7.9 GiB with
+    # rot_chunk=8, and nearly every TEST complex OOM'd at that setting on a
+    # 47 GiB card. rot_chunk=2 is the 1.2 A default.
+    ap.add_argument("--frame-chunk", type=int, default=100, dest="frame_chunk")
+    ap.add_argument("--rot-chunk", type=int, default=2, dest="rot_chunk")
     # One spacing for BOTH the search that generates the pool and the scorer
     # that featurises it. These used to disagree (3.0 vs 1.2), so the top-N cut
     # was made under a different objective from the one being trained.
     ap.add_argument("--spacing", type=float, default=SC_REFERENCE_SPACING)
+    # --- candidate pool -------------------------------------------------
+    ap.add_argument("--loss-prov", choices=("search", "all"), default="search",
+                    dest="loss_prov",
+                    help="which poses the LOSS may see. 'search' = only what "
+                         "the FFT search returned (the deployment "
+                         "distribution); 'all' also feeds it the enumerated "
+                         "near-native poses, which the first N=220 run showed "
+                         "collapses end-to-end success@1 from 69.5%% to 34.7%%")
+    ap.add_argument("--pool", choices=("reachable", "legacy"), default="reachable",
+                    help="reachable: Hopf search (no q* cone) + positives "
+                         "enumerated on the search's own lattice. legacy: the "
+                         "section 5.6 recipe (cone-seeded search + positives "
+                         "injected at the exact, unreachable t*).")
+    ap.add_argument("--rot-set", choices=("hopf", "uniform"), default="hopf",
+                    dest="rot_set")
+    ap.add_argument("--hopf-nside", type=int, default=3, dest="hopf_nside",
+                    help="72*nside^3 rotations; 3 -> 1944, covering radius ~18.5 deg")
+    ap.add_argument("--near-rot", type=int, default=8, dest="near_rot",
+                    help="grid rotations nearest q* to enumerate positives from")
+    # +/-1, not +/-2. The radius sets how many near-native poses are
+    # enumerated, and 8 rotations x (2R+1)^3 translations floods the positive
+    # class fast: measured over 24 TEST complexes, R=2 yields a median 982
+    # positives of which only 14 clear DockQ 0.6, while R=1 yields 216 with 8 --
+    # a 4.6x smaller pool, the same ceiling (best DockQ 0.671 vs 0.686) and a
+    # BETTER median positive (0.383 vs 0.352). The marginal ones are poses
+    # pushed up to 2.4 A into the receptor; labelling them "correct" teaches the
+    # model that interpenetration is fine, and it made the pooled AUC
+    # meaningless (0.085 at DockQ>=0.23 against 0.990 at >=0.8).
+    ap.add_argument("--trans-cells", type=int, default=1, dest="trans_cells",
+                    help="+/- this many lattice cells around the snapped t*")
+    ap.add_argument("--psc-decompose", dest="psc_decompose",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="cache (c_pair, n_ss, n_sc, n_cc) so rho is trainable")
+    # --- trainable parameters -------------------------------------------
+    ap.add_argument("--freeze-psc", dest="freeze_psc", action="store_true",
+                    help="hold alpha and the clash weights at the published "
+                         "values and train only the 144 pair terms")
+    ap.add_argument("--psc-mode", choices=("rho", "free"), default="rho",
+                    dest="psc_mode",
+                    help="rho: keep Chen & Weng's w_k = alpha*rho^k, i.e. the "
+                         "three log clash weights stay collinear (146 params). "
+                         "free: let them move independently (148), so the "
+                         "published 1:rho:rho^2 penalty ratio becomes testable")
+    ap.add_argument("--rho0", type=float, default=SC_RHO)
+    ap.add_argument("--rho-lr", type=float, default=1e-3, dest="rho_lr")
+    ap.add_argument("--rho-min", type=float, default=0.5, dest="rho_min",
+                    help="strictly > 0: S_PSC is discontinuous at rho = 0")
+    ap.add_argument("--rho-max", type=float, default=9.0, dest="rho_max")
+    # Elements in the (frame_chunk*12, nx, ny, nz) featurisation tensor.
+    # 1e9 float32 = 4 GiB, which leaves room for the receptor grids and the
+    # FFT buffers on a 47 GiB card.
+    ap.add_argument("--feature-budget", type=int, default=1_000_000_000,
+                    dest="feature_budget",
+                    help="max elements in the (chunk*12, nx, ny, nz) IFACE tensor")
     ap.add_argument("--dockq-budget", type=int, default=50_000_000,
                     dest="dockq_budget",
                     help="max elements in the dense DockQ (chunk,N_rec,N_lig) tensor")
@@ -554,6 +952,8 @@ def main() -> None:
     ap.add_argument("--mine-cone", type=int, default=400, dest="mine_cone")
     ap.add_argument("--mine-ntop", type=int, default=1500, dest="mine_ntop")
     args = ap.parse_args()
+    if args.alpha_lr <= 0:
+        args.alpha_lr = 1e-3 * args.alpha0
     if args.alpha_max <= 0:
         args.alpha_max = 10.0 * args.alpha0
     assert args.alpha_max >= args.alpha0, (
@@ -570,9 +970,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     skip_log = open(run_dir / "skipped.jsonl", "w", buffering=1)
 
-    alpha0 = torch.tensor(args.alpha0, device=device, dtype=dtype)
     beta0 = torch.tensor(3.0, device=device, dtype=dtype)
-    iface0 = iface_ij(device=device, dtype=dtype, flat=True)
     charge0 = default_charge_score(device=device, dtype=dtype)
 
     # ---- dataset selection + leakage assertions --------------------------
@@ -597,16 +995,51 @@ def main() -> None:
 
     # ---- fixed TEST pool (built once with default parameters, §5.4) ------
     print("loading FIXED deleaked TEST pool ...", flush=True)
-    test_feats = load_test_feats(args.test_cache, dtype)
+    test_feats = load_test_feats(args.test_cache, dtype,
+                                 require_psc_terms=args.psc_decompose)
     assert set(f.name for f in test_feats) <= test_ids, "TEST cache holds non-test ids"
     print(f"  test complexes: {len(test_feats)}", flush=True)
 
     val_set = set(val_ids)
     pools: dict[str, Feats] = {}
-    alpha, iface = alpha0.clone(), iface0.clone()
+    p0 = Params.initial(args, device, dtype)
+    p = p0.clone()
     optimizer_state = None
     history = []
     n_skipped_total = 0
+
+    def pool_cache_key(rnd: int) -> str | None:
+        if not args.pool_cache:
+            return None
+        Path(args.pool_cache).mkdir(parents=True, exist_ok=True)
+        # The round-0 pool depends on the selection and the BASELINE parameters,
+        # neither of which depends on --seed (select_split has no RNG and the
+        # split files are byte-identical across seeds). So every seed would mine
+        # exactly the same pool. Key the cache on what actually determines it.
+        key = (f"n{args.n_fit}_r{rnd}_sp{args.spacing}_{args.pool}"
+               f"_{args.rot_set}{args.hopf_nside}_ntop{args.mine_ntop}"
+               f"_nr{args.near_rot}_tc{args.trans_cells}"
+               f"_a{args.alpha0}_rho{args.rho0}"
+               f"_hd{int(args.exclude_homodimer)}_mv{args.max_grid_voxels}"
+               f"_bg{int(bool(args.exclude_bad_geometry))}")
+        return key
+
+    def pool_cache_path(rnd: int) -> Path | None:
+        """Where THIS process writes. Sharded miners must not share a file."""
+        key = pool_cache_key(rnd)
+        if key is None:
+            return None
+        suffix = "" if args.mine_shard == "0/1" else \
+            "." + args.mine_shard.replace("/", "of")
+        return Path(args.pool_cache) / f"{key}{suffix}.pt"
+
+    def pool_cache_read(rnd: int) -> list[Path]:
+        """Every file that can contribute, whole-set and sharded alike."""
+        key = pool_cache_key(rnd)
+        if key is None:
+            return []
+        d = Path(args.pool_cache)
+        return sorted(d.glob(f"{key}.pt")) + sorted(d.glob(f"{key}.*of*.pt"))
 
     def absorb(pid: str, nf: Feats, rnd: int) -> None:
         """Install a freshly mined candidate set into the complex's pool."""
@@ -620,8 +1053,7 @@ def main() -> None:
             return
         before_pos = int((pools[pid].dockq >= args.dockq_thr).sum())
         pools[pid].cat(nf.index(neg))
-        pools[pid] = cap_pool(pools[pid], args.pool_cap,
-                              alpha.detach().cpu(), iface.detach().cpu(),
+        pools[pid] = cap_pool(pools[pid], args.pool_cap, p.cpu(),
                               beta0.detach().cpu(), args.dockq_thr)
         after_pos = int((pools[pid].dockq >= args.dockq_thr).sum())
         assert after_pos == before_pos, (
@@ -648,7 +1080,7 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             prot = prot_cpu.to(device, dtype=dtype)
-            nf = mine_complex(prot, alpha, iface, beta0, charge0, args, rnd,
+            nf = mine_complex(prot, p, beta0, charge0, args, rnd,
                               **chunks)
             return nf, meta
         except torch.cuda.OutOfMemoryError as exc:
@@ -666,6 +1098,37 @@ def main() -> None:
         t_round = time.time()
         targets = sel if rnd == 0 else fit_ids
         t_mine = time.time()
+
+        cpath = pool_cache_path(rnd)
+        n_from_cache = 0
+        sources = pool_cache_read(rnd) if rnd == 0 else []
+        if sources:
+            for src in sources:
+                blob = torch.load(src, map_location="cpu", weights_only=True)
+                for d in blob["pools"]:
+                    pools[d["name"]] = Feats(d["name"], d["sc"], d["T"],
+                                             d["elec"], d["rmsd"], d["dockq"],
+                                             d["origin"], d["prov"])
+            # Mine only what the cache lacks. A changed selection (a new
+            # exclusion list, a different N) overlaps heavily with the old one,
+            # and re-mining the shared part costs hours for nothing. Entries the
+            # current selection no longer wants stay in the cache but are simply
+            # not read into fit/val below.
+            n_from_cache = sum(1 for p in targets if p in pools)
+            targets = [p for p in targets if p not in pools]
+            print(f"  round 0: {n_from_cache} pools reused from "
+                  f"{len(sources)} cache file(s), {len(targets)} to mine",
+                  flush=True)
+
+        # Split the remaining work so several GPUs can mine disjoint parts of
+        # one round-0 pool. Each writes its own cache file; a later run picks
+        # them all up. The round-0 pool is seed-independent, so this is pure
+        # wall-clock, not a change of experiment.
+        si, sn = (int(x) for x in args.mine_shard.split("/"))
+        if sn > 1:
+            targets = targets[si::sn]
+            print(f"  round 0: mining shard {si}/{sn} -> {len(targets)} "
+                  f"complexes", flush=True)
         failed: list[tuple[str, dict]] = []
         for ci, pid in enumerate(targets):
             nf, meta = try_mine(pid, rnd)
@@ -715,6 +1178,21 @@ def main() -> None:
                     print(f"    [{pid}] rescued at rot_chunk=1", flush=True)
         n_skipped_total += n_skipped
         mine_seconds = time.time() - t_mine
+        if targets or n_from_cache == 0:
+            if rnd == 0 and cpath is not None:
+                torch.save({"n_skipped": n_skipped,
+                            "pools": [{"name": f.name, "sc": f.sc, "T": f.T,
+                                       "elec": f.elec, "rmsd": f.rmsd,
+                                       "dockq": f.dockq, "origin": f.origin,
+                                       "prov": f.prov}
+                                      for f in pools.values()]}, cpath)
+                print(f"  round 0: cached {len(pools)} pools -> {cpath}",
+                      flush=True)
+
+        if args.mine_only:
+            print(f"  --mine-only: wrote {cpath}; stopping before training",
+                  flush=True)
+            return
 
         fit_pools = [pools[p] for p in fit_ids if p in pools]
         val_pools = [pools[p] for p in val_ids if p in pools]
@@ -724,7 +1202,7 @@ def main() -> None:
 
         if rnd == 0:
             # Baseline (default ZDOCK parameters) on the same fixed pools.
-            b_sr, b_sd, b_t1 = aggregate(test_feats, alpha0, iface0, beta0,
+            b_sr, b_sd, b_t1 = aggregate(test_feats, p0, beta0,
                                          device, args.rmsd_thr, args.dockq_thr)
             print("=" * 62)
             print("BASELINE (default ZDOCK params) on fixed deleaked TEST")
@@ -747,25 +1225,38 @@ def main() -> None:
                       args.epoch_passes * -(-len(fit_pools) // args.batch_size))
         val_every = max(50, n_steps // 100)
         t_train = time.time()
-        alpha, iface, stats, traj, optimizer_state = train_params(
-            fit_pools, val_pools, alpha, iface, alpha0, iface0, beta0, args,
+        p, stats, traj, optimizer_state = train_params(
+            fit_pools, val_pools, p, p0, beta0, args,
             device, dtype, gen, n_steps, val_every, optimizer_state)
         train_seconds = time.time() - t_train
 
         with open(run_dir / f"round{rnd}_trajectory.csv", "w") as fh:
-            fh.write("step,fit_loss,val_loss,grad_norm,accepted,alpha,d_iface\n")
+            fh.write("step,fit_loss,val_loss,grad_norm,accepted,"
+                     "alpha,rho,d_iface_norm\n")
             for r in traj:
                 fh.write(f"{r['step']},{r['fit_loss']:.6f},{r['val_loss']:.6f},"
                          f"{r['grad_norm']:.6f},{r['accepted']},{r['alpha']:.6f},"
-                         f"{r['d_iface']:.6f}\n")
+                         f"{r['rho']:.6f},{r['d_iface_norm']:.6f}\n")
 
-        sr, sd, t1 = aggregate(test_feats, alpha, iface, beta0, device,
+        sr, sd, t1 = aggregate(test_feats, p, beta0, device,
                                args.rmsd_thr, args.dockq_thr)
-        srt, sdt, t1t = aggregate(fit_pools, alpha, iface, beta0, device,
+        srt, sdt, t1t = aggregate(fit_pools, p, beta0, device,
                                   args.rmsd_thr, args.dockq_thr)
-        comp = [p.counts(args.dockq_thr) for p in fit_pools]
+        n_usable_loss = sum(
+            1 for f in fit_pools
+            if int((loss_view(f, args.loss_prov).dockq >= args.dockq_thr).sum()) > 0)
+        print(f"  complexes contributing a gradient under --loss-prov "
+              f"{args.loss_prov}: {n_usable_loss}/{len(fit_pools)}", flush=True)
+        comp = [f.counts(args.dockq_thr) for f in fit_pools]
+        pool_keys = ("n", "n_pos", "n_rand_neg", "n_hard_neg",
+                     "n_pos_from_search", "n_pos_enumerated")
         pool_stats = {k: sum(c[k] for c in comp) / max(1, len(comp))
-                      for k in ("n", "n_pos", "n_rand_neg", "n_hard_neg")}
+                      for k in pool_keys}
+        # A complex with no positive at all has no reachable near-native pose
+        # under this rotation grid and translation lattice: no amount of
+        # parameter fitting can make the search return one. Count it.
+        pool_stats["n_complexes_without_positive"] = sum(
+            1 for c in comp if c["n_pos"] == 0)
         rejected = [r for r in traj if r["step"] > 0 and not r["accepted"]]
         accepted = [r for r in traj if r["step"] > 0 and r["accepted"]]
         peak_mem = (torch.cuda.max_memory_allocated() / 2**30
@@ -775,7 +1266,9 @@ def main() -> None:
             "round": rnd, "seed": args.seed, "n_fit": len(fit_pools),
             "n_val": len(val_pools), "n_test": len(test_feats),
             "n_skipped_this_round": n_skipped, "n_skipped_total": n_skipped_total,
-            "alpha": float(alpha), "d_iface_norm": float((iface - iface0).norm()),
+            **p.summary(p0),
+            "alpha_at_bound": stats["alpha_at_bound"],
+            "rho_at_bound": stats["rho_at_bound"],
             "val_loss": stats["best_val_loss"], "steps_run": stats["steps_run"],
             "steps_budget": n_steps, "val_every": val_every,
             "mean_grad_norm": stats["mean_grad_norm"],
@@ -799,19 +1292,30 @@ def main() -> None:
         }
         (run_dir / f"round{rnd}_metrics.json").write_text(json.dumps(rec, indent=1))
         torch.save({"round": rnd, "seed": args.seed, "n_fit": len(fit_pools),
-                    "alpha": alpha.cpu(), "iface": iface.cpu(),
+                    **p.state_dict(),
                     "val_loss": stats["best_val_loss"], "config": vars(args)},
                    run_dir / f"round{rnd}_ckpt.pt")
 
         tag = "round 0 (no mining)" if rnd == 0 else f"round {rnd} (mined)"
         print("=" * 62)
         print(f"{tag} | N_fit={len(fit_pools)} | mean pool={pool_stats['n']:.0f} "
-              f"(pos {pool_stats['n_pos']:.0f} / rand-neg "
-              f"{pool_stats['n_rand_neg']:.0f} / hard-neg {pool_stats['n_hard_neg']:.0f})")
-        print(f"  alpha={float(alpha):.4f} ||dIface||="
-              f"{float((iface-iface0).norm()):.3f} val_loss={stats['best_val_loss']:.4f} "
+              f"(pos {pool_stats['n_pos']:.0f} "
+              f"[search {pool_stats['n_pos_from_search']:.0f} / "
+              f"enumerated {pool_stats['n_pos_enumerated']:.0f}] / neg "
+              f"{pool_stats['n_rand_neg']:.0f})")
+        if pool_stats["n_complexes_without_positive"]:
+            print(f"  {pool_stats['n_complexes_without_positive']} of "
+                  f"{len(fit_pools)} fit complexes have NO reachable positive "
+                  f"- that is a hard ceiling on what training can do")
+        print(f"  alpha={float(p.alpha):.4f} rho={float(p.rho):.4f} ||dIface||="
+              f"{float((p.iface-p0.iface).norm()):.3f} "
+              f"val_loss={stats['best_val_loss']:.4f} "
               f"steps={stats['steps_run']}/{n_steps} skipped={n_skipped} "
               f"peakGPU={peak_mem:.1f} GiB")
+        if stats["alpha_at_bound"] or stats["rho_at_bound"]:
+            print(f"  WARNING: a parameter sits on its box constraint "
+                  f"(alpha {stats['alpha_at_bound']}, rho {stats['rho_at_bound']}) "
+                  f"- the reported optimum is a clamp artifact", flush=True)
         print("=" * 62)
         print(_fmt("TEST(deleaked)", sr, sd, t1))
         print(_fmt("FIT", srt, sdt, t1t))

@@ -34,7 +34,7 @@ def _3d(arr) -> np.ndarray:
     return a
 
 
-def test_orient_matches_julia(load_ref, device, dtype):
+def test_orient_matches_julia_legacy_weighted_centroid(load_ref, device, dtype):
     ref = load_ref("phase5", "scores")
 
     # Ligand (frame 0) post-decenter, BEFORE orient.
@@ -58,7 +58,10 @@ def test_orient_matches_julia(load_ref, device, dtype):
     # So mass[atom] = iface_ij[atomtype_id[atom], 1] (1-based).
     mass = iface_mat[lig_atomtype - 1, 0]
 
-    got = orient(lig_frame0, mass=mass)
+    # The Julia reference decentered by the SIGNED-weight centroid; production
+    # no longer does (see `orient`). This test pins the port's fidelity to the
+    # reference, not the correctness of the current default.
+    got = orient(lig_frame0, mass=mass, decenter_weighted=True)
     expected = torch.as_tensor(_2d(ref["lig_xyz_for_grid"]), device=device, dtype=dtype)
 
     # Sign ambiguity means per-axis sign may differ from Julia even though
@@ -85,3 +88,37 @@ def test_orient_matches_julia(load_ref, device, dtype):
     # Accept up to 1e-3 Å tolerance (float64 should give ~1e-6; float32 ~1e-3)
     tol = 1e-4 if dtype == torch.float64 else 1e-2
     torch.testing.assert_close(got, expected, atol=tol, rtol=tol)
+
+
+def test_orient_centroid_is_at_the_origin(device, dtype):
+    """The production default must put the GEOMETRIC centroid at the origin.
+
+    `orient`'s caller passes a column of the IFACE pair table as "mass", and 6
+    of its 12 entries are negative, so a signed-weight centroid can diverge:
+    measured over 300 cached PINDER complexes it exceeded 10 A for 121 of them
+    and reached 22,708 A for one. Since the FFT search rotates this frame about
+    the ORIGIN, that lever arm turns the rotation grid's discretisation error
+    into an uncorrectable translation error -- 6 of the 8 complexes with no
+    reachable near-native pose at all were recovered by this fix.
+    """
+    torch.manual_seed(0)
+    n = 200
+    xyz = torch.randn(n, 3, device=device, dtype=dtype) * 12.0 + 60.0
+    # signed weights whose sum is small relative to their magnitudes -- the
+    # pathological case the real IFACE column produces
+    mass = torch.randn(n, device=device, dtype=dtype)
+    mass = mass - mass.mean() + 0.02
+
+    out = orient(xyz, mass=mass)
+    assert float(out.mean(dim=0).norm()) < 1e-3, out.mean(dim=0)
+
+    legacy = orient(xyz, mass=mass, decenter_weighted=True)
+    assert float(legacy.mean(dim=0).norm()) > 10.0, (
+        "the legacy path should reproduce the divergent centroid; got "
+        f"{float(legacy.mean(dim=0).norm())}")
+
+    # the default path is a rigid transform of the input: distances preserved
+    def _d(a):
+        a = a.double()
+        return torch.cdist(a, a, compute_mode="donot_use_mm_for_euclid_dist")
+    assert torch.allclose(_d(out), _d(xyz), atol=1e-3, rtol=1e-5)

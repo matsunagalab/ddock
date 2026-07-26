@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 
-from zdock.geom import generate_grid
+from zdock.geom import grid_shape
 from zdock.prep_cache import load_prepared
 from zdock.score import SC_REFERENCE_SPACING
 
@@ -54,10 +54,11 @@ def main() -> None:
         prot = load_prepared(args.prep_cache, pid)
         if prot is None:
             continue
-        _, _, x, y, z = generate_grid(prot.rec_xyz, prot.lig_ref,
-                                      spacing=args.spacing, device=dev,
-                                      dtype=torch.float32)
-        out[pid] = int(x.numel()) * int(y.numel()) * int(z.numel())
+        # `grid_shape`, not `generate_grid`: the tail of this corpus reaches
+        # ~2e11 voxels at 1.2 A, and allocating those two zero grids just to
+        # read their shape gets the process SIGKILLed (measured).
+        nx, ny, nz = grid_shape(prot.rec_xyz, prot.lig_ref, spacing=args.spacing)
+        out[pid] = nx * ny * nz
 
     Path(args.out).write_text(json.dumps(out))
     vals = sorted(out.values())

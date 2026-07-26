@@ -48,7 +48,9 @@ def _worker(args) -> None:
     mine = [(r, i) for r, i in enumerate(ids) if r % args.n_workers == args.worker_id]
 
     out = open(args.manifest, "a", buffering=1)
-    from pinder.core import PinderSystem
+    complex_dir = Path(args.complex_dir) if args.complex_dir else None
+    if complex_dir is None:
+        from pinder.core import PinderSystem
 
     for rank, pid in mine:
         if has_prepared(args.cache_dir, pid) and not args.force:
@@ -56,10 +58,25 @@ def _worker(args) -> None:
         t0 = time.time()
         rec = {"rank": rank, "id": pid, "worker": args.worker_id}
         try:
-            ps = PinderSystem(pid, pdb_engine="biotite")
-            prot = prepare_protein_from_pdb(
-                pid, str(ps.holo_receptor.filepath), str(ps.holo_ligand.filepath),
-                device=device, dtype=dtype)
+            if complex_dir is not None:
+                # Both chains from the COMPLEX file, which is the only source
+                # that carries them in a common frame. PINDER's per-split
+                # monomer files are docking inputs: for the test split
+                # (`test_set_pdbs/`) each is centred on the origin, so pairing
+                # them superimposes the two proteins -- that is how every
+                # TEST-set number in this repository up to 2026-07-26 came to
+                # be computed against a sterically impossible reference.
+                cpath = complex_dir / f"{pid}.pdb"
+                prot = prepare_protein_from_pdb(
+                    pid, str(cpath), str(cpath),
+                    rec_chain="R", lig_chain="L",
+                    device=device, dtype=dtype)
+            else:
+                ps = PinderSystem(pid, pdb_engine="biotite")
+                prot = prepare_protein_from_pdb(
+                    pid, str(ps.holo_receptor.filepath),
+                    str(ps.holo_ligand.filepath),
+                    device=device, dtype=dtype)
             rec.update(status="ok", n_rec=prot.n_rec, n_lig=prot.n_lig,
                        reason="", stage="")
             save_prepared(args.cache_dir, prot)
@@ -83,6 +100,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ids-file", default="data/scaling/master_ids.txt", dest="ids_file")
     ap.add_argument("--cache-dir", default="data/scaling/prep_cache", dest="cache_dir")
+    ap.add_argument("--complex-dir", default="", dest="complex_dir",
+                    help="read BOTH chains (R and L) from "
+                         "{complex_dir}/{system_id}.pdb instead of asking "
+                         "PinderSystem for per-split monomer files")
     ap.add_argument("--manifest-dir", default="data/scaling/prep_manifest",
                     dest="manifest_dir")
     # Explicit: deriving this from --manifest-dir's parent once made a TEST-set
@@ -127,6 +148,8 @@ def main() -> None:
                "--worker-id", str(w), "--n-workers", str(n_workers),
                "--manifest", str(mdir / f"worker{w:02d}.jsonl"),
                "--device", "cpu" if cpu_only else "cuda"]
+        if args.complex_dir:
+            cmd += ["--complex-dir", args.complex_dir]
         if args.force:
             cmd.append("--force")
         log = open(mdir / f"worker{w:02d}.log", "a")

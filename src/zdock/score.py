@@ -331,11 +331,70 @@ def sc_encode(shell: torch.Tensor, core: torch.Tensor, *, rho=SC_RHO):
     Note PSC, unlike GSC, has **no** "solvent accessible surface layer": "any
     grid point that does not correspond to an atom is in the open space".
     """
-    shell_b = shell > 0
-    core_b = (core > 0) & ~shell_b
+    shell_b, core_b = sc_layers(shell, core)
     rho_t = rho if torch.is_tensor(rho) else torch.as_tensor(
         rho, dtype=shell.dtype, device=shell.device)
     return shell_b.to(shell.dtype) * rho_t + core_b.to(shell.dtype) * rho_t.pow(2)
+
+
+def sc_layers(shell: torch.Tensor, core: torch.Tensor):
+    """The surface / core occupancy indicators of Eq. (3), with the paper's
+    precedence (surface first, core = residual). Returned separately from
+    :func:`sc_encode` so the clash channel can be decomposed by overlap class
+    without re-deriving it from the encoded values — see
+    :func:`psc_clash_counts`.
+    """
+    shell_b = shell > 0
+    core_b = (core > 0) & ~shell_b
+    return shell_b, core_b
+
+
+def psc_clash_counts(rec_surf, rec_core, lig_surf, lig_core):
+    """Split ``sum(Im[R] * Im[L])`` into its three rho-independent counts.
+
+    ``Im`` takes only the values ``{0, rho, rho**2}``, so
+
+        sum(Im[R]*Im[L]) = n_ss * rho**2 + n_sc * rho**3 + n_cc * rho**4
+
+    with ``n_ss`` the number of surface-surface cell overlaps, ``n_sc`` the
+    surface-core ones (either way round) and ``n_cc`` the core-core ones. The
+    counts do not depend on rho, so caching them alongside the favourable pair
+    count makes ``S_PSC`` an exact quartic in rho that a trainer can
+    differentiate from cached features — see :func:`psc_score_from_terms`.
+
+    Inputs are ``(..., nx, ny, nz)`` boolean-or-0/1 grids; the receptor grids
+    broadcast against a leading frame dimension on the ligand side.
+    """
+    rs, rc = rec_surf.to(lig_surf.dtype), rec_core.to(lig_surf.dtype)
+    ls, lc = lig_surf.to(lig_surf.dtype), lig_core.to(lig_surf.dtype)
+    n_ss = rs * ls
+    n_sc = rs * lc + rc * ls
+    n_cc = rc * lc
+    return n_ss, n_sc, n_cc
+
+
+def psc_score_from_terms(terms: torch.Tensor, rho, *,
+                         clash_volume_factor: float = 1.0) -> torch.Tensor:
+    """Reconstruct ``S_PSC`` from the cached ``(F, 4)`` decomposition.
+
+    ``terms[..., 0]`` is the favourable receptor-ligand atom-pair count
+    ``sum(Re[R]*Re[L])`` and ``terms[..., 1:4]`` are ``(n_ss, n_sc, n_cc)``.
+
+        S_PSC = c_pair - k * (n_ss rho^2 + n_sc rho^3 + n_cc rho^4)
+
+    Note ``k`` (:func:`sc_cell_volume_factor`) is applied to the **clash
+    channel only**. The clash sum counts overlapping grid *cells* and so grows
+    like ``1/(dx dy dz)``, whereas ``c_pair`` is a receptor-ligand *atom-pair*
+    count and is spacing-invariant by construction; one scalar on the whole of
+    ``S_PSC`` cannot correct both. ``k`` is exactly 1 at the paper's 1.2 A, so
+    this only matters when comparing across spacings.
+    """
+    rho_t = rho if torch.is_tensor(rho) else torch.as_tensor(
+        rho, dtype=terms.dtype, device=terms.device)
+    clash = (terms[..., 1] * rho_t.pow(2)
+             + terms[..., 2] * rho_t.pow(3)
+             + terms[..., 3] * rho_t.pow(4))
+    return terms[..., 0] - clash_volume_factor * clash
 
 
 def sc_open_boundary_to_surface(re: torch.Tensor, im: torch.Tensor):
@@ -379,6 +438,7 @@ def psc_grids(
     receptor: bool,
     rho=SC_RHO,
     psc_d: float = PSC_D,
+    return_layers: bool = False,
 ):
     """``(Re, Im)`` of Chen & Weng 2003 Eq. (3) for one molecule.
 
@@ -403,6 +463,7 @@ def psc_grids(
     surf_ind = _sc_indicator(shape, xyz[surf], radius[surf], x_grid, y_grid, z_grid)
     core_ind = _sc_indicator(shape, xyz[core], radius[core], x_grid, y_grid, z_grid)
     im = sc_encode(surf_ind, core_ind, rho=rho)
+    layers = sc_layers(surf_ind, core_ind) if return_layers else None
 
     if receptor:
         counts = _sc_indicator(shape, xyz, radius + psc_d, x_grid, y_grid, z_grid)
@@ -413,6 +474,8 @@ def psc_grids(
         spread_nearest_add(
             re, xyz, torch.ones(xyz.shape[0], device=xyz.device, dtype=x_grid.dtype),
             x_grid, y_grid, z_grid)
+    if return_layers:
+        return re, im, layers[0], layers[1]
     return re, im
 
 
@@ -453,6 +516,9 @@ def _score_ligand_chunk(
     sc_rho=SC_RHO,
     psc_d: float = PSC_D,
     return_components: bool = False,
+    psc_decompose: bool = False,
+    rec_sc_surf: torch.Tensor | None = None,
+    rec_sc_core: torch.Tensor | None = None,
 ):
     """Per-frame total scores for a single ligand frame-chunk, re-using
     precomputed receptor grids.
@@ -522,7 +588,11 @@ def _score_ligand_chunk(
     core_ind = (sc_union(lxyz_flat[core_idx], frame_idx_per_atom[core_idx],
                          lig_radius_flat[core_idx], (F, nx, ny, nz))
                 if core_idx.numel() > 0 else zeros_g)
-    lig_sc_imag = sc_encode(surf_ind, core_ind, rho=sc_rho)
+    lig_surf_b, lig_core_b = sc_layers(surf_ind, core_ind)
+    rho_t = sc_rho if torch.is_tensor(sc_rho) else torch.as_tensor(
+        sc_rho, dtype=dtype, device=device)
+    lig_sc_imag = (lig_surf_b.to(dtype) * rho_t
+                   + lig_core_b.to(dtype) * rho_t.pow(2))
     # Re[L_PSC]: one count at each ligand atom's nearest grid point (Eq. (3)).
     lig_sc_real = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
     _grouped_spread_nearest_add(
@@ -530,14 +600,28 @@ def _score_ligand_chunk(
         torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
         x_grid, y_grid, z_grid)
 
-    multi_real = (rec_sc_real.unsqueeze(0) * lig_sc_real
-                  - rec_sc_imag.unsqueeze(0) * lig_sc_imag)
+    vol_k = sc_cell_volume_factor(x_grid, y_grid, z_grid, sc_reference_spacing)
+    c_pair = (rec_sc_real.unsqueeze(0) * lig_sc_real).reshape(F, -1).sum(-1)
+    clash = (rec_sc_imag.unsqueeze(0) * lig_sc_imag).reshape(F, -1).sum(-1)
     # Chen & Weng 2003 Eq. (4): S_PSC = Re[R_PSC . L_PSC]
     #   = Re[R]Re[L] (favourable atom-pair count) - Im[R]Im[L] (clash penalty),
     # "with a higher score indicating better shape complementarity".
-    score_sc = multi_real.reshape(F, -1).sum(-1)
-    score_sc = score_sc * sc_cell_volume_factor(x_grid, y_grid, z_grid,
-                                                sc_reference_spacing)
+    score_sc = (c_pair - clash) * vol_k
+
+    psc_terms = None
+    if psc_decompose:
+        if rec_sc_surf is None or rec_sc_core is None:
+            raise ValueError("psc_decompose=True needs rec_sc_surf/rec_sc_core "
+                             "(psc_grids(..., return_layers=True))")
+        n_ss, n_sc, n_cc = psc_clash_counts(
+            rec_sc_surf.unsqueeze(0), rec_sc_core.unsqueeze(0),
+            lig_surf_b, lig_core_b)
+        psc_terms = torch.stack([
+            c_pair,
+            n_ss.reshape(F, -1).sum(-1),
+            n_sc.reshape(F, -1).sum(-1),
+            n_cc.reshape(F, -1).sum(-1),
+        ], dim=-1)                                    # (F, 4)
 
     L_count = torch.zeros((F * 12, nx, ny, nz), device=device, dtype=dtype)
     group_f12 = frame_idx_per_atom * 12 + lig_group_iface_flat
@@ -594,7 +678,7 @@ def _score_ligand_chunk(
         score_elec = (charge_score.pow(2).unsqueeze(0) * c).sum(-1)
 
     if return_components:
-        return score_sc, T, score_elec
+        return (psc_terms if psc_decompose else score_sc), T, score_elec
     return alpha * score_sc + score_iface + beta * score_elec
 
 
@@ -626,12 +710,20 @@ def docking_score_elec(
     sc_rho=SC_RHO,
     psc_d: float = PSC_D,
     return_components: bool = False,
+    psc_decompose: bool = False,
 ):
     """Return a (F,) tensor of docking scores.
 
     If ``return_components`` is True, return ``(score_sc, T, score_elec)``
     where ``T`` is ``(F, 12, 12)`` — the per-pose geometric features that
-    the score is linear in for ``(alpha, iface)``. See
+    the score is linear in for ``(alpha, iface)``.
+
+    With ``psc_decompose=True`` the first element becomes ``(F, 4)`` instead:
+    ``(c_pair, n_ss, n_sc, n_cc)``, from which
+    ``psc_score_from_terms(terms, rho)`` reconstructs ``score_sc`` exactly for
+    **any** rho. Caching that instead of the collapsed scalar is what makes rho
+    trainable from cached features (``S_PSC`` is an exact quartic in rho;
+    ``T`` and ``score_elec`` do not depend on rho at all). See
     ``_score_ligand_chunk`` for the exact definition. ``score_elec`` is
     evaluated with the supplied ``charge_score`` (so freeze it at the
     ZDOCK default to treat ELEC as a fixed per-pose feature).
@@ -699,9 +791,15 @@ def docking_score_elec(
 
     # Precompute receptor SC slabs (real + imag parts of SC filter).
     rec_surf = rec_sasa > surface_threshold
-    rec_sc_real, rec_sc_imag = psc_grids(
-        rec_xyz, rec_radius, rec_surf, x_grid, y_grid, z_grid, receptor=True,
-        rho=sc_rho, psc_d=psc_d)
+    if psc_decompose:
+        rec_sc_real, rec_sc_imag, rec_sc_surf, rec_sc_core = psc_grids(
+            rec_xyz, rec_radius, rec_surf, x_grid, y_grid, z_grid, receptor=True,
+            rho=sc_rho, psc_d=psc_d, return_layers=True)
+    else:
+        rec_sc_real, rec_sc_imag = psc_grids(
+            rec_xyz, rec_radius, rec_surf, x_grid, y_grid, z_grid, receptor=True,
+            rho=sc_rho, psc_d=psc_d)
+        rec_sc_surf = rec_sc_core = None
 
     # Precompute receptor IFACE contribution slabs H[j] for j in 1..12.
     # H[j] = Σ_atoms_of_type_j (within rcut=6 of cell) indicator. Weight 1.
@@ -779,6 +877,8 @@ def docking_score_elec(
         surface_threshold=surface_threshold, elec_mode=elec_mode,
         scatter_mode=scatter_mode, sc_reference_spacing=sc_reference_spacing,
         sc_rho=sc_rho, psc_d=psc_d,
+        psc_decompose=psc_decompose,
+        rec_sc_surf=rec_sc_surf, rec_sc_core=rec_sc_core,
     )
     use_chunks = (
         frame_chunk_size is not None
