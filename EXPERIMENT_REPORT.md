@@ -4468,24 +4468,28 @@ seed 2を止めるなら「事前3-seed完遂」ではなく探索的go/no-go判
 | round 0 | 0.077 | 0.176 | 0.229 |
 | round 1（学習後パラメータ） | 0.085 | 0.210 | 0.655 |
 
-**閾値 0.23 に対して中央値 0.085 である。** 沈黙している複合体は閾値の
-すぐ下にいるのではなく、**探索の到達範囲の外**にいる。
+**閾値 0.23 に対して中央値 0.085 である。**
+
+> **訂正（2026-07-27）。** 当初ここに「沈黙している複合体は**探索の到達範囲の
+> 外**にいる」と書いたが、これは誤りである（codex 指摘）。測っているのは
+> **top-1500 に入った pose の最良 DockQ** であって、到達可能性ではない。
+> **nside=3 の reachable ceiling は 99.0%**（§5.10）であり、これらの複合体でも
+> 近native pose は格子上に存在する。示されたのは「現在のスコア関数では
+> 上位1500に入らない」——**ranking truncation** であって reach の欠如ではない。
 
 **判断: 契約B（on-policy positive refresh）を却下する。**
 実効 N は 148 → 154（+4%）にしかならず、この増分で success@1 の変化を
 検出できる見込みはない（実験1の実測で、+3.39 pp の効果ですら 9勝1敗 $p=0.0215$
 でようやく有意だった）。self-training の drift リスクを負う価値がない。
 
-**したがって72件の勾配ゼロは「訓練契約の問題」ではなく「探索の問題」である。**
-これは §5.14.21 の negative 側の診断と同じ結論を指す——
-上端が動かないのも、positive が見つからないのも、**探索が返す候補集合が
-変わらない**ことに帰着する。次に試すべきは訓練側の工夫ではなく、
-探索そのものを変える介入（`ntop` の増加、回転グリッドの細密化）である。
+**72件の勾配ゼロは訓練契約の問題ではなく、候補取得（ranking truncation）の
+問題である。** これは §5.14.21 の negative 側の診断と同じ方向を指す——
+上端が動かないのも positive が見つからないのも、**探索が返す候補集合が
+変わらない**ことに帰着する。
 
-ただし §5.14.21 で見たとおり `ntop` 増加は「同じ分布からの標本追加」でもあるため、
-まず **ranking truncation か reach の欠如か**を切り分ける必要がある
-（codex 提案の項目3）。上表で round-1 の最大 DockQ が 0.655 に達した複合体が
-存在することは、少なくとも一部は top-1500 の切り捨てで失われている可能性を示す。
+ただし `ntop` の拡大は**配備時の top-1 を直接は変えない**（深い順位から
+positive を取得して学習に参加させる介入である）ため、本命ではなく
+**安価な coverage 診断**として位置づける。
 
 ##### パラメータは動いたのか、そして round 0 は収束していたのか
 
@@ -4517,40 +4521,137 @@ round 0 は plateau に達したのではなく、**1500 step の予算を使い
 2.7240 → 2.7191 と下げたのに、**TEST success@1 は 77.54% → 77.12% と下がった**。
 
 **これは round 1 の null に対する別の説明を示唆する。** 「採掘が情報を足さない」
-のとは独立に、**round 0 の 1500 step 地点が汎化の観点でほぼ最適で、そこから先は
-validation が下がっても TEST が改善しない領域**に入っている可能性がある。
-validation が TEST と交換可能でないこと（§5.14.11、探索 recall 65.8% vs 94.8%）
-と整合する。
+のとは独立に、**round 0 の 1500 step 地点から先は validation が下がっても
+TEST が改善しない領域**に入っている可能性がある。
 
-**この2つの説明は現データでは分離できていない。** 分離には採掘を含まない
-step budget 対照が要る（下記候補1）。
+> **訂正（2026-07-27）。** これを口頭で「過学習の兆候」と述べたが、**誤りである**
+> （codex 指摘）。通常の過学習は train が改善し held-out validation が悪化する
+> ことを要するが、ここでは **validation も改善している**。しかも val loss の
+> 低下は 0.18%、TEST の低下は 236件中 **1件**で $p=1$ である。
+> より自然な候補は次のとおりで、いずれも過学習ではない:
+>
+> - 平滑な損失と離散指標 success@1 の**不一致**（objective mismatch）
+> - checkpoint noise（1複合体の反転は測定限界の内側）
+> - validation と TEST の**分布シフト**
+> - validation そのものへの**反復選択**
+>
+> 分離には TEST を使わず、複数の held-out fit fold で checkpoint 軌跡を測り、
+> さらに探索 recall の高群・低群へ層別する。全 held-out で後半悪化なら過学習、
+> 高recall群だけ TEST 同様に悪化なら分布シフト、損失だけ改善して top-1 が
+> 不変なら objective mismatch である。
 
-##### 次の実験候補（優先順、2026-07-27 時点）
+**なお §5.14.11 の「validation recall 65.8% vs TEST 94.8%」を自然な分布差と
+決めつけてはならない。** 同じ prep cache・同じ除外リスト・同じ探索条件で
+生成されているかをまず監査すべきである（codex 指摘）。原因未特定のまま
+「交換可能でない」と書いたのは踏み込みすぎであった。
 
-1. **step budget 対照（新規、最優先）。** round 0 を 1500 ではなく 3000 step で
-   回し、early stoppingで短縮せず、1500/3000の固定step checkpointを同じ固定validation
-   規則で記録する。(a) val lossがどこでplateauするか、(b) TEST success@1が1500 step
-   以降も伸びるか下がるかを測る。round 1のnullが「採掘の無効」なのか
-   「1500 step以降に伸びしろがない」のかを分離する。
-   **採掘を一切含まないので実験4の解釈に直接効き、pool cache を再利用するので
-   追加の採掘コストはゼロ。**
-2. **seed 0 の mine/continue を全249件 end-to-end で比較**（codex 提案の項目1）。
-   固定プール上の再ランキングではなく、事前規定した primary endpoint。
-3. **ranking truncation か reach の欠如か**（codex 提案の項目3）。
-   救済されなかった66件について `ntop` を段階的に増やし、閾値を超える複合体が
-   増えるかを測る。増えれば top-1500 の切り捨てが原因、増えなければ
-   回転グリッドの到達範囲が原因。
-4. N scaling（各 N で search-positive を持つ実効 N も併記）。
+**round 1 の null に対する2つの説明は現データでは分離できていない。**
+
+##### 次の実験候補（優先順、2026-07-27 改訂）
+
+codex の効果量見積もり（下記「確率的な投資判断」）を受けて順序を改めた。
+**当初 step budget 対照を最優先に置いたが、N scaling を本命に繰り上げる。**
+理由は、active complex が 148 しかない以上、現在の制約は**モデル容量ではなく
+推定分散**である可能性が高いこと（full 144 が additive 23 を 3.4 pp 上回る以上、
+容量は現に効いている）。
+
+1. **N scaling（本命）。** $N = 220 \to 500 \to 1000$。
+   期待 $+1$〜$3$ pp、$1$ pp 以上の確率 50〜70%。
+   **各 $N$ で search-positive を持つ実効 $N$ も併記**し、名目 $N$ だけを
+   横軸にしない（148/220 = 67% が実効値である）。
+2. **未使用または unbound cohort での end-to-end 確認。**
+   反復利用済み PINDER-S TEST でさらに 0.5 pp を探すより、外部妥当性の確認の
+   ほうが研究上の価値が高い。
+3. **step budget 対照。** round 0 を 1500 と 3000 step で、early stopping を
+   無効化し**固定 step checkpoint** を同一 validation 規則で記録する。
+   round 1 の null が「採掘の無効」なのか「1500 step 以降に伸びしろがない」のかを
+   分離する。採掘を含まず pool cache を再利用するので追加コストはゼロ。
+4. **`ntop` / `nside` の小規模 coverage 診断。** 救済されなかった66件について
+   `ntop` を段階的に増やし、閾値を超える複合体が増えるかを測る。
+   **これは配備時の top-1 を直接変える介入ではない**（深い順位から positive を
+   取得して学習に参加させるだけ）ので、安価な診断として位置づける。
+5. **refresh 型 mining の seed 0 pilot。** 総 pool size・positive 数・
+   random-negative 数を固定し、**hard-negative 部分だけ**を置換する。
+   old-hard の一部は reservoir として残し、全置換による round 間 cycling を監視する。
+   **単純な cap 縮小は pool size・忘却・class 比を同時に変えるので対照にならない。**
+   validation で明瞭な改善がなければ終了。
 
 **却下・後回し**（根拠つき）:
 
 - **契約B（on-policy positive refresh）**: 救済監査で 72件中6件（8.3%）しか
   救えないと判明。実効 N は 148 → 154 にしかならない。
-- `ntop` 増加を単独で: §5.14.21 のとおり「同じ分布からの標本追加」になりうるため、
-  項目3 の切り分けを先に行う。
+- **現行 accumulate 型の追加ラウンド**: $1$ pp 以上改善する確率 <5%。
 - PSC 同時学習: §5.14.8 で IFACE-only より悪く、探索と ranking を再び交絡する。
-- round 2、pool cap 増加、loss variant、nside=4 の全面学習:
-  上の診断が必要性を示すまで行わない。
+- loss 改良（top-k / CVaR 等）: 期待 $0$〜$1$ pp、確率 10〜25%。
+  候補分布自体が変わらなければ効果は限定的。
+- nside=4 の**全面学習**: 期待 $0$〜$2$ pp、確率 25〜40%。項目4の診断が
+  必要性を示すまで行わない。
+- round 2、pool cap 増加。
+
+##### 確率的な投資判断と研究の停止条件（2026-07-27、結果レビュー）
+
+以下は新しい測定値ではなく、§5.14.21までの結果に基づく**主観的な事前見積もり**である。
+統計的confidence intervalではない。
+
+**mining loop。** 現行のaccumulate型をもう1 round回してsuccess@1が1 pp以上改善する
+確率は5%未満と見る。refresh型には、current searchのtop-1500に残る約69%を維持しつつ、
+古くなった約31%を新しい候補へ同数置換するという、現行実験が試していない介入が残る。
+したがってrefresh型が1 pp以上改善する確率はおよそ20〜30%、2 pp以上は10%未満と見る。
+これは小規模pilotを正当化するが、3 seedの本実験へ直行する強さではない。
+
+refreshを試す場合は総pool size、positive、random-negative数を両armで固定し、
+`stale negative -> current-score上位negative`の置換だけを変える。単なるcap縮小では
+pool size、class比、忘却が同時に変わる。old-hardの一部をreservoirとして残し、
+全置換によるround間cyclingも診断する。比較対象は同じstep budgetの固定pool継続である。
+
+**重要な限定。** `loss_margin_hard_negatives`はmax一個だけでなく帯域内全negativeの
+平均hingeである。したがって3/148は上端更新の希少性を示すが、refreshの効果を
+論理的に否定しない。一方、mine armは新規negativeをすでに帯域の23.2%まで追加して
+固定pool順位を改善しなかったため、refreshが大幅改善するとの期待も支持しない。
+
+**continueの解釈。** val lossの2.7240から2.7191への低下は0.18%であり、
+TEST success@1の低下は236件中1件だけ（$p=1$）である。これは通常の意味のoverfitを
+示す証拠ではない。train loss低下とval loss上昇が観測されておらず、
+smoothな学習lossと離散top-1の不一致、checkpoint noise、validation/TEST shiftの
+いずれでも説明できる。特にrecall 65.8%対94.8%の原因を未同定のまま
+「分布差」と確定してはならない。
+
+分離には、まず同じcache schema・探索条件・除外規則でsplit別recall差を再監査する。
+次にTESTを使わず、fit側interface clusterから複数のheld-out foldを作り、
+各checkpointについてtrain loss、held-out loss、AUC、success@1の軌跡を測る。
+さらにheld-outをsearch recallの低群・高群に層別する。全held-outでstep増加により
+悪化すればoverfit、高recall群だけTESTと同じ悪化を示せばshift、lossだけ改善して
+top-1が動かなければobjective/endpoint mismatchが主因である。最終確認は未使用cohortで
+一度だけ行う。
+
+**期待効果の順位（1 pp以上改善する主観確率）。**
+
+1. `N=500/1000` scaling: 50〜70%。144成分に対してactive complexが148しかなく、
+   fullがadditiveを3.4 pp上回ったため、容量より推定分散が制約である可能性が高い。
+   名目Nとsearch-positiveを持つ実効Nを併記する。
+2. nside=4 end-to-end: 25〜40%。候補集合を直接変えるが、nside=3のreachable ceilingが
+   99%なので巨大な改善は期待しにくく、計算量増加も大きい。
+3. `ntop`拡大 + 再学習: 15〜30%。同じ最終scoreでtop-1を選ぶ限り、`ntop`だけを
+   増やしても配備時top-1は直接変わらず、価値は深い順位からpositiveを取得して
+   訓練へ参加させる点にある。未救済66件のbest DockQ中央値0.085は大半が
+   閾値直下でないことを示すため、まず段階的screenに留める。
+4. loss variant: 10〜25%。現lossは公開値から+8 ppを実現しhard negativeも減らしている。
+   148 complexのままtail weightingを変えると、改善より分散・overfitを増す可能性がある。
+
+実行順は費用も考慮し、step-budget対照、`ntop`の安価なcoverage screen、N scaling、
+nside=4 pilotとする。refresh miningは機構確認としてseed 0の小規模pilotまでに留め、
+validationで明瞭な改善がなければ終了する。
+
+**研究の落とし所。** 公開パラメータ69.5%から固定pool 77.5%への+8.0 pp
+（21勝2敗）と、全249件end-to-endでの改善は、IFACEを微分可能に学習する主結果として
+すでに十分に大きい。full 144がadditiveを上回る対照と、fixed-positive accumulate型
+miningのnullも一つの整合した物語になる。ただしPINDER-S TESTは反復利用済みであり、
+$p$値を最終confirmatory evidenceとは呼べない。
+
+追加投資は「さらに0.5 ppを探す」より、(1) 未使用またはunbound cohortでのend-to-end
+確認、(2) N scaling、(3) 探索coverageの小規模診断へ限定する。この三つのうち
+N scalingがflatで、探索pilotも1 pp未満なら、モデル容量をさらにいじらず現結果を
+まとめる。refresh loopは論文の成立条件ではなく、negative resultの機構補足である。
 
 ##### コマンド
 
