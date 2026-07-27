@@ -4019,8 +4019,69 @@ hopf nside=3: 1944 回転 -> 2 個のキー
 
 コード読解だけで終わらせず、`scripts/audit_pose_key_fix.py` で旧キャッシュと
 新 `_pk2` キャッシュの `prov == 0` 行について pose 数・行順・
-`sc, T, elec, rmsd, DockQ` を `torch.equal` で突き合わせる。
-これが一致して初めて「主要結果は無影響」と書ける。Phase A′ 完了後に実行する。
+`sc, T, elec, rmsd, DockQ` を突き合わせた。以下がその実測である。
+
+##### 監査の実測結果（2026-07-27、両キャッシュに存在する260複合体）
+
+**探索由来 pose（`prov == 0`）**
+
+| 項目 | 結果 |
+|---|---|
+| pose 数 | **260/260 で一致**（すべて 1500 → 1500） |
+| `sc`（PSC 4成分） | 259/260 でビット単位一致 |
+| `T`（接触行列） | 259/260 でビット単位一致 |
+| `rmsd`, `DockQ` | 259/260 でビット単位一致 |
+| `elec` | **259/260 が $\le 10^{-6}$**（中央値 $2.4\times10^{-7}$、p99 $4.8\times10^{-7}$） |
+
+**all-provenance（変わることが予測されていた量）**
+
+| 量 | 旧 | 新 | 変化 |
+|---|---:|---:|---:|
+| プールサイズ | 441,133 | 445,794 | +1.1% |
+| positive 総数 | 45,982 | 50,623 | **+10.1%** |
+| うち探索由来 | **3,408** | **3,408** | **±0** |
+| うち列挙由来 | 42,574 | 47,215 | +10.9% |
+| positive ゼロの複合体 | 0 | 0 | ±0 |
+| 探索 positive ゼロの複合体 | 89 | 89 | ±0 |
+
+**探索由来 positive が 3408 で完全に一致し、増えたのは列挙由来だけである。**
+これは「重複除去は列挙側にしか作用しない」というコード上の主張の直接確認である。
+
+##### 唯一の不一致は GPU 非決定性であり、この修正とは無関係
+
+260複合体のうち1件（`7cru__B1_P52292--7cru__A1_P61978`）だけが探索 pose 自体で
+食い違う。ただし**1500行中2行**であり、positive 数（5）も最大 DockQ（0.6675）も同一で、
+上位1500の境界で近接同点の pose が入れ替わったものである。
+
+これが dedup 由来でありえないのはコード上明白である: `prov == 0` の行は
+`docking_search()` と `docking_score_elec()` が生成し、重複除去はその**後**に
+列挙側 `pos_*` のマスクとしてのみ作用する。原因は**旧キャッシュを GPU 0/3/6、
+新キャッシュを GPU 1/2/4/5/6 で採掘したことによる cuFFT の非決定性**である。
+`elec` の $2.4\times10^{-7}$ 程度の系統差（259/260）も同じ理由で、float32 の 1 ULP 相当である。
+
+**これはこの修正が持ち込んだ問題ではなく、パイプラインの既存の性質**である
+——同じ入力でも GPU が違えば探索の上位 $k$ は近接同点のところで入れ替わりうる。
+以後の実験でこれを再現性の限界として記録する。
+
+##### 決定レベルでの不変性（`scratchpad/score_invariance.py`）
+
+丸め差が判断を動かすかを直接確かめるため、§5.14.12 の主要数値を出した
+チェックポイント（`runs_full_m5/N220_seed0`）と baseline の両方で
+新旧プールを採点した。探索由来 pose のみ、260複合体。
+
+| 条件 | top-1 pose 一致 | 全順位一致 | AUC 一致（$<10^{-12}$） | max \|ΔAUC\| |
+|---|---|---|---|---|
+| baseline | **260/260** | 259/260 | **171/171**（計算可能な全件） | **0.000** |
+| trained | **260/260** | 259/260 | **171/171** | **0.000** |
+
+（AUC が計算できるのは探索 positive を持つ 171 複合体のみ。残り89件は positive ゼロで
+未定義であり、その数も新旧で一致している。）
+
+**結論**: success@1 を決める top-1 pose は全260複合体で一致し、AUC は計算可能な
+全複合体で厳密に一致する。したがって §5.14.8 と §5.14.12 の
+`--prov search` / `--loss-prov search` の数値は**この修正で変わらない**。
+訂正が必要なのは all-provenance の positive 数（+10.1%）とそれに依存する
+プール構成・coverage・reachability の記述だけである。
 
 ##### あわせて見つかった別の既存バグ（実害ゼロ）
 
@@ -4055,6 +4116,400 @@ hopf nside=3: 1944 回転 -> 2 個のキー
 回帰テスト（`tests/test_scaling_streaming.py`）: 同一 cell の1944回転が全て distinct
 かつ非負であること、負の並進セルが受理されること、sentinel と rank 違いが拒否されること。
 全スイート 127 passed, 1 skipped。
+
+#### 5.14.20 voxel テーブルの取り違え（2026-07-27、実行者の起動ミス）
+
+Phase A′ の起動で `--grid-voxels` を指定し忘れ、既定の
+`data/scaling/grid_voxels.json`（**3.0 Å 間隔**で計算されたもの）が使われた。
+ボクセル数は間隔の3乗に反比例するので値は実際の約 1/16 になり、
+`--max-grid-voxels 31250000` の上限が事実上機能しなかった。
+
+**実測された帰結**
+
+| | 誤テーブル（3.0 Å） | 正テーブル（1.2 Å） |
+|---|---:|---:|
+| オーバーサイズ除外 | **5件** | **164件** |
+| 6fkf のボクセル数 | 4,062,609 | **61,501,356** |
+| 7n6g のボクセル数 | 18,006,060 | **276,438,696** |
+
+6100万〜2億7600万ボクセルの複合体が上限を通過して選択に入り、
+採掘時に OOM して8件がスキップされた。`_adaptive_frame_chunk` の docstring が
+「サイズ上限はまさにこの生存者バイアスを防ぐために存在する」と書いている、
+その事態そのものである。
+
+さらに重大なのは、**選択が実験1と15複合体ずれていた**ことである。
+気づかずに進めていれば round-1 実験は実験1と別のデータセットで走り、
+両者を並べて論じられなくなっていた。
+
+**恒久対策。** `compute_grid_sizes.py` が出力へ `spacing` を記録し、
+`run_pinder_scaling.py` が `--spacing` と照合して不一致なら停止する。
+spacing を記録しない旧形式も拒否する（既定ファイルが 3.0 Å のものなので、
+黙って読むと同じ事故が再現する）。実測で発火を確認した:
+
+```
+data/scaling/grid_voxels.json was computed at spacing 3.0 A but this run uses
+1.2 A. Voxel counts scale as spacing^-3, so the size cutoff would be off by
+(2.5)^3 = 16x and stop filtering. Run scripts/compute_grid_sizes.py --spacing 1.2.
+```
+
+正しいテーブルで再実行した結果、選択は実験1と **fit 220 / val 55 の ID 順まで完全一致**し、
+追加15件の採掘は OOM ゼロで完了した（275/275、全件が pose identity を保持）。
+
+#### 5.14.21 実験4の結果: hard-negative mining round 1 は効かない（2026-07-27）
+
+##### 設定
+
+§5.14.14 の設計どおり、契約A（hard-negative only、positive は round 0 に凍結）を
+primary とし、**採掘の有無だけが違う2本**を同一の round-0 状態から分岐させた。
+
+```
+              round 0 の学習（1500 step、fit 220 / val 55）
+                            │
+                  round0_optstate.pt
+                  ・パラメータ ・Adam 状態 ・minibatch 乱数列
+                            │
+             ┌──────────────┴──────────────┐
+        【mine】hardneg                【continue】none
+   学習後パラメータで再探索し           再探索せず、
+   新しい negative のみ追加             プールは round 0 のまま
+             │                              │
+      さらに 1500 step               さらに 1500 step
+             └──────────────┬──────────────┘
+                    同じ236複合体でペア比較
+```
+
+full 144 + $\lambda_\mathrm{margin}=0.5$、`--freeze-psc --loss-prov search`、
+seed 0。両arm は同じ step budget・停止規則・pool cap を共有する。
+
+##### round-0 学習が実験1と完全一致（pose key 修正の最終確認）
+
+再採掘したプールで round 0 を学習し直した結果:
+
+| seed | val loss | ‖Δe‖ | steps | TEST DockQ@1 |
+|---|---|---|---|---|
+| 0 | 2.7240 = 2.7240 | 1.5594 = 1.5594 | 1500 | 0.4658 = 0.4658 |
+| 1 | 2.7220 = 2.7220 | 1.5514 = 1.5514 | 1500 | 0.4660 = 0.4660 |
+| 2 | 2.7268 = 2.7268 | 1.5717 = 1.5717 | 1500 | 0.4659 = 0.4659 |
+
+（左が今回、右が実験1。すべて一致。）
+列挙 positive が複合体あたり 147 → 183（+24%）と増えているにもかかわらず、
+`--loss-prov search` の学習は同じ結果に到達した。勾配を出す複合体数も
+**148/220 で一致**、IFACE coverage もゼロ成分 0/144・中央値 189/220 で一致。
+§5.14.19 のテンソル監査を、学習パイプライン全体で裏付けたことになる。
+
+##### 結果（seed 0、236複合体、`--prov search`）
+
+| 条件 | success@1 | AUC | best DockQ@1 | first-hit % |
+|---|---:|---:|---:|---:|
+| baseline（公開パラメータ） | 69.49% | 0.8696 | 0.4457 | 1.098 |
+| round 0（学習済み） | **77.54%** | 0.8933 | 0.4893 | 0.546 |
+| round 1 **mine** | **77.54%** | 0.8935 | 0.4894 | 0.539 |
+| round 1 **continue** | 77.12% | 0.8938 | 0.4875 | 0.532 |
+
+**固定TESTプール上の主要対比: continue → mine**
+
+これは §5.14.14 でsecondaryと事前規定したreranking機構評価である。
+同節で科学的primaryとした全249件の **end-to-end success@1 は未評価**なので、
+以下だけで実験4全体のprimaryがnullになったとはしない。
+
+| 指標 | 変化 | 検定 |
+|---|---|---|
+| **success@1** | 77.12% → 77.54% | **1勝0敗、exact McNemar $p=1$**、bootstrap 95% CI $[+0.00, +1.27]$ pp |
+| AUC | 0.8938 → 0.8935（**−0.0003**） | Wilcoxon $p=0.003$（符号一貫性であって効果量ではない） |
+| best DockQ@1 | 0.4875 → 0.4894 | Wilcoxon $p=1$ |
+| first-hit | 0.0053 → 0.0054 | Wilcoxon $p=0.14$ |
+
+**動いた複合体は1件だけである。** AUC はむしろ mine のほうが低い。
+
+**secondary: 分岐元からの変化**
+
+| 対比 | success@1 | 勝/敗 | p |
+|---|---|---|---|
+| round 0 → round 1 mine | 77.54% → 77.54% | **0勝0敗** | 1 |
+| round 0 → round 1 continue | 77.54% → 77.12% | 0勝1敗 | 1 |
+
+**round 0 → round 1 mine は固定プールの success@1 が完全に不変**である。
+最大1500 stepのbudget（実際は501 stepで早期停止）を追加して採掘しても、
+この共通候補集合上で成功判定が変わった複合体はない。
+
+##### candidate novelty の診断
+
+round-1 採掘の内訳（220複合体、`round1_metrics.json` の `mining`）:
+
+| 項目 | 値 |
+|---|---:|
+| 提案された negative | 333,475 |
+| **うち round-0 プールとの重複** | **231,042（69.3%）** |
+| 新規に追加された negative | 102,433 |
+| cap 後に生き残った新規 | 102,433（全部） |
+| **cap により追い出された old negative** | **0** |
+| プールサイズ | 1,715 → 2,180（上限 4,000 に未到達） |
+
+学習後パラメータの探索が返す negative の69%は、round-0探索が既に返していた。
+ただし、これだけをnullの原因と断定してはならない。**102,433件（30.7%）は新規**で、
+平均プールも1,715から2,180へ**27%増加**しており、「新情報が入らなかった」は
+数としては誤りである。示されたのは、新規negativeを追加しても固定TEST順位が
+改善しなかったことまでである。
+
+原因を分けるには、新規negativeについてround-0 checkpointでのscore/rank、
+positiveとのmargin violation率、basin softmax mass、lossおよびgradient寄与を
+old negativeと比較する必要がある。このときlossはpool全体のscoreを複合体ごとに
+標準化するため、raw scoreへmarginを当てず、**old+new結合poolを
+`normalized_scores()`に通した値**で測る。最も直接的には同じround-0 checkpointで
+old poolとold+new poolのloss、gradient norm、gradient cosineを複合体ごとに比較する。
+新規でも既存例と特徴的に冗長、またはloss上
+すでに容易なら、10万件追加されても学習信号はほとんど増えない。cap未到達で
+old negativeの置換がゼロだったため、今回の介入は「hardest例への置換」ではなく
+主としてadditive pool expansionだったことも限界である。
+
+##### その測定（`scripts/measure_new_negative_leverage.py`）
+
+**単位の訂正（codex 指摘）。** この診断を最初は**生スコア**に margin $=1$ を
+適用して書いたが、それは学習が見ている量ではない。`mean_objective` は
+`normalized_scores` を通す——プールを自身の平均で中心化し、自身の標準偏差
+（生スコアでは $5\times10^2$〜$2\times10^3$）で割る。生スコアに margin $1.0$ を
+当てるのは実質「最悪の positive を超える negative」を数えているだけで、別の量である。
+さらに標準化は**与えられたプールごとに再計算される**ので、27%の pose を足せば
+同じ pose の位置も変わる。以下は学習経路（`loss_view` の `prov==0` 部分集合、
+round-0 プール＋新規 negative を結合してから標準化）を再現した測定である。
+
+勾配を持つ148複合体、round-0 の学習済みパラメータ、**標準化スコア単位**:
+
+| 項目 | 値 |
+|---|---:|
+| 148複合体に追加された新 negative | 67,278 |
+| うち margin 帯域 $s > \min_i s(\text{pos}_i) - \lambda$ に入るもの | **52,723（78.4%）** |
+| 同じ帯域内の old negative（round-1 プールで再標準化後） | 174,093 |
+| **帯域に占める新規の割合** | **23.2%**（複合体ごと中央値 22.9%） |
+| **新 negative が最難関（最高スコア）になった複合体** | **3/148** |
+| **最難関 negative のスコア差（新 − 旧）** | **中央値 $-1.87$** |
+| margin 閾値そのものの移動 | 中央値 $+0.037$ |
+
+（参考: 生スコアで測った誤った版では 54.0% / 22.0% / 3-of-148 だった。
+新規が最難関になった複合体数だけは単位に依らない。）
+
+**新規 negative の 78% は損失が見る帯域に入っている。** 届いていないのではない。
+プールも 27% 増えている。「新情報が入らなかった」という最初の説明は誤りである。
+
+正しい機構は**帯域の上端**にある。`loss_margin_hard_negatives` は
+$\max$ 側で駆動される hinge であり、勾配の大きさを決めるのは最も高くスコアする
+negative である。新規 pose は同じ探索・同じ分布から引かれるので帯域は埋めるが、
+**その上端より中央値で 1.87 標準偏差も下**にあり、上端を更新したのは
+**148複合体のうち3件だけ**であった。帯域を埋めるだけの新規 pose が加える勾配は、
+既存 negative が既に供給しているものと**冗長**である。
+
+この区別は次の投資先を分ける。「新情報が届かない」なら探索深度 `ntop` を
+増やせば解決しうるが、「分布は同じで上端が動かない」なら **`ntop` 増加は
+同じ分布からの標本追加にすぎず期待が薄い**。探索そのものを変える介入
+（PSC も学習する、回転グリッドを細かくする）か、negative ではなく
+positive 側の欠損（勾配ゼロの72複合体）を扱う必要がある。
+
+**なおこの機構説明は round-1 の null を「説明する」ものであって、
+独立に検証された因果ではない。** 上端が動かないことと性能が動かないことの
+同時観測であり、「上端を動かせば性能が上がる」は別に示す必要がある。
+
+**重複除去がなければこの結果は出なかった。** 231,042件を二重に格納すれば、
+それらは損失で暗黙に2倍の重みを持ち、val loss の変化を「採掘効果」と
+誤読するところだった（§5.14.15 の指摘1）。
+
+##### matched-budget であって matched-compute ではない（実データで確認）
+
+両arm とも `--patience 8` により上限1500の前で早期終了した:
+**mine 501 step、continue 601 step**。§5.14.15 で用語を
+matched-compute から matched-budget へ改めた判断が、実データで裏づけられた形である。
+両者は同じ budget と同じ停止規則を共有するが、消費した step は同じではない。
+
+##### 結論
+
+**この契約・この設定の固定TESTプールでは、hard-negative mining round 1 の
+検出可能な増分はなかった。** success@1 は1勝0敗（$p=1$）、AUCは微減し、
+round 0からのsuccess判定は完全に不変だった。bootstrap CIの上端は+1.27 ppなので、
+小さい正の効果との同等性まで証明した結果ではない。
+
+**言明の範囲を限定する。** 示されたのは
+「**positive を凍結し（契約A）、PSC を凍結し（$\alpha=1,\rho=3.5$）、
+Hopf nside=3・探索深度top-1500で1 round回す限り**、seed 0の固定プール上で
+matched-budget continuationを上回らなかった」であって、hard-negative mining一般が
+無効という主張ではない。さらにend-to-end primaryは未測定である。
+
+##### 限界
+
+- **seed 0 のみ**。seed追加は同じ236複合体を独立標本に増やさず、optimizer感度を
+  調べる。seed 1は採掘がほぼ完了しているため両armまで完了する価値があるが、
+  seed 2よりend-to-end primaryを優先する。
+- **契約Aに条件付き**。新 positive も取り込む契約B（on-policy）は未実施であり、
+  round-0 探索が近native pose を返さない **72/220 複合体は契約A では永久に勾配ゼロ**である。
+  この72件は次に直接検証すべき対象だが、性能限界の主因とはまだ証明されていない。
+- **1 round のみ**。§5.14.14 の事前規定どおり round 2 へは進まない
+  （改善した場合のみ進む規則だったため）。
+- bound-bound、固定プール上の再ランキング、反復利用済み PINDER-S TEST。
+
+##### 次の訓練実験への判断（結果レビュー）
+
+72/220件のsearch-positive欠損は最大の構造的な非効率だが、性能限界の主因とはまだ
+証明されていない。lossのmarginや温度を変えてもこの72件には勾配が出ないため、
+次はこれを直接falsifyする。
+
+1. **まずseed 0のmine/continueを全249件end-to-endで比較する。**
+   これは事前規定primaryであり、seed 2の再採掘より優先する。
+2. まず既存のround-1 `mined_raw` cacheを使い、72件のうち学習後探索で新たに
+   search positiveを得た件数、positive数、DockQ、first-hit rankを測る。
+   これは追加FFTなしで契約Bの救済可能性を判定できる。
+3. まだ救済されない複合体だけについて、同じnside=3で`ntop`を段階的に増やし、
+   新たにDockQ閾値を超える複合体数、first-hit rank、計算費用を測る。
+   99%のreachable ceilingは「top-1500にsearch positiveが入る」ことを意味しないので、
+   まずranking truncationを調べる。これで救済されない場合だけnside=4をscreenする。
+4. 取得法を事前固定してpositiveを一度だけ生成し、その後は凍結する。
+   既にactiveな148件のpositiveは変えず、救済された複合体だけを加えた
+   **rescue-only対照**を、同じnegative pool・full144+m5・PSC固定で学習する。
+   これにより「実効N増加」をon-policy driftから分離する。
+5. rescue-onlyで改善した場合に限り契約Bを行い、§5.14.14のdrift診断と
+   positive quota/balanced samplingを適用する。
+
+優先度は **既存raw cacheの救済監査 → positive取得screen → rescue-only学習 → N scaling**。
+N scalingは先に各Nでsearch-positiveを持つ実効Nも報告し、名目Nだけを横軸にしない。
+loss variantはゼロ勾配を直さないため後回し。PSC同時学習は既にIFACE-onlyより悪く、
+探索とrankingを再び交絡するので現時点では棄却する。nside=4の全面学習、round 2、
+pool cap増加も、取得screenまたは今回の診断が必要性を示すまで行わない。
+
+seedについては、seed 1はsunk costが大きいので完了してoptimizer頑健性を確認する。
+seed 2を止めるなら「事前3-seed完遂」ではなく探索的go/no-go判断だったと明記する。
+3-seed結果を論文上の確証として約束している場合だけseed 2も完遂する。
+
+##### 救済監査の結果: 契約Bは却下される（2026-07-27）
+
+上の項目2（既存 round-1 キャッシュによる救済可能性の判定、追加 FFT なし）を
+実施した（`scripts/measure_rescue_potential.py`、seed 0）。
+
+| 項目 | 値 |
+|---|---:|
+| 契約Aで勾配ゼロの複合体 | **72/220** |
+| **学習後パラメータの探索が近native pose を見つけた数** | **6（8.3%）** |
+| 実効 fit 集合（契約Bを実装した場合） | 148 → **154** |
+
+救済されなかった66件の、探索が返した pose の **best DockQ**:
+
+| | 中央値 | p90 | 最大 |
+|---|---:|---:|---:|
+| round 0 | 0.077 | 0.176 | 0.229 |
+| round 1（学習後パラメータ） | 0.085 | 0.210 | 0.655 |
+
+**閾値 0.23 に対して中央値 0.085 である。** 沈黙している複合体は閾値の
+すぐ下にいるのではなく、**探索の到達範囲の外**にいる。
+
+**判断: 契約B（on-policy positive refresh）を却下する。**
+実効 N は 148 → 154（+4%）にしかならず、この増分で success@1 の変化を
+検出できる見込みはない（実験1の実測で、+3.39 pp の効果ですら 9勝1敗 $p=0.0215$
+でようやく有意だった）。self-training の drift リスクを負う価値がない。
+
+**したがって72件の勾配ゼロは「訓練契約の問題」ではなく「探索の問題」である。**
+これは §5.14.21 の negative 側の診断と同じ結論を指す——
+上端が動かないのも、positive が見つからないのも、**探索が返す候補集合が
+変わらない**ことに帰着する。次に試すべきは訓練側の工夫ではなく、
+探索そのものを変える介入（`ntop` の増加、回転グリッドの細密化）である。
+
+ただし §5.14.21 で見たとおり `ntop` 増加は「同じ分布からの標本追加」でもあるため、
+まず **ranking truncation か reach の欠如か**を切り分ける必要がある
+（codex 提案の項目3）。上表で round-1 の最大 DockQ が 0.655 に達した複合体が
+存在することは、少なくとも一部は top-1500 の切り捨てで失われている可能性を示す。
+
+##### パラメータは動いたのか、そして round 0 は収束していたのか
+
+「学習でパラメータは実際に動いているのか」を確かめるため、公開表 $e_0$ に対する
+学習差分の大きさを測った。
+
+| | $\|\Delta e\|$ | $\|e_0\|=8.669$ 比 | 自分の値の10%超動いた成分 | 50%超 |
+|---|---:|---:|---:|---:|
+| round 0 | 1.5594 | **18.0%** | **95/144** | 34/144 |
+| round 1 mine | 1.5884 | 18.3% | 98/144 | 33/144 |
+| round 1 continue | 1.6197 | 18.7% | 95/144 | 34/144 |
+
+**round 0 では確かに動いている**（144成分中95個が自分の値の10%以上、34個が50%以上、
+success@1 は +8.0 pp）。一方 **round 0 → round 1 の変化は $\|\Delta e\|$ で
++1.9% にすぎない**。
+
+**round 0 は収束していなかった。** `round0_trajectory.csv` を読むと:
+
+| | 検証チェック | accepted | 最後に改善した step | val loss |
+|---|---:|---:|---|---|
+| round 0 | 31 | 26 | **1500 / 1500** | 2.9653 → 2.7240 |
+| round 1 mine | 11 | **2** | **101** / 501 | 2.7240 → 2.7210 |
+| round 1 continue | 13 | **3** | **201** / 601 | 2.7240 → 2.7191 |
+
+round 0 は plateau に達したのではなく、**1500 step の予算を使い切っただけ**である
+（§5.14.12 の限界「全 run が 1500 step 上限に到達しており収束 plateau は未確認」を
+実データが裏づけた）。ところが同じ最適化を round 1 で続けると、両arm とも
+**100〜200 step で頭打ち**になる。さらに `continue` は val loss を
+2.7240 → 2.7191 と下げたのに、**TEST success@1 は 77.54% → 77.12% と下がった**。
+
+**これは round 1 の null に対する別の説明を示唆する。** 「採掘が情報を足さない」
+のとは独立に、**round 0 の 1500 step 地点が汎化の観点でほぼ最適で、そこから先は
+validation が下がっても TEST が改善しない領域**に入っている可能性がある。
+validation が TEST と交換可能でないこと（§5.14.11、探索 recall 65.8% vs 94.8%）
+と整合する。
+
+**この2つの説明は現データでは分離できていない。** 分離には採掘を含まない
+step budget 対照が要る（下記候補1）。
+
+##### 次の実験候補（優先順、2026-07-27 時点）
+
+1. **step budget 対照（新規、最優先）。** round 0 を 1500 ではなく 3000 step で
+   回し、(a) val loss がどこで plateau するか、(b) TEST success@1 が 1500 step
+   以降も伸びるか下がるかを測る。round 1 の null が「採掘の無効」なのか
+   「1500 step 以降に伸びしろがない」のかを分離する。
+   **採掘を一切含まないので実験4の解釈に直接効き、pool cache を再利用するので
+   追加の採掘コストはゼロ。**
+2. **seed 0 の mine/continue を全249件 end-to-end で比較**（codex 提案の項目1）。
+   固定プール上の再ランキングではなく、事前規定した primary endpoint。
+3. **ranking truncation か reach の欠如か**（codex 提案の項目3）。
+   救済されなかった66件について `ntop` を段階的に増やし、閾値を超える複合体が
+   増えるかを測る。増えれば top-1500 の切り捨てが原因、増えなければ
+   回転グリッドの到達範囲が原因。
+4. N scaling（各 N で search-positive を持つ実効 N も併記）。
+
+**却下・後回し**（根拠つき）:
+
+- **契約B（on-policy positive refresh）**: 救済監査で 72件中6件（8.3%）しか
+  救えないと判明。実効 N は 148 → 154 にしかならない。
+- `ntop` 増加を単独で: §5.14.21 のとおり「同じ分布からの標本追加」になりうるため、
+  項目3 の切り分けを先に行う。
+- PSC 同時学習: §5.14.8 で IFACE-only より悪く、探索と ranking を再び交絡する。
+- round 2、pool cap 増加、loss variant、nside=4 の全面学習:
+  上の診断が必要性を示すまで行わない。
+
+##### コマンド
+
+```bash
+# Phase A: round-0 学習（seed ごと）-> round0_ckpt.pt + round0_optstate.pt
+uv run python scripts/run_pinder_scaling.py \
+    --n-fit 220 --seed $s --rounds 0 \
+    --freeze-psc --loss-prov search --alpha0 1.0 \
+    --iface-mode full --lambda-margin 0.5 \
+    --grid-voxels data/scaling/grid_voxels_1.2.json \
+    --pool-cache data/scaling/pool_cache \
+    --test-cache data/shards_pinder/test_pool_reachable.pt \
+    --max-grid-voxels 31250000 \
+    --exclude-bad-geometry data/scaling/excluded_bad_geometry.txt \
+    --exclude-homodimer --out-dir data/scaling/runs_r1
+
+# Phase B: round-1 採掘（5シャード、パラメータ指紋でキャッシュを分離）
+uv run python scripts/run_pinder_scaling.py ... \
+    --rounds 1 --mine-only --mine-from-ckpt <round0_ckpt.pt> --mine-shard $i/5
+
+# Phase C: 両arm を同一 round-0 状態から分岐
+uv run python scripts/run_pinder_scaling.py ... \
+    --rounds 1 --resume-from <round0_optstate.pt> \
+    --mining-contract {hardneg,none}
+
+# 固定TESTプール評価と mine/continue contrast
+uv run python scripts/compare_conditions.py --pool data/shards_pinder/test_pool_reachable.pt \
+    --ckpt data/scaling/runs_r1/N220_seed0_{hardneg,none}/round1_ckpt.pt --prov search
+uv run python scripts/r1_contrast.py
+```
+
+**hardware**: round-1 採掘は 220複合体を5シャードで約1時間半（1シャード44件、
+実測 140〜180 秒/複合体、共有機・load average 20〜30）。学習は1本あたり約40分。
+評価は CPU のみ。
 
 ---
 

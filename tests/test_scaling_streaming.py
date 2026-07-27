@@ -12,6 +12,7 @@ reference and the GPU streaming path agree.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -357,7 +358,11 @@ def _write_selection_fixture(tmp_path, n_master=60, bad=(3, 11), voxels=None):
     vox = {pid: 1000 for pid in ids}
     for r in (voxels or ()):
         vox[ids[r]] = 10_000_000
-    (tmp_path / "voxels.json").write_text(json.dumps(vox))
+    # versioned form: the table records the spacing it was computed at, because
+    # a 3.0 A table read at 1.2 A under-reports by 16x and silently disables the
+    # size cutoff (report section 5.14.20)
+    (tmp_path / "voxels.json").write_text(
+        json.dumps({"spacing": 1.2, "voxels": vox}))
     return ids
 
 
@@ -369,6 +374,7 @@ class _Args:
         # no-op here; the flag still has to exist for `eligible`
         kw.setdefault("exclude_homodimer", False)
         kw.setdefault("exclude_bad_geometry", "")
+        kw.setdefault("spacing", 1.2)
         self.__dict__.update(kw)
 
 
@@ -619,3 +625,41 @@ def test_pose_identity_distinguishes_every_rotation_via_production_helper():
                         torch.zeros(n, 3, dtype=torch.int64))
     assert len({tuple(r) for r in key.tolist()}) == n
     assert has_pose_identity(key)
+
+
+def test_voxel_table_spacing_must_match_the_run(tmp_path):
+    """A voxel table from a different spacing must stop the run, not filter wrong.
+
+    Voxel counts scale as spacing^-3, so the default 3.0 A table read by a 1.2 A
+    run under-reports by ~16x and the size cutoff stops excluding anything.
+    Measured consequence (report section 5.14.20): 164 oversized complexes
+    dropped to 5, complexes of 61M-276M voxels entered the selection against a
+    31.25M cap, then OOMed during mining -- and the selection silently differed
+    from the experiment it was meant to extend by 15 complexes.
+    """
+    mod = _load_run_module()
+    ids = _write_selection_fixture(tmp_path, n_master=60, bad=(), voxels=(0,))
+    (tmp_path / "wrong.json").write_text(json.dumps(
+        {"spacing": 3.0, "voxels": {pid: 1000 for pid in ids}}))
+    common = dict(master_ids=str(tmp_path / "master_ids.txt"),
+                  prep_manifest=str(tmp_path / "manifest.jsonl"),
+                  max_grid_voxels=2_000_000, val_frac=0.2, n_total=0,
+                  spacing=1.2)
+
+    with pytest.raises(SystemExit) as e:
+        mod.select_split(_Args(n_fit=8, grid_voxels=str(tmp_path / "wrong.json"),
+                               **common))
+    assert "3.0" in str(e.value) and "1.2" in str(e.value)
+
+    # a table with no spacing at all is refused rather than guessed at
+    (tmp_path / "legacy.json").write_text(
+        json.dumps({pid: 1000 for pid in ids}))
+    with pytest.raises(SystemExit) as e:
+        mod.select_split(_Args(n_fit=8, grid_voxels=str(tmp_path / "legacy.json"),
+                               **common))
+    assert "records no spacing" in str(e.value)
+
+    # the matching table is accepted
+    sel, _, _, _, info = mod.select_split(
+        _Args(n_fit=8, grid_voxels=str(tmp_path / "voxels.json"), **common))
+    assert info["n_excluded_oversized"] == 1

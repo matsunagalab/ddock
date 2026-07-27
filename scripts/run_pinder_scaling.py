@@ -920,7 +920,25 @@ def select_split(args):
             raise SystemExit(
                 f"--max-grid-voxels is set but {vpath} is missing; run "
                 f"scripts/compute_grid_sizes.py first")
-        voxels = json.loads(vpath.read_text())
+        blob = json.loads(vpath.read_text())
+        if isinstance(blob, dict) and "voxels" in blob:
+            got = float(blob.get("spacing", float("nan")))
+            if abs(got - float(args.spacing)) > 1e-9:
+                raise SystemExit(
+                    f"{vpath} was computed at spacing {got} A but this run uses "
+                    f"{args.spacing} A. Voxel counts scale as spacing^-3, so the "
+                    f"size cutoff would be off by ({got/args.spacing:.1f})^3 = "
+                    f"{(got/args.spacing)**3:.0f}x and stop filtering. Run "
+                    f"scripts/compute_grid_sizes.py --spacing {args.spacing}.")
+            voxels = blob["voxels"]
+        else:
+            # Legacy table with no spacing recorded. Refuse rather than guess:
+            # the default file is the 3.0 A one, and reading it at 1.2 A let
+            # 61M-276M-voxel complexes through a 31.25M cap.
+            raise SystemExit(
+                f"{vpath} records no spacing, so it cannot be checked against "
+                f"--spacing {args.spacing}. Re-run scripts/compute_grid_sizes.py "
+                f"--spacing {args.spacing} --out {vpath}.")
 
     def eligible(pid: str) -> bool:
         if status.get(pid, {}).get("status") != "ok":

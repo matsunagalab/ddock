@@ -60,7 +60,13 @@ def main() -> None:
         nx, ny, nz = grid_shape(prot.rec_xyz, prot.lig_ref, spacing=args.spacing)
         out[pid] = nx * ny * nz
 
-    Path(args.out).write_text(json.dumps(out))
+    # Record the spacing. The voxel count scales as spacing^-3, so a table
+    # built at 3.0 A reports ~1/15 of the 1.2 A count, and a size cutoff read
+    # against the wrong table silently stops filtering: measured, complexes of
+    # 61M-276M voxels passed a 31.25M cap and then OOMed during mining, which
+    # is exactly the survivorship bias the cutoff exists to prevent.
+    Path(args.out).write_text(json.dumps({"spacing": args.spacing,
+                                          "voxels": out}))
     vals = sorted(out.values())
     n = len(vals)
     def pct(q):
