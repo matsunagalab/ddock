@@ -257,14 +257,20 @@ def test_rho_receives_gradient_through_cached_features():
 # --------------------------------------------------------------------------
 # pool bookkeeping invariants
 # --------------------------------------------------------------------------
-def _fake_feats(mod, name, n, dockq, origin):
+def _fake_feats(mod, name, n, dockq, origin, pose_key=None):
     return mod.Feats(name,
                      torch.arange(n, dtype=torch.float64),
                      torch.zeros(n, 12, 12, dtype=torch.float64),
                      torch.zeros(n, dtype=torch.float64),
                      torch.full((n,), 3.0, dtype=torch.float64),
                      torch.as_tensor(dockq, dtype=torch.float64),
-                     torch.full((n,), origin, dtype=torch.int16))
+                     torch.full((n,), origin, dtype=torch.int16),
+                     None,
+                     None if pose_key is None
+                     else torch.as_tensor(
+                         [[k, 0, 0, 0] for k in pose_key]
+                         if not hasattr(pose_key[0], "__len__") else pose_key,
+                         dtype=torch.int64))
 
 
 def test_normalized_scores_preserve_pose_ranking():
@@ -443,3 +449,173 @@ def test_split_refuses_when_cache_too_small(tmp_path):
             n_fit=100, n_total=0, val_frac=0.2,
             master_ids=str(tmp_path / "master_ids.txt"),
             prep_manifest=str(tmp_path / "manifest.jsonl")))
+
+
+# ---------------------------------------------------------------------------
+# mining round > 0: pose identity, de-duplication and cap accounting
+#
+# A round-1 pool that double-counts a pose the search returned twice reweights
+# the loss without saying so, and the reweighting would be read as the mining
+# effect the experiment is trying to measure. These pin the parts of that path
+# that are easy to get subtly wrong.
+# ---------------------------------------------------------------------------
+
+def test_dedup_uses_pose_identity_not_derived_quantities():
+    """Two distinct poses may share (RMSD, DockQ, ELEC); they must both survive.
+
+    `_fake_feats` gives every pose rmsd 3.0, dockq from the argument and elec 0,
+    so under the earlier derived-quantity key the whole candidate set collapsed
+    to one entry.
+    """
+    mod = _load_run_module()
+    pool = _fake_feats(mod, "X", 4, torch.zeros(4), 0, pose_key=[10, 11, 12, 13])
+    cand = _fake_feats(mod, "X", 4, torch.zeros(4), 1, pose_key=[20, 21, 22, 23])
+    keep, n_dup = mod._fresh_indices(cand, pool)
+    assert keep.tolist() == [0, 1, 2, 3]
+    assert n_dup == 0
+
+
+def test_dedup_drops_poses_already_in_the_pool():
+    mod = _load_run_module()
+    pool = _fake_feats(mod, "X", 3, torch.zeros(3), 0, pose_key=[10, 11, 12])
+    cand = _fake_feats(mod, "X", 4, torch.zeros(4), 1, pose_key=[11, 99, 10, 98])
+    keep, n_dup = mod._fresh_indices(cand, pool)
+    assert keep.tolist() == [1, 3]
+    assert n_dup == 2
+
+
+def test_dedup_drops_repeats_inside_the_candidate_set():
+    """`generate_pool_reachable` de-duplicates its own two provenances against
+    each other, but a candidate set can still repeat a key; keeping both would
+    double its weight just as surely as a cross-round duplicate."""
+    mod = _load_run_module()
+    pool = _fake_feats(mod, "X", 1, torch.zeros(1), 0, pose_key=[1])
+    cand = _fake_feats(mod, "X", 4, torch.zeros(4), 1, pose_key=[7, 7, 8, 7])
+    keep, n_dup = mod._fresh_indices(cand, pool)
+    assert keep.tolist() == [0, 2]
+    assert n_dup == 2
+
+
+def test_dedup_refuses_a_pool_without_pose_identities():
+    mod = _load_run_module()
+    pool = _fake_feats(mod, "X", 2, torch.zeros(2), 0)          # pose_key = -1
+    cand = _fake_feats(mod, "X", 2, torch.zeros(2), 1, pose_key=[5, 6])
+    with pytest.raises(SystemExit):
+        mod._fresh_indices(cand, pool)
+
+
+def test_cap_can_evict_old_negatives_so_growth_is_not_survival():
+    """The statistic `pool_after - pool_before` is not the number of new poses
+    that survived: `cap_pool` keeps the highest-scoring negatives, so a new pose
+    can enter by pushing an old one out and leave the size unchanged."""
+    mod = _load_run_module()
+    alpha = torch.tensor(0.01, dtype=torch.float64)
+    rho = torch.tensor(3.5, dtype=torch.float64)
+    p = mod.Params(alpha, rho, iface_ij(dtype=torch.float64, flat=True))
+    beta = torch.tensor(3.0, dtype=torch.float64)
+
+    pool = _fake_feats(mod, "X", 10, torch.zeros(10), 0, pose_key=list(range(10)))
+    cand = _fake_feats(mod, "X", 5, torch.zeros(5), 1, pose_key=list(range(100, 105)))
+    cand.sc = torch.arange(50.0, 55.0, dtype=torch.float64)   # outscore the pool
+    before = pool.n
+    pool.cat(cand)
+    capped = mod.cap_pool(pool, 10, p, beta, 0.23)
+
+    assert capped.n == before                       # size unchanged ...
+    survivors = {r[0] for r in capped.pose_key.tolist()}
+    assert len(survivors & set(range(100, 105))) == 5   # ... but 5 new poses in
+    assert len(survivors & set(range(10))) == 5        # ... and 5 old ones out
+
+
+def test_param_fingerprint_separates_checkpoints():
+    """The round-1 cache key carries this hash so a pool mined from one
+    checkpoint can never be picked up by a run holding another."""
+    mod = _load_run_module()
+    rho = torch.tensor(3.5, dtype=torch.float64)
+    e0 = iface_ij(dtype=torch.float64, flat=True)
+    a = mod.Params(torch.tensor(1.0, dtype=torch.float64), rho, e0.clone())
+    b = mod.Params(torch.tensor(1.0, dtype=torch.float64), rho, e0.clone())
+    assert mod.param_fingerprint(a) == mod.param_fingerprint(b)
+    b.iface[0] += 1e-6
+    assert mod.param_fingerprint(a) != mod.param_fingerprint(b)
+    c = mod.Params(torch.tensor(1.0 + 1e-9, dtype=torch.float64), rho, e0.clone())
+    assert mod.param_fingerprint(a) != mod.param_fingerprint(c)
+
+
+def test_shards_partition_the_fit_list_exactly_once():
+    """Sharding happens before cached ids are removed, so a worker's ownership
+    does not depend on what happened to be cached when it started."""
+    fit = [f"c{i}" for i in range(220)]
+    n = 3
+    shards = [fit[i::n] for i in range(n)]
+    flat = [pid for sh in shards for pid in sh]
+    assert sorted(flat) == sorted(fit)
+    assert len(flat) == len(set(flat))
+    assert max(len(s) for s in shards) - min(len(s) for s in shards) <= 1
+
+
+def test_pose_identity_distinguishes_every_rotation_at_one_cell():
+    """Regression: the packed-int64 key collapsed 1944 rotations to two.
+
+    ``((qi*2**21 + cx)*2**21 + cy)*2**21 + cz`` puts ``qi`` at bit 63, so it
+    overflowed int64 and only the *parity* of the rotation index survived --
+    measured, all 1944 Hopf rotations produced two distinct keys, and every odd
+    rotation produced a negative one. Both consequences were silent: enumerated
+    poses were dropped as duplicates of a search pose they merely shared a
+    translation cell and a rotation parity with, and a negative key would later
+    read as "this pool has no identities".
+    """
+    from zdock.dataset import generate_pool_reachable  # noqa: F401  (contract)
+
+    n = 1944
+    qi = torch.arange(n, dtype=torch.int64).reshape(-1, 1)
+    cell = torch.zeros(n, 3, dtype=torch.int64)
+    key = torch.cat([qi, cell], dim=1)
+    assert len({tuple(r) for r in key.tolist()}) == n
+    assert int((key < 0).sum()) == 0
+
+
+def test_generate_pool_reachable_returns_one_identity_per_pose():
+    """The identity must line up with the poses, or de-duplication silently
+    compares the wrong rows."""
+    import inspect
+
+    from zdock.dataset import generate_pool_reachable
+
+    src = inspect.getsource(generate_pool_reachable)
+    assert "return poses, origin, pose_key" in src, (
+        "generate_pool_reachable must return the pose identity; a caller that "
+        "unpacks two values would take `origin` as the identity")
+
+
+def test_pose_identity_accepts_negative_translation_cells():
+    """A negative translation cell is ordinary, not a missing identity.
+
+    The lattice spans the origin, so `(qi, -1, 0, 0)` is a perfectly good pose.
+    An earlier sentinel test asked whether ANY column was negative and would
+    have rejected it, refusing to de-duplicate a pool that was in fact fine.
+    Only the rotation-index column separates the sentinel from an identity.
+    """
+    from zdock.dataset import has_pose_identity, pose_identity
+
+    qi = torch.tensor([0, 5, 1943], dtype=torch.int64)
+    cell = torch.tensor([[-3, 0, 2], [0, -7, -1], [4, 4, -9]], dtype=torch.int64)
+    key = pose_identity(qi, cell)
+    assert key.shape == (3, 4)
+    assert has_pose_identity(key)
+    assert len({tuple(r) for r in key.tolist()}) == 3
+
+    missing = torch.full((3, 4), -1, dtype=torch.int64)
+    assert not has_pose_identity(missing)
+    assert not has_pose_identity(torch.zeros(3, dtype=torch.int64))   # wrong rank
+
+
+def test_pose_identity_distinguishes_every_rotation_via_production_helper():
+    """The same 1944-rotation check, through the function the pipeline calls."""
+    from zdock.dataset import has_pose_identity, pose_identity
+
+    n = 1944
+    key = pose_identity(torch.arange(n, dtype=torch.int64),
+                        torch.zeros(n, 3, dtype=torch.int64))
+    assert len({tuple(r) for r in key.tolist()}) == n
+    assert has_pose_identity(key)

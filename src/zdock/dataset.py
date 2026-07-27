@@ -424,6 +424,41 @@ def generate_decoys(
     return poses, fft_scores
 
 
+#: Sentinel row for "this pool does not record pose identities".
+#: Only the rotation-index column can distinguish it from a real identity: the
+#: translation cells span the origin, so a negative cx/cy/cz is ordinary.
+POSE_IDENTITY_MISSING = -1
+
+
+def pose_identity(qi: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
+    """``(N, 4)`` exact pose identity ``(rotation index, cx, cy, cz)``.
+
+    Four columns, not one packed integer. The packing this replaced --
+    ``((qi*2**21 + cx)*2**21 + cy)*2**21 + cz`` -- puts ``qi`` at bit 63 and
+    overflows int64: measured, all 1944 Hopf rotations at one cell collapsed to
+    TWO distinct keys (the rotation index's parity), and every odd rotation
+    produced a negative key. Any enumerated pose sharing a translation cell
+    with a search pose of the same rotation parity was dropped as a
+    "duplicate" -- up to 122 of 216 candidates on a single complex.
+
+    Rotation *indices* only mean the same thing against the same rotation grid,
+    so identities are comparable across mining rounds only for a grid that does
+    not depend on the round (``--rot-set hopf``, not ``random``).
+    """
+    return torch.cat([qi.to(torch.int64).reshape(-1, 1),
+                      cell.to(torch.int64)], dim=1)
+
+
+def has_pose_identity(pose_key: torch.Tensor) -> bool:
+    """Whether `pose_key` carries real identities rather than the sentinel.
+
+    Tests the rotation-index column only. Testing every column would reject a
+    perfectly valid pose at a negative translation cell.
+    """
+    return bool(pose_key.ndim == 2 and pose_key.shape[1] == 4
+                and int((pose_key[:, 0] < 0).sum()) == 0)
+
+
 def generate_pool_reachable(
     prot: PreparedProtein,
     *,
@@ -437,11 +472,12 @@ def generate_pool_reachable(
     rot_chunk_size: int = 32,
     n_near_rot: int = 8,
     trans_cells: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a candidate pool whose positives the search can actually return.
 
-    Returns ``(poses, origin)`` with ``origin`` 0 for search output and 1 for
-    an enumerated near-native candidate.
+    Returns ``(poses, origin, pose_key)`` with ``origin`` 0 for search output
+    and 1 for an enumerated near-native candidate, and ``pose_key`` the exact
+    ``(rotation index, integer translation cell)`` identity of each pose.
 
     Why not :func:`generate_decoys`
     -------------------------------
@@ -503,14 +539,11 @@ def generate_pool_reachable(
     pos_cell = pos_cell.repeat(k, 1)                            # (k*C, 3)
 
     # drop candidates the search already returned (same rotation, same cell)
-    def _key(qi, cell):
-        big = 1 << 21
-        c = cell + (big // 2)
-        return ((qi.to(torch.int64) * big + c[:, 0]) * big + c[:, 1]) * big + c[:, 2]
-
-    seen = set(_key(neg_qi, neg_cell).tolist())
-    keep = torch.tensor([int(x) not in seen for x in _key(pos_qi, pos_cell).tolist()],
-                        device=device, dtype=torch.bool)
+    seen = set(map(tuple, pose_identity(neg_qi, neg_cell).tolist()))
+    keep = torch.tensor(
+        [tuple(x) not in seen
+         for x in pose_identity(pos_qi, pos_cell).tolist()],
+        device=device, dtype=torch.bool)
     pos_qi, pos_cell = pos_qi[keep], pos_cell[keep]
 
     neg_poses = (_rotate_batch(prot.lig_ref, quats[neg_qi])
@@ -522,7 +555,15 @@ def generate_pool_reachable(
         torch.zeros(neg_poses.shape[0], device=device, dtype=torch.int16),
         torch.ones(pos_poses.shape[0], device=device, dtype=torch.int16),
     ])
-    return poses, origin
+    # The same `(rotation index, integer cell)` identity used just above to drop
+    # duplicates between the two provenances, returned as `(N, 4)` so a caller
+    # mining a second round can tell a genuinely new pose from one it already
+    # holds. Derived quantities cannot do this job: two different poses can
+    # share an (RMSD, DockQ, ELEC) triple, and one pose recomputed under a
+    # different chunking can differ in the last bits and look new.
+    pose_key = torch.cat([pose_identity(neg_qi, neg_cell),
+                          pose_identity(pos_qi, pos_cell)])
+    return poses, origin, pose_key
 
 
 def label_decoys(

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -66,7 +67,9 @@ import torch  # noqa: E402
 
 from zdock.atomtypes import charge_score as default_charge_score
 from zdock.atomtypes import iface_ij
-from zdock.dataset import generate_decoys, generate_pool_reachable, label_decoys
+from zdock.dataset import (POSE_IDENTITY_MISSING, generate_decoys,
+                           generate_pool_reachable,
+                           has_pose_identity, label_decoys)
 from zdock.evaluate import evaluate_ranking
 from zdock.geom import grid_shape
 from zdock.prep_cache import load_prepared
@@ -97,11 +100,30 @@ class Feats:
     ``sc`` is ``(F, 4)`` — the rho-independent PSC decomposition
     ``(c_pair, n_ss, n_sc, n_cc)`` — when the pool was built with
     ``--psc-decompose`` (the default), and ``(F,)`` for legacy caches.
+
+    ``pose_key`` is ``(F, 4)``: the pose's exact identity as
+    ``(rotation index, cell_x, cell_y, cell_z)``, which is what
+    `generate_pool_reachable` already uses to drop duplicates between its two
+    provenances. A later mining round needs it to tell a genuinely new pose
+    from one already in the pool. Derived quantities cannot: two different
+    poses can share an (RMSD, DockQ, ELEC) triple, and the same pose recomputed
+    under different chunking can differ in the last bits and be counted as new.
+    Four columns rather than one packed integer, because packing four values
+    into an int64 overflowed and silently reduced 1944 rotations to two
+    distinct keys. A row of -1 marks a pool built by a path that does not track
+    identity (the legacy ``generate_decoys`` recipe); de-duplication refuses to
+    run on those rather than guess.
+
+    Rotation *indices* are only comparable against the same rotation grid, so
+    they are only meaningful across rounds under ``--rot-set hopf``, which is
+    round-independent; ``random`` reseeds per round. The CLI enforces that.
     """
 
-    __slots__ = ("name", "sc", "T", "elec", "rmsd", "dockq", "origin", "prov")
+    __slots__ = ("name", "sc", "T", "elec", "rmsd", "dockq", "origin", "prov",
+                 "pose_key")
 
-    def __init__(self, name, sc, T, elec, rmsd, dockq, origin, prov=None):
+    def __init__(self, name, sc, T, elec, rmsd, dockq, origin, prov=None,
+                 pose_key=None):
         self.name = name
         self.sc = sc
         self.T = T
@@ -110,6 +132,9 @@ class Feats:
         self.dockq = dockq
         self.origin = origin
         self.prov = (torch.zeros_like(origin) if prov is None else prov)
+        self.pose_key = (torch.full((origin.shape[0], 4),
+                                    POSE_IDENTITY_MISSING, dtype=torch.int64)
+                         if pose_key is None else pose_key)
 
     @property
     def n(self) -> int:
@@ -125,7 +150,8 @@ class Feats:
                      self.rmsd.to(device, non_blocking=non_blocking),
                      self.dockq.to(device, non_blocking=non_blocking),
                      self.origin.to(device, non_blocking=non_blocking),
-                     self.prov.to(device, non_blocking=non_blocking))
+                     self.prov.to(device, non_blocking=non_blocking),
+                     self.pose_key.to(device, non_blocking=non_blocking))
 
     def cat(self, other: "Feats") -> None:
         self.sc = torch.cat([self.sc, other.sc])
@@ -135,11 +161,12 @@ class Feats:
         self.dockq = torch.cat([self.dockq, other.dockq])
         self.origin = torch.cat([self.origin, other.origin])
         self.prov = torch.cat([self.prov, other.prov])
+        self.pose_key = torch.cat([self.pose_key, other.pose_key])
 
     def index(self, idx) -> "Feats":
         return Feats(self.name, self.sc[idx], self.T[idx], self.elec[idx],
                      self.rmsd[idx], self.dockq[idx], self.origin[idx],
-                     self.prov[idx])
+                     self.prov[idx], self.pose_key[idx])
 
     def counts(self, dockq_thr: float) -> dict:
         pos = self.dockq >= dockq_thr
@@ -466,7 +493,7 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
     for attempt in range(args.oom_retries + 1):
         try:
             if args.pool == "reachable":
-                poses, prov = generate_pool_reachable(
+                poses, prov, pose_key = generate_pool_reachable(
                     prot, alpha=p.alpha, iface_ij_flat=p.iface_vec(), beta=beta0,
                     charge_score_lut=charge0, quats=quats,
                     ntop=args.mine_ntop, spacing=args.spacing,
@@ -483,6 +510,13 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
                 )
                 prov = torch.zeros(poses.shape[0], device=device,
                                    dtype=torch.int16)
+                # this recipe does not track pose identity; the sentinel
+                # makes de-duplication refuse rather than silently mis-count.
+                # Same (F, 4) shape as a real identity, so nothing downstream
+                # has to special-case the rank.
+                pose_key = torch.full((poses.shape[0], 4),
+                                      POSE_IDENTITY_MISSING,
+                                      device=device, dtype=torch.int64)
             alpha_d = torch.zeros((), device=device, dtype=dtype)
             iface_d = iface_ij(device=device, dtype=dtype, flat=True)
             # `psc_decompose` caches (c_pair, n_ss, n_sc, n_cc) instead of the
@@ -501,8 +535,8 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
             out = Feats(prot.name, sc.cpu(), T.cpu(), elec.cpu(),
                         rmsd.cpu(), dockq.cpu(),
                         torch.full((sc.shape[0],), round_idx, dtype=torch.int16),
-                        prov.cpu())
-            del poses, prov, sc, T, elec, rmsd, dockq
+                        prov.cpu(), pose_key.cpu())
+            del poses, prov, pose_key, sc, T, elec, rmsd, dockq
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             return out
@@ -523,6 +557,66 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
 # --------------------------------------------------------------------------
 # pool bookkeeping
 # --------------------------------------------------------------------------
+#: Version of the pose-identity schema stored in a pool cache. Bump whenever
+#: the meaning of `Feats.pose_key` changes: caches are keyed on it, so an old
+#: pool can never be silently reused by code that reads its identities
+#: differently. v2 = the (N, 4) `(rotation index, cell_x, cell_y, cell_z)`
+#: tensor; v1 (unversioned) had no identity, and the packed-int64 form that
+#: preceded it recorded only the rotation index's parity.
+POSE_KEY_SCHEMA = 2
+
+
+def _fresh_indices(cand: Feats, pool: Feats) -> tuple[torch.Tensor, int]:
+    """``(indices of cand poses not already in pool, how many were dropped)``.
+
+    Keyed on the pose's own identity (rotation index, translation cell),
+    never on derived quantities: two different poses can share an
+    (RMSD, DockQ, ELEC) triple, and the same pose recomputed under a
+    different chunking can differ in the last bits and look new. Without
+    this a pose the search returns in two rounds is stored twice and
+    silently carries double weight in the loss -- an implicit reweighting
+    that would be read as a mining effect.
+
+    The candidate's own duplicates are dropped too: `generate_pool_reachable`
+    de-duplicates its two provenances against each other but two rounds'
+    proposals are only compared here.
+    """
+    if not (has_pose_identity(cand.pose_key) and has_pose_identity(pool.pose_key)):
+        raise SystemExit(
+            "de-duplication needs pose identities, but this pool was built "
+            "by a path that does not record them (--pool decoys, or a "
+            "cache written before pose_key existed). Re-mine round 0 with "
+            "--pool reachable, or the round-1 pool will double-count every "
+            "pose the search returns twice.")
+    seen = set(map(tuple, pool.pose_key.tolist()))
+    keep, dup_within = [], 0
+    for i, row in enumerate(cand.pose_key.tolist()):
+        k = tuple(row)
+        if k in seen:
+            dup_within += 1
+            continue
+        seen.add(k)
+        keep.append(i)
+    return torch.tensor(keep, dtype=torch.long), dup_within
+
+
+def param_fingerprint(q: "Params") -> str:
+    """Short hash of the parameters a mining round actually searches with.
+
+    A round-0 pool is a function of the published parameters, so every seed
+    and every model share one cache. A round-1 pool is a function of what
+    round 0 *learned*, so it is specific to the seed, the dimension, the
+    margin and the number of steps. Nothing in the round-0 key captures
+    that. Hashing the searched parameters themselves makes it impossible to
+    pair a cached round-1 pool with the checkpoint that did not produce it,
+    however the run was invoked.
+    """
+    v = torch.cat([q.iface_vec().detach().cpu().reshape(-1).double(),
+                   q.alpha.detach().cpu().reshape(-1).double(),
+                   q.clash_weights().detach().cpu().reshape(-1).double()])
+    return hashlib.sha1(v.numpy().tobytes()).hexdigest()[:12]
+
+
 def cap_pool(f: Feats, cap: int, p: Params, beta, dockq_thr: float) -> Feats:
     """Keep every positive + the hardest (highest-scoring) current negatives."""
     if f.n <= cap:
@@ -652,6 +746,11 @@ def train_params(fit_feats, val_feats, p: Params, p0: Params, beta0,
     best_val = _val_loss(val_feats, p, p0, beta0, args, charge_dummy, device)
     best_params = p.clone()
     best_opt = copy.deepcopy(opt.state_dict())
+    # The minibatch stream is part of the state a later round resumes, so it
+    # has to be rewound to the accepted checkpoint along with the parameters
+    # and Adam -- otherwise "continue from the best checkpoint" continues its
+    # parameters but some later point of its data order.
+    best_gen = gen.get_state().clone()
     traj = [{"step": 0, "fit_loss": float("nan"), "val_loss": best_val,
              "grad_norm": float("nan"), "accepted": 1, **p.summary(p0)}]
     stale = 0
@@ -699,6 +798,7 @@ def train_params(fit_feats, val_feats, p: Params, p0: Params, beta0,
                 best_val = val
                 best_params = p.clone()
                 best_opt = copy.deepcopy(opt.state_dict())
+                best_gen = gen.get_state().clone()
                 stale = 0
             else:
                 stale += 1
@@ -708,7 +808,10 @@ def train_params(fit_feats, val_feats, p: Params, p0: Params, beta0,
     with torch.no_grad():
         for n in Params.NAMES:
             getattr(p, n).copy_(getattr(best_params, n))
+        if best_params.rowcol is not None and p.rowcol is not None:
+            p.rowcol.copy_(best_params.rowcol)
     opt.load_state_dict(best_opt)
+    gen.set_state(best_gen)
     at_bound = {"alpha_at_bound": bool(float(p.alpha) in (0.0, args.alpha_max)),
                 "rho_at_bound": bool(p.mode == "rho" and float(p.rho)
                                      in (args.rho_min, args.rho_max))}
@@ -891,6 +994,16 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rounds", type=int, default=1,
                     help="number of hard-negative mining rounds after round 0")
+    ap.add_argument("--mining-contract", choices=("hardneg", "none"),
+                    default="hardneg", dest="mining_contract",
+                    help="what a round > 0 does. 'hardneg': re-run the search "
+                         "with the current parameters and add the new "
+                         "NEGATIVES (the positive set stays frozen at round "
+                         "0). 'none': the matched-budget control -- skip "
+                         "mining entirely and spend the identical extra "
+                         "optimizer budget on the unchanged round-0 pool. "
+                         "Without the control, a round-0-to-round-1 difference "
+                         "confounds mining with 1500 more steps of training.")
     ap.add_argument("--master-ids", default="data/scaling/master_ids.txt",
                     dest="master_ids")
     ap.add_argument("--prep-cache", default="data/scaling/prep_cache", dest="prep_cache")
@@ -930,6 +1043,22 @@ def main() -> None:
                          "GPUs can build one round-0 pool in parallel")
     ap.add_argument("--mine-only", dest="mine_only", action="store_true",
                     help="mine and cache, then exit before training")
+    ap.add_argument("--resume-from", default="", dest="resume_from",
+                    help="path to a round<r>_optstate.pt. Restores that "
+                         "round's parameters AND Adam state and continues at "
+                         "round r+1, instead of retraining the earlier rounds. "
+                         "The mine and continue arms of a mining experiment "
+                         "must branch from ONE round-0 state; re-running "
+                         "round-0 training in each arm branches from two, and "
+                         "GPU reductions do not guarantee they are identical.")
+    ap.add_argument("--mine-from-ckpt", default="", dest="mine_from_ckpt",
+                    help="path to a round-0 checkpoint. Skips round 0 entirely "
+                         "and mines the LAST round with those parameters, so "
+                         "several GPUs can shard a round-1 pool without each "
+                         "re-running round-0 training. Use with --mine-only "
+                         "and --mine-shard. The cache key carries a hash of "
+                         "the loaded parameters, so a shard mined from the "
+                         "wrong checkpoint cannot be picked up by mistake.")
     ap.add_argument("--pool-cache", default="data/scaling/pool_cache",
                     dest="pool_cache", help="'' disables")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1051,6 +1180,20 @@ def main() -> None:
     ap.add_argument("--mine-cone", type=int, default=400, dest="mine_cone")
     ap.add_argument("--mine-ntop", type=int, default=1500, dest="mine_ntop")
     args = ap.parse_args()
+    if args.mine_from_ckpt and args.rounds < 1:
+        raise SystemExit(
+            "--mine-from-ckpt --rounds 0 would mine with TRAINED parameters "
+            "and write the result into the round-0 cache, whose key carries no "
+            "parameter fingerprint and is shared by every seed and model. Pass "
+            "--rounds 1 or higher.")
+    if args.rounds > 0 and args.mining_contract == "hardneg" \
+            and args.rot_set != "hopf":
+        raise SystemExit(
+            "a mining round de-duplicates poses by (rotation index, "
+            f"translation cell), and --rot-set {args.rot_set} reseeds its "
+            "rotations per round, so the same index is a different rotation in "
+            "round 1 than in round 0 and the keys are not comparable. Use "
+            "--rot-set hopf, which is round-independent.")
     if args.alpha_lr <= 0:
         args.alpha_lr = 1e-3 * args.alpha0
     if args.alpha_max <= 0:
@@ -1065,7 +1208,16 @@ def main() -> None:
     gen = torch.Generator().manual_seed(args.seed)
     torch.manual_seed(args.seed)
 
-    run_dir = Path(args.out_dir) / f"N{args.n_fit}_seed{args.seed}"
+    # Namespace the run directory by what distinguishes concurrent processes.
+    # Three sharded miners and the two arms of a mining experiment all have the
+    # same N and seed; without this they race on one split.json / skipped.jsonl
+    # and each arm overwrites the other's round-1 artefacts.
+    run_tag = f"N{args.n_fit}_seed{args.seed}"
+    if args.mine_only and args.mine_shard != "0/1":
+        run_tag += f"_mine{args.mine_shard.replace('/', 'of')}"
+    if args.rounds > 0 and not args.mine_only:
+        run_tag += f"_{args.mining_contract}"
+    run_dir = Path(args.out_dir) / run_tag
     run_dir.mkdir(parents=True, exist_ok=True)
     skip_log = open(run_dir / "skipped.jsonl", "w", buffering=1)
 
@@ -1100,6 +1252,7 @@ def main() -> None:
     print(f"  test complexes: {len(test_feats)}", flush=True)
 
     val_set = set(val_ids)
+    fit_set = set(fit_ids)
     pools: dict[str, Feats] = {}
     p0 = Params.initial(args, device, dtype)
     p = p0.clone()
@@ -1120,8 +1273,117 @@ def main() -> None:
                f"_nr{args.near_rot}_tc{args.trans_cells}"
                f"_a{args.alpha0}_rho{args.rho0}"
                f"_hd{int(args.exclude_homodimer)}_mv{args.max_grid_voxels}"
-               f"_bg{int(bool(args.exclude_bad_geometry))}")
+               f"_bg{int(bool(args.exclude_bad_geometry))}"
+               # Pose-identity schema. v1 pools carry no identity at all, and
+               # the packing before that recorded only the rotation index's
+               # parity. Reusing either under the same key would look like a
+               # cache hit and fail hours later, inside a round-1 absorb.
+               f"_pk{POSE_KEY_SCHEMA}")
+        if rnd > 0:
+            key += f"_p{param_fingerprint(p)}"
         return key
+
+    def resume_identity() -> dict:
+        """What must match for a resumed round to be the same experiment.
+
+        The Adam state alone does not say which model, loss or split produced
+        it, so resuming across a changed `--iface-mode`, `--lambda-margin` or
+        selection would silently continue a different run.
+        """
+        keys = ("iface_mode", "lambda_margin", "margin", "lambda_prior",
+                "iface_lr", "alpha_lr", "rho_lr", "freeze_psc", "psc_mode",
+                "loss_prov", "basin_temp", "batch_size", "dockq_thr",
+                "pool_cap", "n_fit", "seed", "spacing", "rot_set",
+                "hopf_nside", "mine_ntop", "near_rot", "trans_cells",
+                # continuation rule: two arms that stop by different rules are
+                # not matched, and nothing else here would notice
+                "min_steps", "epoch_passes", "patience", "min_delta",
+                "grad_clip", "alpha_max", "rho_min", "rho_max",
+                # what the pool and the score even are
+                "alpha0", "rho0", "psc_decompose", "pool")
+        return {"config": {k: getattr(args, k) for k in keys},
+                "split": hashlib.sha1(
+                    ("\n".join(fit_ids) + "|" + "\n".join(val_ids))
+                    .encode()).hexdigest()[:16]}
+
+    def restore_params(state: dict) -> None:
+        """Put a saved `Params.state_dict()` back into `p`, in place.
+
+        One implementation for both --resume-from and --mine-from-ckpt: if the
+        miner and the trainer restored a checkpoint even slightly differently
+        they would search with different parameters, and the fingerprint that
+        is supposed to prevent exactly that would be computed from the wrong
+        vector on one side.
+        """
+        with torch.no_grad():
+            p.alpha.copy_(state["alpha"].to(device=device, dtype=dtype))
+            if "rho" in state:
+                p.rho.copy_(state["rho"].to(device=device, dtype=dtype))
+            if "clash_weights" in state:
+                p.log_clash.copy_(state["clash_weights"]
+                                  .to(device=device, dtype=dtype).log())
+            if p.iface_mode == "full":
+                p.iface.copy_(state["iface"].to(device=device, dtype=dtype))
+            else:
+                # `iface_vec()` rebuilds the 144-vector from iface0 + rowcol, so
+                # restoring rowcol is what restores the table -- iface0 is p0's
+                # published table and is not written by training.
+                p.rowcol.copy_(state["rowcol"].to(device=device, dtype=dtype))
+        # Elementwise, not just the norm: a permuted or transposed table has the
+        # same norm and would search a different scoring function.
+        want_vec = state["iface"].to(device=device, dtype=dtype)
+        worst = float((p.iface_vec() - want_vec).abs().max())
+        if worst > 1e-9:
+            raise SystemExit(
+                f"restored IFACE table differs from the checkpoint by up to "
+                f"{worst:.3e} elementwise; the parametrisation does not "
+                f"round-trip and the mined pool would not be the one this "
+                f"checkpoint implies")
+        got = float((p.iface_vec() - p0.iface_vec()).norm())
+        print(f"restored from checkpoint: ||d_iface||={got:.4f} "
+              f"alpha={float(p.alpha):.4f} "
+              f"fingerprint={param_fingerprint(p)}", flush=True)
+
+    resume_round = -1
+    if args.mine_from_ckpt:
+        if not args.mine_only:
+            raise SystemExit("--mine-from-ckpt is for sharded miners: it skips "
+                             "round-0 training, so the parameters it would go "
+                             "on to train are not the ones it loaded. Pass "
+                             "--mine-only.")
+        if args.resume_from:
+            raise SystemExit("pass --resume-from or --mine-from-ckpt, not both")
+        restore_params(torch.load(args.mine_from_ckpt, map_location="cpu",
+                                  weights_only=True))
+    elif args.resume_from:
+        blob = torch.load(args.resume_from, map_location="cpu",
+                          weights_only=False)
+        want, have = blob.get("resume_identity"), resume_identity()
+        if want is None:
+            raise SystemExit(
+                f"{args.resume_from} predates the resume-identity record. "
+                f"Re-run round 0 with the current code.")
+        if want != have:
+            diff = [k for k in have["config"]
+                    if want["config"].get(k) != have["config"][k]]
+            raise SystemExit(
+                f"--resume-from was produced by a different run: "
+                + (f"config differs in {diff}. " if diff else "")
+                + ("the fit/validation split differs. "
+                   if want["split"] != have["split"] else "")
+                + "Resuming would continue someone else's experiment.")
+        restore_params(blob["param_state"])
+        optimizer_state = blob["optimizer_state"]
+        resume_round = int(blob["round"])
+        # Restore the minibatch stream too. Without it a resumed round replays
+        # round 0's sequence, so "continue for 1500 more steps" would not be the
+        # continuation it claims to be -- and the two arms would only agree
+        # because they replay the same wrong sequence.
+        if "generator_state" in blob:
+            gen.set_state(blob["generator_state"])
+        print(f"--resume-from {args.resume_from}: continuing after round "
+              f"{resume_round} with its Adam state and minibatch stream",
+              flush=True)
 
     def pool_cache_path(rnd: int) -> Path | None:
         """Where THIS process writes. Sharded miners must not share a file."""
@@ -1140,6 +1402,9 @@ def main() -> None:
         d = Path(args.pool_cache)
         return sorted(d.glob(f"{key}.pt")) + sorted(d.glob(f"{key}.*of*.pt"))
 
+    #: per-round mining bookkeeping, written into round<r>_metrics.json
+    mine_stats: dict[int, dict] = {}
+
     def absorb(pid: str, nf: Feats, rnd: int) -> None:
         """Install a freshly mined candidate set into the complex's pool."""
         if rnd == 0:
@@ -1148,12 +1413,38 @@ def main() -> None:
         # hard-*negative* mining: never re-add the near-native cone positives,
         # so the positive set stays frozen at round 0.
         neg = (nf.dockq < args.dockq_thr).nonzero(as_tuple=True)[0]
+        st = mine_stats.setdefault(
+            rnd, {"n_complexes": 0, "n_proposed_neg": 0, "n_duplicate_neg": 0,
+                  "n_added_neg": 0, "n_new_survived_cap": 0,
+                  "n_old_neg_evicted": 0, "pool_before": 0, "pool_after": 0})
         if neg.numel() == 0 or pid not in pools:
             return
+        cand = nf.index(neg)
+        keep, n_dup = _fresh_indices(cand, pools[pid])
+        st["n_complexes"] += 1
+        st["n_proposed_neg"] += int(neg.numel())
+        st["n_duplicate_neg"] += n_dup
+        st["pool_before"] += pools[pid].n
+        if keep.numel() == 0:
+            st["pool_after"] += pools[pid].n
+            return
         before_pos = int((pools[pid].dockq >= args.dockq_thr).sum())
-        pools[pid].cat(nf.index(neg))
+        old_neg_keys = set(map(tuple, pools[pid].pose_key[
+            pools[pid].dockq < args.dockq_thr].tolist()))
+        pools[pid].cat(cand.index(keep))
+        st["n_added_neg"] += int(keep.numel())
         pools[pid] = cap_pool(pools[pid], args.pool_cap, p.cpu(),
                               beta0.detach().cpu(), args.dockq_thr)
+        # The cap does not just refuse new poses, it can evict old ones -- so
+        # `pool_after - pool_before` is not the number of new poses that
+        # survived. Count each side directly.
+        after_keys = set(map(tuple, pools[pid].pose_key.tolist()))
+        st["n_new_survived_cap"] += sum(
+            1 for k in map(tuple, cand.pose_key[keep].tolist())
+            if k in after_keys)
+        st["n_old_neg_evicted"] += sum(
+            1 for k in old_neg_keys if k not in after_keys)
+        st["pool_after"] += pools[pid].n
         after_pos = int((pools[pid].dockq >= args.dockq_thr).sum())
         assert after_pos == before_pos, (
             f"{pid}: positives changed {before_pos} -> {after_pos} "
@@ -1193,47 +1484,153 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    for rnd in range(args.rounds + 1):
+    # A sharded miner already holds the parameters round 0 would have produced,
+    # so it goes straight to the round it was asked to mine; --resume-from
+    # picks up after the round its checkpoint recorded.
+    rounds_to_run = ([args.rounds] if args.mine_from_ckpt
+                     else list(range(resume_round + 1, args.rounds + 1)))
+    if not rounds_to_run:
+        raise SystemExit(
+            f"nothing to do: --resume-from is at round {resume_round} and "
+            f"--rounds is {args.rounds}. Raise --rounds.")
+
+    def preflight_identities(pool_map, ids, where: str) -> None:
+        """Fail before the expensive part if a later round could not dedup.
+
+        Placed at every entry point that precedes hours of mining -- Phase A's
+        round 0, and a sharded miner's start -- because the alternative is
+        discovering it in Phase C's first `absorb`, after the mining is spent.
+        """
+        if args.pool != "reachable":
+            return
+        bad = [q for q in ids
+               if q in pool_map and not has_pose_identity(pool_map[q].pose_key)]
+        if bad:
+            raise SystemExit(
+                f"{len(bad)} of {len(ids)} round-0 pools carry no pose "
+                f"identity (e.g. {bad[0]}), so a later round could not tell a "
+                f"new pose from one it already holds. Re-mine round 0 with the "
+                f"current code (cache schema v{POSE_KEY_SCHEMA}); {where}.")
+        missing = [q for q in ids if q not in pool_map]
+        if missing:
+            raise SystemExit(
+                f"{len(missing)} of {len(ids)} round-0 pools are absent "
+                f"(e.g. {missing[0]}); {where}.")
+
+    if args.mine_from_ckpt and args.pool == "reachable":
+        # This worker mines round > 0 without ever loading the round-0 pool, so
+        # nothing else here would notice that Phase C will not be able to use
+        # what it produces. Read the cache once and check, before hours of FFT.
+        r0: dict[str, Feats] = {}
+        for src in pool_cache_read(0):
+            blob = torch.load(src, map_location="cpu", weights_only=True)
+            for d in blob["pools"]:
+                r0[d["name"]] = Feats(
+                    d["name"], d["sc"], d["T"], d["elec"], d["rmsd"],
+                    d["dockq"], d["origin"], d["prov"], d.get("pose_key"))
+        preflight_identities(
+            r0, fit_ids,
+            "a sharded miner refuses to spend hours on a pool round 1 could "
+            "not absorb")
+        print(f"miner preflight: {len(fit_ids)} round-0 pools carry pose "
+              f"identities", flush=True)
+        del r0
+
+    if resume_round >= 0:
+        # Skipping round 0 also skips the read that fills `pools`, and a later
+        # round trains on `pools` -- so without this the resumed run would fit
+        # on an empty set while every assertion about ids still passed.
+        for src in pool_cache_read(0):
+            blob = torch.load(src, map_location="cpu", weights_only=True)
+            for d in blob["pools"]:
+                pools[d["name"]] = Feats(d["name"], d["sc"], d["T"], d["elec"],
+                                         d["rmsd"], d["dockq"], d["origin"],
+                                         d["prov"], d.get("pose_key"))
+        missing = [q for q in sel if q not in pools]
+        if missing:
+            raise SystemExit(
+                f"--resume-from needs the round-0 pool, but {len(missing)} of "
+                f"{len(sel)} complexes are absent from {args.pool_cache}. "
+                f"Re-run round 0 with the same --pool-cache first.")
+        preflight_identities(pools, sel, "checked when resuming")
+        print(f"resumed run: loaded {len(pools)} round-0 pools from cache",
+              flush=True)
+    for rnd in rounds_to_run:
         t_round = time.time()
         targets = sel if rnd == 0 else fit_ids
+        if rnd > 0 and args.mining_contract == "none":
+            # Matched-BUDGET control: same checkpoint, same Adam state, same
+            # minibatch stream, same step budget and stopping rule, same pool.
+            # Not "matched compute" -- `--patience` can stop the two arms at
+            # different `steps_run`. Whatever this round changes is what further
+            # optimisation alone buys, which is what the mining arm must beat.
+            targets = []
+            print(f"  round {rnd}: --mining-contract none, pool unchanged "
+                  f"({len(fit_ids)} fit complexes), training only", flush=True)
         t_mine = time.time()
 
         cpath = pool_cache_path(rnd)
         n_from_cache = 0
-        sources = pool_cache_read(rnd) if rnd == 0 else []
+        # A round > 0 cache holds the RAW mined candidate sets, not pools: the
+        # de-duplication, the positive freeze and the cap all belong to
+        # `absorb`, and running them here as well would apply them twice.
+        mined_raw: dict[str, Feats] = {}
+        sources = pool_cache_read(rnd) if targets else []
         if sources:
             for src in sources:
                 blob = torch.load(src, map_location="cpu", weights_only=True)
                 for d in blob["pools"]:
-                    pools[d["name"]] = Feats(d["name"], d["sc"], d["T"],
-                                             d["elec"], d["rmsd"], d["dockq"],
-                                             d["origin"], d["prov"])
-            # Mine only what the cache lacks. A changed selection (a new
-            # exclusion list, a different N) overlaps heavily with the old one,
-            # and re-mining the shared part costs hours for nothing. Entries the
-            # current selection no longer wants stay in the cache but are simply
-            # not read into fit/val below.
-            n_from_cache = sum(1 for p in targets if p in pools)
-            targets = [p for p in targets if p not in pools]
-            print(f"  round 0: {n_from_cache} pools reused from "
+                    f = Feats(d["name"], d["sc"], d["T"], d["elec"],
+                              d["rmsd"], d["dockq"], d["origin"], d["prov"],
+                              d.get("pose_key"))
+                    tgt = pools if rnd == 0 else mined_raw
+                    if f.name in tgt and not torch.equal(
+                            tgt[f.name].pose_key, f.pose_key):
+                        raise SystemExit(
+                            f"{f.name} appears in two cache files for round "
+                            f"{rnd} with different poses. Silently keeping the "
+                            f"last one would make the pool depend on glob "
+                            f"order. Delete the stale shard.")
+                    tgt[f.name] = f
+            for pid, f in mined_raw.items():
+                if pid in fit_set:
+                    absorb(pid, f, rnd)
+        # Only what the cache lacks is mined. A changed selection (a new
+        # exclusion list, a different N) overlaps heavily with the old one, and
+        # re-mining the shared part costs hours for nothing. Entries the
+        # current selection no longer wants stay in the cache but are simply
+        # not read into fit/val below.
+        #
+        # Shard FIRST, then drop what is already cached. The other order makes
+        # a shard's membership depend on what happened to be cached when it
+        # started, so a worker launched late, or re-run after a failure, owns a
+        # different set and the union stops covering the fit list exactly once.
+        # At round 0 the pool is seed-independent so sharding is pure
+        # wall-clock; at round > 0 it is a function of the trained parameters,
+        # which is why the cache key carries their fingerprint -- a shard mined
+        # from a different checkpoint lands in a different file and can never
+        # be silently mixed in.
+        si, sn = (int(x) for x in args.mine_shard.split("/"))
+        if sn > 1 and targets:
+            targets = targets[si::sn]
+            print(f"  round {rnd}: mining shard {si}/{sn} -> {len(targets)} "
+                  f"complexes (before removing cached)", flush=True)
+        if sources:
+            have = pools if rnd == 0 else mined_raw
+            n_from_cache = sum(1 for q in targets if q in have)
+            targets = [q for q in targets if q not in have]
+            print(f"  round {rnd}: {n_from_cache} candidate set(s) reused from "
                   f"{len(sources)} cache file(s), {len(targets)} to mine",
                   flush=True)
-
-        # Split the remaining work so several GPUs can mine disjoint parts of
-        # one round-0 pool. Each writes its own cache file; a later run picks
-        # them all up. The round-0 pool is seed-independent, so this is pure
-        # wall-clock, not a change of experiment.
-        si, sn = (int(x) for x in args.mine_shard.split("/"))
-        if sn > 1:
-            targets = targets[si::sn]
-            print(f"  round 0: mining shard {si}/{sn} -> {len(targets)} "
-                  f"complexes", flush=True)
         failed: list[tuple[str, dict]] = []
         for ci, pid in enumerate(targets):
             nf, meta = try_mine(pid, rnd)
             if nf is None:
                 failed.append((pid, meta))
+            elif rnd == 0:
+                absorb(pid, nf, rnd)
             else:
+                mined_raw[pid] = nf
                 absorb(pid, nf, rnd)
             if (ci + 1) % 50 == 0:
                 el = time.time() - t_mine
@@ -1268,6 +1665,8 @@ def main() -> None:
                           f"(n_rec={meta2.get('n_rec')} n_lig={meta2.get('n_lig')})",
                           flush=True)
                 else:
+                    if rnd > 0:
+                        mined_raw[pid] = nf
                     absorb(pid, nf, rnd)
                     skip_log.write(json.dumps(
                         {"round": rnd, "id": pid, "rescued": True,
@@ -1277,22 +1676,30 @@ def main() -> None:
                     print(f"    [{pid}] rescued at rot_chunk=1", flush=True)
         n_skipped_total += n_skipped
         mine_seconds = time.time() - t_mine
-        if targets or n_from_cache == 0:
-            if rnd == 0 and cpath is not None:
+        if cpath is not None and (targets or n_from_cache == 0):
+            # round 0 caches the pools themselves; a later round caches the raw
+            # candidate sets it mined, keyed by the parameters that found them.
+            store = pools.values() if rnd == 0 else \
+                [mined_raw[p] for p in targets if p in mined_raw]
+            if rnd == 0 or store:
                 torch.save({"n_skipped": n_skipped,
                             "pools": [{"name": f.name, "sc": f.sc, "T": f.T,
                                        "elec": f.elec, "rmsd": f.rmsd,
                                        "dockq": f.dockq, "origin": f.origin,
-                                       "prov": f.prov}
-                                      for f in pools.values()]}, cpath)
-                print(f"  round 0: cached {len(pools)} pools -> {cpath}",
-                      flush=True)
+                                       "prov": f.prov, "pose_key": f.pose_key}
+                                      for f in store]}, cpath)
+                print(f"  round {rnd}: cached {len(list(store))} candidate "
+                      f"set(s) -> {cpath}", flush=True)
 
         if args.mine_only:
             print(f"  --mine-only: wrote {cpath}; stopping before training",
                   flush=True)
             return
 
+        if rnd == 0:
+            # Phase A checks what Phase B and C will depend on, while it is
+            # still a second of start-up rather than hours of spent mining.
+            preflight_identities(pools, sel, "checked after mining round 0")
         fit_pools = [pools[p] for p in fit_ids if p in pools]
         val_pools = [pools[p] for p in val_ids if p in pools]
         assert not (set(f.name for f in fit_pools) & set(f.name for f in val_pools))
@@ -1379,6 +1786,11 @@ def main() -> None:
             "rejected_mean_val_loss": (sum(r["val_loss"] for r in rejected)
                                        / len(rejected)) if rejected else None,
             "pool_mean": pool_stats,
+            "mining_contract": args.mining_contract,
+            # How much of what the search proposed this round was actually new,
+            # and how much of that survived the cap. A round whose proposals are
+            # mostly duplicates has not mined anything, however long it ran.
+            "mining": mine_stats.get(rnd),
             "test_success_rmsd": {str(k): sr[k] for k in KS},
             "test_success_dockq": {str(k): sd[k] for k in KS},
             "test_mean_best_dockq_at1": t1,
@@ -1394,8 +1806,24 @@ def main() -> None:
                     **p.state_dict(),
                     "val_loss": stats["best_val_loss"], "config": vars(args)},
                    run_dir / f"round{rnd}_ckpt.pt")
+        # Separate file: the optimizer state is large, and every consumer of the
+        # checkpoint so far (compare_conditions, the analysis scripts) loads it
+        # with weights_only=True and wants only the parameters. Saving it lets a
+        # later round resume this exact state instead of retraining round 0 --
+        # which matters because the mine and continue arms must branch from ONE
+        # round-0 state, not from two independent re-runs of it.
+        torch.save({"round": rnd, "seed": args.seed,
+                    "optimizer_state": optimizer_state,
+                    "param_state": p.state_dict(),
+                    # Enough identity that resuming with a different model,
+                    # loss or split fails loudly instead of producing a number.
+                    "resume_identity": resume_identity(),
+                    "generator_state": gen.get_state()},
+                   run_dir / f"round{rnd}_optstate.pt")
 
-        tag = "round 0 (no mining)" if rnd == 0 else f"round {rnd} (mined)"
+        tag = ("round 0 (no mining)" if rnd == 0
+               else f"round {rnd} (mined)" if args.mining_contract == "hardneg"
+               else f"round {rnd} (matched-budget control, no mining)")
         print("=" * 62)
         print(f"{tag} | N_fit={len(fit_pools)} | mean pool={pool_stats['n']:.0f} "
               f"(pos {pool_stats['n_pos']:.0f} "

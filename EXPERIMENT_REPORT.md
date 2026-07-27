@@ -3600,6 +3600,462 @@ signed-rankでは支持されるが、**変化した約12〜15%の複合体に�
 - working choiceはvalidation AUCで事前選択したfull+m5。ただしvalidation/test shiftと
   反復利用TESTのため、確定モデルではなく次段階の候補とする。
 
+#### 5.14.14 mining round 1 の契約と評価設計（2026-07-27、実行前）
+
+**コード確認による訂正。** round 0 はfit+validationの `sel` を採掘するが、
+round 1以降のtargetは `fit_ids` のみである。したがって `absorb()` はvalidation poolへ
+触れず、validationとTESTはround 0で凍結される。round間のval loss、val success@1/AUC、
+固定TEST指標は同じ候補集合上で比較可能である。
+
+**採用契約: A（hard-negative only）をprimaryとする。** 研究上の問いは
+「hard-negative miningが効くか」なので、新positiveも取り込むBは
+on-policy pool refresh/self-trainingという別介入になる。Cはround-0 recallに応じて
+教師更新規則が複合体ごとに変わり、A/Bのどちらの効果か解釈しにくいので採用しない。
+Aでは探索由来positiveをround 0に固定し、新パラメータで見つかったnegativeだけを
+replay poolへ加える。72/220件が勾配ゼロのままという不利益は隠さず、
+「fixed-target hard-negative mining」の限界として報告する。
+
+ただし単純なround 0 checkpoint対round 1 checkpointは、miningに加えて
+**追加1500 optimizer step**も異なる。mining効果の対照は以下のmatched branchとする:
+
+- `continue`: round-0 poolのまま、同じround-0 checkpoint/Adam stateから1500 step継続。
+- `mine`: 学習後パラメータでnegativeを再採掘し、同じcheckpoint/Adam stateから
+  同じ1500 step継続。
+
+primary contrastは `mine vs continue`。`mine vs round0` はpipeline全体の変化として
+secondaryにする。seed、minibatch順、step数、early-stopping rule、pool capを揃える。
+同一poseの再出現で重みが暗黙に増えないよう、round間dedupまたは少なくとも
+unique/survival率の記録が必要である。
+
+**評価。**
+
+- checkpoint/round選択: 凍結validationの共通AUCを主に用いる
+  （success@1は55件で解像度ゼロ）。val lossは同一目的・同一poolなので比較可能だが、
+  prior込みであるため最適化診断とする。
+- 科学的primary endpoint: 同一Hopf grid・全249件の
+  **end-to-end success@1**について `mine vs continue` を複合体paired McNemarで比較。
+  fixed TEST pool 236件のsuccess@1/AUC/first-hitは、共通候補上のreranking機構を示す
+  secondary endpoint。
+- TESTでround数を選ばない。round 0/1とcontinue/mineの比較を事前固定し、
+  TESTは1回の最終比較に使う。
+
+**Bを将来別実験として行う場合のeasy-positive drift診断。**
+
+- roundごとのsearch recall、勾配を出す複合体数、新規に救済された複合体数。
+- old/new positive数、DockQ quantile、score/rank、first-hit、basin softmax mass。
+- 新positiveのunique pose/basin数とround間重複率、cap後のprovenance別survival率。
+- old/new positiveがmargin anchor（最低positive）になる割合とloss/gradient寄与。
+- positive:random-negative:hard-negative比、複合体ごとの重み。
+- frozen validationとend-to-end TESTの指標。train recallだけ上がり外部指標が上がらない
+  状態をself-reinforcementと判定する。
+
+現 `cap_pool()` はpositiveを全件残すため、Bではpositive重複・増殖によりcapを実質超過し、
+loss weightingがroundごとに変わりうる。Bの前にdedupとpositive quota/balanced samplingの
+契約が必要である。
+
+**round数。** primary実験は**1 roundで止めて評価**する。改善した場合だけ、
+validation規則によりround 2をsecondary learning-curveとして追加する。
+新規unique hard negativeのcap生存率、validation AUC、parameter driftが飽和したら停止し、
+初回から4 roundを回して最良TEST roundを選ばない。
+
+**結論。** A + matched no-mining continuationが、hard-negative miningの増分を最も
+狭く識別する。Bは72件救済という別の価値を持つが、positive更新を含む別実験として
+Aの結果後に行う。
+
+#### 5.14.15 mining round 1 実装レビュー（2026-07-27、production実行前）
+
+**問い。** §5.14.14 の `hardneg` 対 matched no-mining continuation を、
+同一round-0 parameter/Adam stateから分岐し、round-1採掘を安全にシャード・再利用できる
+実装になっているかを、未コミット差分について静的レビューした。対象は
+`scripts/run_pinder_scaling.py` の `--mining-contract`、`--mine-from-ckpt`、
+`--resume-from`、raw cache、`absorb()`、dedup/cap/統計である。予定条件は
+full 144 + margin 0.5、`--freeze-psc --loss-prov search`、fit/validation/TEST =
+220/55/249、seed 0/1/2、round 1のみであり、本節では新しい学習・TEST評価はしていない。
+
+**検証。**
+
+```bash
+git diff -- scripts/run_pinder_scaling.py
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run pytest -q tests/test_scaling_streaming.py
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run python -m py_compile \
+  scripts/run_pinder_scaling.py
+```
+
+既存テストは20 passed, 1 skipped（66.58 s）、構文検査も成功した。ただし既存テストは
+新しいresume/shard/dedup経路を直接検証しない。smoke runでの
+12,205 proposed negatives中4,913（40%）がround-0との完全一致だったという数値は
+実装者の実測であり、本レビューでは再実行していない。
+
+**静的レビューで確認したこと。** intended workflow（Hopf、full、PSC凍結、
+`--rounds 1`）に限れば、Phase Bはround-1 raw candidatesだけを保存し、Phase Cは
+round-0 poolを復元してから`absorb`を一度だけ適用する。resume round番号は
+round-0 optstateから1へ進み、保存されたbest parameterと対応するbest Adam stateも
+復元される。validation poolはround 0のままなので、mine/continue間で共通である。
+
+**production前に直すべき点。**
+
+1. `(rmsd, DockQ, ELEC)` はpose identityではない。別poseの派生量衝突と、同一poseの
+   浮動小数再計算差によるfalse negativeの両方がありうる。しかも現在の`keep`は
+   candidate内で`seen`を更新しない。`generate_pool_reachable()`が既に同一性として使う
+   `(rotation index, integer translation cell)`を`Feats`とcacheまで伝播する。Hopf以外では
+   rotation indexだけでなくrotation/quaternion gridのidentityも必要である。
+2. `n_survived_cap += max(pool_after - pool_before, 0)` はnew poseの生存数ではない。
+   capが満杯ならnew negativeがold negativeを置換しても0になり、cap未満からの切詰めでも
+   oldの退場分だけ過小評価する。`origin == rnd`（かexact pose key）をcap後に直接数え、
+   old-negative evictionも別に記録する。
+3. `--mine-from-ckpt --rounds 0`を拒否していない。この場合、学習済みparamで採掘した
+   poolをfingerprintなしの共有round-0 cacheへ書ける。またrun directoryは
+   `N<n>_seed<s>`だけなので、3 minerが同じ`split.json`/`skipped.jsonl`を競合上書きし、
+   mine/continueも同じ`--out-dir`ならround-1成果物を上書きする。round>0を強制し、
+   Phase A/B/Cと両armのartifact directoryを分離または契約名で名前空間化する。
+4. optstateにはconfig、split/cache identity、minibatch generator stateがない。
+   現状でも同じCLI seedで両armを新規起動すれば両者のbatch順は一致するが、
+   uninterrupted continuationではなくround-0の乱数列を再生する。さらに誤った
+   margin/iface mode/prior/splitでのresumeを検出できない。source config/fingerprint、
+   fit/val ID hash、generator stateを保存・照合し、effective 144-vectorをnormだけでなく
+   elementwiseにcheckpointと照合する。
+5. cache済みIDを除いてから`targets[shard::n]`を取るため、遅れて開始したworkerや
+   failed shardの再実行ではshard所有集合が変わる。最初に全fit IDsをshard分割し、
+   その後そのshard内のcached IDsを除く。複数cacheに同じPIDがあれば、現在は後の値で
+   silent overwriteするため、一致確認またはerrorにする。
+
+**解釈上の限定。** `patience`によるearly stoppingがあるので両armは同一
+**step budget/rule**だが、`steps_run`まで同じとは限らない。「matched-compute」と呼ぶなら
+固定stepで走らせる必要があり、現状はmatched-budget controlと書く方が正確である。また
+capはnew hard negativesを追加するだけでなくold negativesを置換するため、estimandは
+「fixed-positive hard-negative pool refresh」の増分である。なお汎用モードでは
+`mine_complex()`が学習した`rho`をsearchへ渡していないが、今回の
+`--freeze-psc`条件には影響しない。
+
+**結論。** Phase A/B/Cの中心的な分岐設計とraw-cache/`absorb`の責務分離は妥当である。
+しかしpose ID、cap survival統計、round-0 cache汚染防止、artifact分離はproduction run前の
+blockerとする。修正後、(i) exact dedup、(ii) cap満杯でのnew/old survivor、
+(iii) 3 shardの和がfit 220を重複なく覆うこと、(iv) resume直後のparameter/Adam/batch順が
+両armで一致することを小規模回帰テストで確認してから3 seedを開始する。
+
+#### 5.14.16 mining round 1 修正の再レビュー（2026-07-27、production実行前）
+
+**問いと範囲。** §5.14.15の5指摘に対する未コミット修正を
+`scripts/run_pinder_scaling.py`、`src/zdock/dataset.py`、
+`tests/test_scaling_streaming.py`について再レビューした。新しい学習、採掘、TEST評価は
+行っていない。予定条件とleakage controlは§5.14.14〜§5.14.15から不変である。
+
+**検証。**
+
+```bash
+git diff -- scripts/run_pinder_scaling.py src/zdock/dataset.py \
+  tests/test_scaling_streaming.py
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run pytest -q \
+  tests/test_scaling_streaming.py
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run python - <<'PY'
+import torch
+big = 1 << 21
+cell = torch.zeros(3, 3, dtype=torch.int64)
+qi = torch.tensor([0, 1, 2], dtype=torch.int64)
+c = cell + big // 2
+key = ((qi * big + c[:, 0]) * big + c[:, 1]) * big + c[:, 2]
+print(key.tolist(), bool(key[0] == key[2]))
+PY
+```
+
+対象テストは**27 passed, 1 skipped**（41.32 s）だった。差分中の新規
+`test_*`関数は7本であり、「28 passed」ではなく28 collected中1 skippedに相当する。
+全suiteは本レビューでは実行していない。
+
+**前回指摘への対応状況。**
+
+- cap後のnew survivorとold-negative evictionの直接集計、`rounds 0`汚染のCLI拒否、
+  intended 3-shard/2-armのartifact分離、cache除去前のshard所有集合固定、
+  duplicate PIDの拒否、matched-budgetへの改称は意図どおりである。
+- effective 144-vectorのelementwise照合と、同じoptstateからのAdam/minibatch state復元も
+ 方向は正しい。ただし下記のcheckpoint整合性の限定が残る。
+- pose identityをdatasetから`Feats`、index/cat/device移動、cacheまで伝播した設計は正しいが、
+  **identityのpacking自体が壊れている**。
+
+**production blocker 1: int64 pose keyのoverflow/collision。**
+`_key()`は3 translation cellに各21 bitを使った後にrotation indexも左から追加するため、
+必要幅が63 bitを超える。実測では同一cellに対する`qi=[0,1,2]`が
+`[4611688217451692032, -4611683819403083776, 4611688217451692032]`となり、
+`qi=0`と`qi=2`が衝突した。さらに有効なodd rotationのkeyが負になるため、
+`_fresh_indices()`の`pose_key < 0`判定はidentity欠損と誤認してround 1を停止する。
+scalar packingをやめ、`(qi, cell_x, cell_y, cell_z)`の`(N,4)`整数tensorをそのまま保存し、
+dedup時だけtuple集合にするのが安全である。少なくとも
+「同一cell・rotation 0/1/2が全てdistinctかつvalid」の回帰テストが必要である。
+
+**production blocker 2: cache schemaが更新されていない。** 新しい`pose_key`を持たない
+旧round-0/raw cacheは同じcache keyで再利用され、`Feats`内では`-1`になる。Phase Aの
+`--rounds 0`ではこれを検出せずcheckpointを作れ、長時間のPhase B後、Phase Cの
+`absorb()`で初めて停止しうる。cache keyへpose-identity schema versionを入れて旧cacheと
+分離し、Phase AまたはPhase B前のpreflightで全round-0 poolのidentityを検証する。
+
+**非blockerだが残る契約/テスト不足。**
+
+1. `train_params()`はbest parameter/Adam stateへ巻き戻す一方、generator stateは
+   最終`steps_run`時点を保存する。両arm間では同一なのでprimary contrastは壊さないが、
+   「best checkpointからの厳密な継続」ではない。accepted時にbest generator stateも保存して
+   一緒に戻すか、この意味を明記する。
+2. `resume_identity`には`min_steps`、`epoch_passes`、`patience`、`min_delta`、
+   `grad_clip`、parameter bounds、`alpha0/rho0`、`psc_decompose`、`pool`がない。
+   arm間で異なるcontinuation ruleを誤指定しても検出できるよう追加する。
+3. cap testは`cap_pool()`の現象を示すだけで、production `absorb()`が
+   `n_new_survived_cap=5`、`n_old_neg_evicted=5`を記録することを検証していない。
+   shard testも単純なlist slicingのみでcached IDsを含む実装経路を呼ばない。
+   resume identity/generator、CLI guards、cache conflictにも直接テストがない。
+4. intended workflowの3-shard minerは分離されたが、`--mine-from-ckpt`を
+   `--mine-shard 0/1`で使う場合はPhase Aと同じrun directoryになる。minerであること自体を
+   run tagへ入れる方が安全である。
+
+**結論。** 前回の5指摘のうち2、3、5は本体として解消し、4もprimary contrastを
+matchedにする方向で改善した。しかしscalar pose-key overflowとcache schema非更新は
+production blockerである。両者を直して新規round-0 cacheを作り、actual
+`generate_pool_reachable()`由来keyのuniqueness/round間一致をsmoke確認するまで、
+Phase Bの長時間採掘は開始しない。
+
+#### 5.14.17 mining round 1 修正の第3回レビュー（2026-07-27、production実行前）
+
+**問いと範囲。** §5.14.16のblocker 2点、checkpoint整合性、低次元best-checkpoint
+巻き戻し修正を再レビューし、overflowが§5.14.12までの既報結果へ影響する経路を確認した。
+新しい学習・TEST評価は実行していない。実装者が進行中の全suiteとは別に次を実行した。
+
+```bash
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run pytest -q \
+  tests/test_scaling_streaming.py
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run python -m py_compile \
+  scripts/run_pinder_scaling.py src/zdock/dataset.py
+```
+
+結果は**29 passed, 1 skipped**（20.54 s）で、構文検査も成功した。「30 passed」ではなく
+30 collected中1 skippedである。全suiteの結果は本節にはまだ含めない。
+
+**解消を確認した点。**
+
+- scalar packingを廃止した`(qi,cx,cy,cz)`の`(F,4)`表現、tuple dedup、cache schema
+  `_pk2`、candidate内部dedup、cap survivor/old eviction集計は方向・実装とも妥当である。
+- `best_gen`をaccepted parameter/Adamと同時に保存・巻き戻すため、保存optstateは
+  同一checkpoint時点の3状態を持つ。resume identityへ追加したoptimizer/stopping/pool設定も
+  intended workflowを十分に拘束する。
+- 低次元modeでは`Params.NAMES`ループ後に`rowcol`を明示的にbest stateへcopyしており、
+  巻き戻しバグは修正されている。既報12本で最終validation checkがすべてaccepted
+  （`last_accepted_gap=0`）なら、旧コードでもreturned rowcolがbestと一致するため、
+  実験1の数値へ影響ゼロという判定は妥当である。
+
+**production blocker: sentinel判定がvalidな負translationを拒否する。**
+pose identityのtranslation cellは原点をまたぐため`cx/cy/cz < 0`が正常に起こる。しかし
+`_fresh_indices()`とround-0 preflightは`(pose_key < 0).any()`をidentity欠損判定に使うため、
+有効な`(qi, -1, 0, 0)`も拒否する。欠損rowは4成分すべて`-1`だが、有効rowは
+`qi >= 0`なので、`pose_key[:,0] < 0`（shape `(F,4)`もassert）で判定できる。
+legacy経路のsentinelも現在の`(F,)`ではなく`(F,4)`へ統一し、負cellを含む回帰テストを置く。
+
+**preflightのタイミング。** 条件は`rnd == 0 and args.rounds > 0`だが、予定Phase Aは
+`--rounds 0`、Phase Bはround 0をskipする。したがって「Phase Aで落ちる」は現workflowでは
+成立しない。schema versionにより旧cache混入は防げるが、identity破損やround-0 pool欠損を
+長時間のPhase B前に検出する目的は未達である。round-0 reachable poolでは無条件に検証するか、
+Phase B開始時に対応するround-0 cacheのfit 220件・identity shape/validityをpreflightする。
+
+**overflowの過去結果への影響。** `_key()`の誤dedupはsearch結果を生成した後、
+列挙由来`pos_*`をsearch poseと照合する箇所だけにあり、search pose自体は削除しない。
+したがって以下には原理上影響しない:
+
+- `--loss-prov search`のfit/validation lossと、それによるcheckpoint選択。
+- `--prov search`へ限定した固定pool success/AUC/first-hit。
+- 列挙を使わない全249件end-to-end再探索。
+
+一方、all-provenanceのpool size、positive数、reachable-positive ceiling、coverage、
+pooled success/AUCは影響対象であり、同じ数値を無条件に保存してはならない。実測1複合体の
+212→216（4 pose、1.9%）は列挙側の影響量であって、search-only不変性の直接検証ではない。
+集計中の12複合体でold/newの`prov==0`についてpose/orderと
+`sc,T,elec,rmsd,DockQ`をchecksum比較し、既存checkpointをnew pool上で
+`--prov search`再評価して同値を確認する。これが一致すれば§5.14.12の主要結論は維持できる。
+
+**テストの限定。** 1944回転testはproductionのnested `_key()`を呼ばず同じ`torch.cat`を
+test内で再実装し、return-contract testもsource文字列検査である。今回の実装は読んだ限り
+正しいが、将来の回帰防止にはkey構築をmodule-level helperへ出して直接testする方が強い。
+
+**結論。** overflowとcache version自体は解消したが、負translationの誤拒否が新しい
+production blockerである。sentinel判定・preflight時点を直し、fit 220/val 55の新round-0
+cache完全性、12複合体search-only同値、全suite成功を確認してからPhase Bを開始する。
+
+#### 5.14.18 mining round 1 修正の第4回レビュー（2026-07-27、production実行前）
+
+**問いと範囲。** §5.14.17の負translation sentinelとpreflight timingの修正を再レビューし、
+overflowの既報結果への影響を直接検証する方法、およびPhase B開始条件を確定した。
+新しい学習・TEST評価は実行していない。
+
+```bash
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run pytest -q \
+  tests/test_scaling_streaming.py
+UV_CACHE_DIR=/tmp/ddock-uv-cache uv run python -m py_compile \
+  scripts/run_pinder_scaling.py src/zdock/dataset.py
+```
+
+対象テストは**31 passed, 1 skipped**（16.79 s）、構文検査も成功した。したがって
+「32 passed」ではなく32 collected中1 skippedである。全suiteは本レビューでは未確認。
+
+**blocker解消を確認。**
+
+- productionとtestが共通の`pose_identity(qi, cell)`を使い、scalar overflowはない。
+- `has_pose_identity()`はshape `(F,4)`とrotation-index列だけを検査するため、有効な
+  負translation cellを受理し、sentinel rowを拒否する。
+- `_fresh_indices()`も同helperを通り、candidate内部・round間のtuple dedupを行う。
+- Phase Aはround 0後に`sel`全件、Phase BはFFT前にround-0 cacheのfit 220件、Phase Cは
+  resume直後に`sel`全件について、pool欠損とidentity欠損を検査する。予定workflowで
+  実際に発火する位置である。
+
+intended production経路（`--pool reachable --rot-set hopf`）に新しいblockerは見つからなかった。
+ただしlegacy分岐のsentinelは説明と異なり、まだ`torch.full((F,), -1)`で
+`Feats.pose_key`の`(F,4)`契約を破る。legacy hard-negative miningはidentityを持たず
+いずれ拒否されるので今回のPhase Bには影響しないが、`(F,4)`へ統一し、
+`POSE_IDENTITY_MISSING`を実際に使う。あるいはround>0 + legacyをCLIで最初から拒否する。
+
+**overflow影響の中間測定（実装者測定、未完了）。**
+
+| complex | generated | old kept | exact-key kept | erroneous drops |
+|---|---:|---:|---:|---:|
+| 2io2 | 216 | 212 | 216 | 4 |
+| 7oit | 216 | 88 | 210 | 122 |
+| 4zsh | 216 | 140 | 211 | 71 |
+| 5oen | 216 | 212 | 215 | 3 |
+| 6hvo | 216 | 143 | 209 | 66 |
+| 8env | 216 | 216 | 216 | 0 |
+
+6複合体で266/1296候補（20.5%）を余分に削除しており、0〜56.5%とheterogeneousである。
+これは列挙候補数への影響であって、正例数への影響とは限らない。全12件では
+erroneously dropped poseのDockQ分布、`DockQ>=0.23`数、all-provenanceのpooled指標と
+reachability統計への差も記録する。
+
+**search-only不変性の直接検証。** 旧cacheにpose keyがなくても、`prov`とmodel-visible
+featuresはあるため比較できる。対応する旧cacheと新`_pk2` cacheについて複合体ごとに
+`prov==0`を選び、pose数・row orderと`sc,T,elec,rmsd,DockQ`のshapeおよび
+`torch.equal`/checksumを比較する。丸め差があればmax-abs差と既存checkpointでのscore/rank
+一致を併記する。これは「学習と固定pool評価が実際に見たtensor」の最も直接的な監査である。
+
+pose座標自体も確認するなら、FFT searchを一度だけ実行して同じ`result`から
+`neg_poses`を構築し、old packed-key maskとnew tuple-key maskを列挙側だけに分岐させる。
+両方の`poses[:n_search]`が同一の`neg_poses`であることをassertする。searchを二度実行すると
+GPU nondeterminismまで混ざるので、一つのsearch resultを共有してdedupだけを変える。
+
+コード上、dedupは`result`から`neg_poses`を作った後の列挙`pos_*` maskだけに作用し、
+search poseはcatの前半として不変である。したがって上のmodel-visible tensor監査が一致すれば
+`--loss-prov search`学習、`--prov search`固定pool評価、end-to-end探索への影響なしという
+結論は十分である。一方all-provenanceのpool/positive/coverage/reachability/pooled metricは
+訂正対象になりうる。
+
+**Phase B開始条件。** コード上のproduction blockerは解消した。新schemaでPhase Aを完走し、
+Phase A logで`sel=275`のpreflight、Phase B dry startでfit 220 preflight、全suite成功を
+確認したらPhase Bを開始してよい。search-only監査は過去結果の訂正作業であり、新しい
+round-1採掘の正しさを左右しないため並行実行可能である。
+
+#### 5.14.19 pose 識別子オーバーフローの実測と影響（2026-07-27）
+
+§5.14.15〜§5.14.18 で codex が指摘したバグの実測記録である。
+**これは round-1 の実装作業中に見つかった既存バグであり、私が今回導入したものではない。**
+
+##### 何が壊れていたか
+
+`generate_pool_reachable()` は「探索が既に返した pose と同じ列挙 pose を捨てる」ために
+`(rotation index, integer translation cell)` を1つの int64 へ詰めていた:
+
+$$\text{key} = ((q_i \cdot 2^{21} + c_x)\cdot 2^{21} + c_y)\cdot 2^{21} + c_z$$
+
+$q_i$ が bit 63 に来るため int64 を溢れる。**実測**:
+
+```
+qi   : [0, 1, 2, 3, 4, 5]           (同一 cell)
+key  : [ 4611688217451692032, -4611683819403083776,
+         4611688217451692032, -4611683819403083776,
+         4611688217451692032, -4611683819403083776]
+6個の異なる回転 -> 2個のキー
+hopf nside=3: 1944 回転 -> 2 個のキー
+負のキー: 3/6 (奇数回転すべて)
+```
+
+つまり**キーは回転インデックスの偶奇しか区別していなかった**。
+結果として、列挙 pose は「並進セルが同じで回転の偶奇が同じ」探索 pose が1つでもあれば
+重複として捨てられていた。
+
+##### 誤って捨てられた量（測定）
+
+`scripts/measure_pose_key_overflow.py`。同一の FFT 探索結果に対して旧キーと
+新しい `(N,4)` 識別子の両方で重複除去を適用し、残る列挙候補数を比較する。
+探索を2回走らせると GPU の非決定性が混ざるため、探索結果は共有し dedup だけを変える。
+
+| complex | 生成 | 旧キーで残存 | 正しい識別子で残存 | 誤削除 |
+|---|---:|---:|---:|---:|
+| 2io2 | 216 | 212 | 216 | 4 |
+| 7oit | 216 | 88 | 210 | **122 (56.5%)** |
+| 4zsh | 216 | 140 | 211 | 71 |
+| 5oen | 216 | 212 | 215 | 3 |
+| 6hvo | 216 | 143 | 209 | 66 |
+| 8env | 216 | 216 | 216 | 0 |
+| 6gxp | 216 | 216 | 216 | 0 |
+| 7a6h | 216 | 212 | 216 | 4 |
+| 5dyd | 216 | 124 | 209 | 85 |
+| 4bts | 216 | 216 | 216 | 0 |
+| 1h6f | 216 | 216 | 216 | 0 |
+| 7jhy | 216 | 211 | 216 | 5 |
+| **合計** | **2592** | **2206** | **2566** | **360 (13.9%)** |
+
+**複合体差が極端である**（0〜56.5%）。均一な縮小ではないので、
+「全体に少し少ない」という補正では済まない。
+
+##### 影響範囲（コード上の論拠と、必要な実測）
+
+この重複除去は探索結果から `neg_poses` を構築した**後**に、列挙側 `pos_*` を
+探索 pose と照合する箇所だけに作用する。探索 pose 自体は削除されず、
+`poses = cat([neg_poses, pos_poses])` の前半をそのまま占める。したがって
+
+**原理上、影響しない**:
+
+- `--loss-prov search` の fit/validation 損失と、それによる checkpoint 選択
+- `--prov search` に限定した固定プールの success@1 / AUC / first-hit
+  （§5.14.8、§5.14.12 の主要結果すべて）
+- 列挙を使わない全249件の end-to-end 再探索
+
+**影響しうる（訂正対象）**:
+
+- all-provenance のプールサイズ、positive 数、`n_pos_enumerated`
+- IFACE coverage、reachability 統計
+- `--prov all` の pooled 指標
+
+コード読解だけで終わらせず、`scripts/audit_pose_key_fix.py` で旧キャッシュと
+新 `_pk2` キャッシュの `prov == 0` 行について pose 数・行順・
+`sc, T, elec, rmsd, DockQ` を `torch.equal` で突き合わせる。
+これが一致して初めて「主要結果は無影響」と書ける。Phase A′ 完了後に実行する。
+
+##### あわせて見つかった別の既存バグ（実害ゼロ）
+
+`Params.NAMES = ("alpha", "rho", "iface", "log_clash")` に `rowcol` が無いため、
+`train_params()` の best-checkpoint 巻き戻しループが低次元モード（`add`/`sym`）で
+`rowcol` を復元していなかった。返るのは最終ステップの値である。
+
+**実験1への影響を実測した**（`round0_trajectory.csv` の accepted フラグ）:
+
+| モード | best ≠ last だった run |
+|---|---|
+| add (m0/m5 × 3 seed) | 0/6 |
+| sym (m0/m5 × 3 seed) | 0/6 |
+| full (m0/m5 × 3 seed) | 3/6（ただし `iface` は NAMES にあり正しく巻き戻る） |
+
+低次元12本すべてで最終 validation チェックが accepted、すなわち best == last なので、
+**§5.14.12 の数値は変わらない**。修正は入れたが、既報結果の訂正は不要である。
+
+##### 修正
+
+- `src/zdock/dataset.py` に `pose_identity(qi, cell) -> (N,4)` と
+  `has_pose_identity(pose_key)` を追加。production の重複除去も `Feats.pose_key` も
+  テストも同じ関数を通る。
+- `has_pose_identity` は **rotation-index 列のみ**を見る。並進セルは原点をまたぐので
+  負の $c_x/c_y/c_z$ は正常であり、全列を見ると有効な pose を identity 欠損と
+  誤判定する（これは私が一度入れて codex に指摘された）。
+- pool cache key に `POSE_KEY_SCHEMA`（`_pk2`）を付け、識別子を持たない旧キャッシュが
+  同じキーで再利用されないようにする。
+- Phase A / Phase B / Phase C の3箇所に preflight を置き、識別子欠損とプール欠損を
+  **長時間の採掘の前に**検出する。
+
+回帰テスト（`tests/test_scaling_streaming.py`）: 同一 cell の1944回転が全て distinct
+かつ非負であること、負の並進セルが受理されること、sentinel と rank 違いが拒否されること。
+全スイート 127 passed, 1 skipped。
+
 ---
 
 ## 6. 解釈と注意
