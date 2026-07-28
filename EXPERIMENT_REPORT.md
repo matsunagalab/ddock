@@ -4687,6 +4687,385 @@ uv run python scripts/r1_contrast.py
 実測 140〜180 秒/複合体、共有機・load average 20〜30）。学習は1本あたり約40分。
 評価は CPU のみ。
 
+#### 5.14.22 評価体系を PINDER に統一する（2026-07-28）
+
+ここまで自前の指標（平均 success@K、閾値 DockQ ≥ 0.23 の2値）で報告してきたが、
+**以後は PINDER の用語・分割・指標に揃える。** 「PINDER で評価した」と言うなら
+PINDER に採点させるべきであり、独自指標は近似にとどまる。
+
+##### PINDER の座標系と、本研究の位置
+
+| 軸 | PINDER の選択肢 | 本研究 |
+|---|---|---|
+| subset | `pinder_xl` / **`pinder_s`** / `pinder_af2` | **`pinder_s`**（公式250件、現cache 249件） |
+| **monomer** | **`holo`** / `apo` / `predicted` | **`holo` のみ** |
+| 集計 | 全複合体の**中央値** | これまで平均 |
+| CAPRI | 4段階（Incorrect / Acceptable / Medium / High） | これまで acceptable の2値 |
+| 系統 | `Oracle` / `Max(Top 1)` / `Max(Top 5)` | success@K |
+
+**`holo` は PINDER の3設定のうち最も易しい。** 結合型構造どうしをドッキングするので
+構造変化を扱わない。実用上意味があるのは `apo`（非結合型）と `predicted`（AF2 構造）で、
+そこでは側鎖・主鎖の再配置への頑健性が問われる。本研究の数値はすべて
+**`pinder_s` / `holo` 列の結果**であり、他手法の `apo` / `predicted` の数値と
+並べてはならない。これまで「bound-bound」と書いてきたものは PINDER 用語で `holo` である。
+
+##### 指標の定義（`pinder.eval.dockq` の実装より）
+
+各 decoy について `BiotiteDockQ` が **DockQ / iRMS / LRMS / Fnat / CAPRI** を計算する。
+CAPRI は `Incorrect=0, Acceptable=1, Medium=2, High=3`。
+
+リーダーボードは複合体ごとに oracle 集約（`DockQ`,`Fnat`,`CAPRI_rank` は max、
+`LRMS`,`iRMS` は min）してから、**全複合体の中央値**を取る。hit rate は
+
+- `CAPRI_rank ≥ 1`（acceptable）、`≥ 2`（medium）、`≥ 3`（high）の複合体割合
+- `iRMS ≤ 2 Å`、`LRMS ≤ 5 Å`、`Fnat ≥ 0.8` の複合体割合
+
+を `Oracle`（返した全 pose の最良）、`Max(Top 1)`、`Max(Top 5)` の3系統で報告する。
+
+**本研究の success@1 / success@5 は `Max(Top 1)` / `Max(Top 5)` の
+acceptable hit rate に対応する**が、(a) 閾値が自前 DockQ の 0.23 であって
+`BiotiteDockQ` の CAPRI 判定ではない、(b) 平均であって中央値ではない、
+という2点で厳密には別物である。
+
+**`Oracle` は本研究の設定では情報を持たない。** PINDER の `Oracle` は
+「提出した decoy 全部の中の最良」であって到達可能性の上限ではない。
+上位5件しか提出しないので `Max(Top 5)` と同一の値になる。
+探索が1500件中に近native pose を見つけられたかは、同じ実行が出す
+`recall` と `best_dockq_out`、および回転格子上の上限 `ceiling_dockq`
+（§5.10 の reachable ceiling、スコア関数に依存しない）から報告する。
+1500件すべてを PDB 化すれば `Oracle` が意味を持つが、249 × 1500 = 37万ファイルになる。
+
+##### 提出形式
+
+```
+eval_dir/{method_name}/{pinder_system_id}/{monomer}/models/model_{rank}.pdb
+```
+
+各 decoy は**鎖 R と L のみ**（それ以外は `ExpectedChainsNotFoundError`）。
+rank はファイル名末尾の整数から読まれる。
+
+##### 本研究でこれをどう満たすか
+
+固定 TEST プールは特徴量しか保存しておらず pose 座標を持たないため、そこからは
+書き出せない。`scripts/eval_search_test.py` に `--export-pdb-dir` を追加し、
+**end-to-end 探索（学習後パラメータで実際に FFT 探索を回す）の上位 K pose** を
+直接 PDB 化する。固定プール上の再ランキングではなく実際にドッキングした結果を
+PINDER に採点させる形になり、codex が優先度2に挙げた
+「全249件 end-to-end 評価」と同じ計算で済む。
+
+decoy の原子は、prep cache が原子名・残基番号・鎖を保持しないため、
+元の複合体 PDB を `parse_pdb_plain` と同一の規則で読み直して復元する。
+両者の原子数が一致しない複合体は**書き出さずに報告する**（対応がずれた decoy を
+採点させると別の原子を評価することになる）。
+
+##### PDB export / 公式harness実装レビュー（2026-07-28、採点前）
+
+対象は未コミットの`scripts/eval_search_test.py`と
+`scripts/score_decoys_with_pinder.py`。新しいend-to-end探索や公式leaderboard値は
+まだ生成していない。
+
+**座標と原子順の実測監査。** 公式`pinder_s` 250 IDのうちprep cacheがある249件すべてで、
+元complex PDBを`parse_pdb_plain(..., "R"/"L")`に通し、受容体重心を引いた座標を
+cacheの`rec_xyz` / `native_lig`と全原子比較した。原子数不一致は0/249、
+最大絶対座標差は$7.5\times10^{-5}$ Åであった。したがって現在のPDB版とcacheについては、
+filtered atom行$i$とpose行$i$の対応、および受容体中心座標frameは一致する。
+ただし原子数だけでは別版PDB・同数の順序入替を検出できないため、この座標照合を
+export preflightへ入れる。
+
+現writerでnative poseを1件書き、Biotite 1.7.1で直接parseした結果、1648原子、
+chain集合`{R,L}`、座標範囲も有限であった。PDB列、chain位置、`TER` / `END`はparse可能。
+現在のwriterはoccupancy/B-factor以降とelement列を保持する。全250件でZDOCK filterが
+除いた68,418/1,065,271 ATOM（6.42%）は水素だけで、重原子欠落は0件であった。
+PINDERのcontact計算は`heavy_only=True`、RMSDはbackbone定義なので、
+水素を書かないことは公式指標との不整合ではない。
+
+**production blocker 1: 現環境でPINDER harness自体が動かない。**
+実測環境は`pinder 0.5.0 / fastpdb 1.3.3 / biotite 1.7.1`。
+`MethodMetrics`が使うfastpdb readerはnative PDB読込時に
+`AttributeError: attribute 'lines' of 'biotite.structure.PDBFile' objects is not writable`
+で停止した。PINDER側の`safe_get_eval_metrics()`はsystem単位の例外を捕捉して`None`へ
+変えるため、一部失敗はmissing penaltyへ化け、全件失敗は後段の空`concat`でしか
+停止しない。互換依存をpinするか、
+公式実装をbiotite backendで確実に動かし、既知native poseがDockQ=1 / Highになる
+round-trip testを通すまで本採点を開始しない。
+
+**production blocker 2: exportと採点がfail-open。**
+`eval_search_test.py`の広い`except Exception`は探索だけでなくPDB exportの失敗も
+`skipped`へ落とし、長時間の進捗表示を正常に見せる。一部失敗ならexit 0になり、
+全件失敗なら最後の`rows[0]`で初めて別の例外になる。source欠損・atom mismatchも
+`exported=0`を返すだけである。公式export時は探索結果生成とartifact書出しの例外を分け、
+書出し失敗をfatalにし、終了時に要求IDごとにexactly K modelがあることをassertする。
+
+さらに`MethodMetrics(..., allow_missing_systems=False)`は「全件必須でエラー」ではなく、
+missing systemをDockQ/Fnat 0、RMSD 100のpenalty rowで補う。現在cacheにない
+`7w93__A1_A0A140N873--7w93__A2_A0A140N873`は公式250件の一つなので、
+現状のofficial denominatorでは1件のゼロ点になる。`score_decoys_with_pinder.py`の
+`--allow-missing` helpにある「require full subset」は不正確である。採点前に
+`get_expected_counts`と照合し、real decoy数、penalty数、欠損IDを別に表示する。
+headlineで`--allow-missing`は使わない。
+
+**production blocker 3: partial/stale artifact。**
+writerは最終`model_K.pdb`へ直接書くため、途中例外で壊れたPDBが残る。既存method dirを
+再利用すると、今回書かなかったsystemや以前の`model_6.pdb`以降もharnessが拾う。
+一時ファイルからatomic renameし、method dirはcheckpoint/config fingerprintで新規作成、
+または開始時に空であることを要求する。各systemのrank集合がexactly
+`{1,...,K}`で、全modelが`{R,L}`だけを持つことを全ファイル検査する。
+
+**production blocker 4: `holo`の誤ラベルがCLI上可能。**
+このpipelineはbound complexしかdockしないのに`--monomer`で`apo/predicted`を選べる。
+公式比較では誤ラベルが重大なので、export経路は`holo`へ固定し、他値を拒否する。
+`--export-pdb-dir`はeval rootではなくmethod rootであることもhelpへ明記する。
+
+**仕様確認。** `{method}/{id}/holo/models/model_{rank}.pdb`と`model_1`〜`model_5`は
+PINDER 0.5.0のdirectory探索とrank regexに一致する。5件だけ提出する限り
+OracleとMax(Top 5)は同一で、探索1500件のoracleとは呼ばない。連続指標はsystemごとの
+oracle後に中央値だが、CAPRI hit rateは全systemの割合であり、「全指標を中央値集計」
+という表現は正確でない。leaderboardは複数subset行を返しうるため、主表は明示的に
+`Dataset=pinder_s, Monomer=holo`だけを選ぶ。
+
+**評価設計の限定。** これは`pinder_s / holo`のrigid-body redockingであり、
+3設定中最も易しい。`apo` / `predicted`で必要なconformational robustnessは測らない。
+公式250件中1件を内部geometry floorで除外しているため、その1件をfailureとして
+ゼロ点にするか、floorが過剰拒否でないかを再監査して実行するかを採点前に固定する。
+
+##### geometry guardの再監査と、除外1件の復帰（2026-07-28）
+
+**問い。** §5.12 で導入した `MIN_PLAUSIBLE_CONTACT_ANGSTROM = 2.0` は、
+公式250件のうち `7w93__A1_A0A140N873--7w93__A2_A0A140N873` を拒否していた。
+このguardはPINDERの収録判断を上書きしてよいものか。
+
+**判断（利用者の指摘による）。** データセットの作成・収録判断はPINDER側の仕事であり、
+本研究の仕事ではない。§5.12 の失敗はPINDERのデータ欠陥ではなく、
+**どのファイルを読むかを我々が間違えた**（`test_set_pdbs/` の原点中心docking入力を
+複合体として対にした）ことによる。`pdbs/{id}.pdb` は最初から正しかった。
+したがってguardが検出すべきなのは*我々のframe取り違え*であって、参照構造の品質ではない。
+
+**測定。** 誤った旧cache（`prep_cache_test_BROKEN_origin_centred`、250件）と
+正しいcache（`prep_cache_test`、249件）が両方残っていたので、両者を分ける統計を実測した。
+
+| 由来 | ligand重原子のうち2.0 Å未満に相手を持つ割合 | 最近接距離 |
+| --- | --- | --- |
+| 原点中心monomerを対にした旧入力 | 0.247 – 1.000（中央値 0.607） | 0.000 – 0.405 Å |
+| `pdbs/{id}.pdb` の複合体 | **249件すべて 0.000** | 2.021 – 3.225 Å |
+| うち `7w93`（旧guardが拒否） | 1 / 2323 原子 = 0.00043 | 1.892 Å |
+
+frame崩壊はligandの1/4以上を受容体内部へ埋没させ、正しく組まれた複合体は1原子も
+埋没させない。両者の間は3桁空いている。
+
+**変更。** 判定を絶対距離から**埋没率**へ移した
+（`MAX_FRAC_LIG_BELOW_CONTACT_FLOOR = 0.05`、`src/zdock/dataset.py`）。
+0.05は観測された失敗の最小値0.247の1/5であり、正しい構造側には0.000しかない。
+距離閾値を下げる案は採らない。それでは真に貫入した参照も通ってしまうし、
+「1.892 Åの複合体は収録すべきでない」という判断自体が我々の越権である。
+`7w93` を再prepし、公式250件すべてを提出する。単体テスト128件は変更後も全て通る。
+
+##### 公式PINDER評価の結果（`pinder_s` / `holo`、250/250、2026-07-28）
+
+`pinder.eval.dockq.MethodMetrics` による採点。baselineは**同一実装＋ZDOCK 3.0.2公開表**、
+`trained_N220` は `data/scaling/runs_nfixed/N220_seed0/round0_ckpt.pt`。
+どちらも学習後パラメータでFFT探索をやり直したend-to-end結果の上位5 poseを提出している。
+再ランキングではない。母数は公式250件で、欠損は0件。
+
+| 指標（`Max(Top 1)`） | published | trained_N220 | 差 |
+| --- | --- | --- | --- |
+| DockQ acceptable | 66.40 % | **74.80 %** | **+8.40 pp** |
+| DockQ medium | 61.60 % | 69.20 % | +7.60 pp |
+| DockQ high | 30.80 % | 32.40 % | +1.60 pp |
+| iRMS ≤ 2 Å | 61.20 % | 68.00 % | +6.80 pp |
+| LRMS ≤ 5 Å | 58.40 % | 65.20 % | +6.80 pp |
+| Fnat ≥ 0.8 | 44.00 % | 46.80 % | +2.80 pp |
+
+| 指標（`Max(Top 5)`） | published | trained_N220 | 差 |
+| --- | --- | --- | --- |
+| DockQ acceptable | 81.20 % | 86.00 % | +4.80 pp |
+| DockQ medium | 76.40 % | 81.60 % | +5.20 pp |
+| DockQ high | 36.80 % | 37.60 % | +0.80 pp |
+| DockQ 中央値 Top 1 | 0.71 | 0.73 | +0.02 |
+| DockQ 中央値 Max(Top 5) | 0.77 | 0.77 | ±0 |
+
+`7w93` 復帰の寄与は事前の見積りどおりで、両条件とも rank 1 でヒットしたため
+（DockQ 0.659、両条件同一）各条件が +0.40 pp 上がり、差の +8.40 pp は変わらなかった。
+249件時点の値は acceptable 66.00 → 74.40 % であった。
+
+`Oracle` 列は本設定では `Max(Top 5)` と同一であり、探索1500件の到達可能性ではない。
+`pinder_xl` / `pinder_af2` 行は同じ250件を大きい母数に対して採点したもので、
+提出していないsystemはゼロ点penaltyになっている。主張に使えるのは
+`Dataset=pinder_s, Monomer=holo` 行だけである。
+
+**この数値が何であって何でないか。** これは`holo`（結合型どうし）のrigid-body
+redockingであり、PINDERの3設定で最も易しい。またPINDER-Sの250件は
+損失設計・margin・パラメータ部分空間・mining可否といった設計判断に反復利用しており、
++8.40 ppは**探索的・記述的なpaired improvement**である。選択後バイアスのない
+confirmatory効果量ではない（§5.14.23の訂正1）。baselineは本実装＋公開表であって
+original ZDOCK binaryではないため、原著実装を上回った証拠でもない。
+
+```bash
+# 1) 除外1件の再prep（guard変更後）
+PINDER_BASE_DIR=$PWD/external/pinder uv run python scripts/prep_pinder_cache.py \
+    --ids-file <(echo 7w93__A1_A0A140N873--7w93__A2_A0A140N873) \
+    --cache-dir data/scaling/prep_cache_test \
+    --complex-dir external/pinder/pinder/2024-02/pdbs --gpus 0 --force
+
+# 2) end-to-end探索 + PDB書き出し（両条件）
+uv run python scripts/eval_search_test.py --label published \
+    --export-pdb-dir data/pinder_eval/published --export-top-k 5 --monomer holo \
+    --prep-cache data/scaling/prep_cache_test --out-dir data/scaling/eval_search_pinder
+uv run python scripts/eval_search_test.py --label trained_N220 \
+    --ckpt data/scaling/runs_nfixed/N220_seed0/round0_ckpt.pt \
+    --export-pdb-dir data/pinder_eval/trained_N220 --export-top-k 5 --monomer holo \
+    --prep-cache data/scaling/prep_cache_test --out-dir data/scaling/eval_search_pinder
+
+# 3) 公式harnessで採点
+PINDER_BASE_DIR=$PWD/external/pinder uv run python scripts/score_decoys_with_pinder.py \
+    --eval-dir data/pinder_eval --out data/pinder_eval/leaderboard.csv --max-workers 16
+```
+
+#### 5.14.23 次実験の優先順位と停止規則（2026-07-28、実行前レビュー）
+
+**問い。** §5.14.21 の mining null、N=220→500 の null、§5.14.22 の
+PINDER公式holo評価を踏まえ、次のGPU投資を外部妥当性、探索診断、モデル容量、
+miningのどこへ配分するか。本節は既報値の解釈と実行計画であり、新しい測定値はない。
+
+**優先順位。**
+
+1. **未使用outer cohortで、凍結済みrecipeを一度だけend-to-end評価する。**
+   PINDER-S 250件は設計判断に反復利用済みなので、現在の+8.40 ppは探索的効果量である。
+   interface clusterで学習系と分離した未使用cohortを事前固定し、公開表と学習表を
+   同一探索・同一denominatorでpaired比較する。checkpoint、閾値、欠損処理は結果を見る前に
+   凍結する。
+2. **PINDER apo評価。** leaderboard上の本命であり、holoで学んだIFACE更新が
+   conformational shiftに耐えるかを測る。ただし同じ250 systemなので、未使用標本による
+   confirmatory testの代用にはしない。apoが存在する全対象ID、欠損、失敗を事前固定し、
+   baselineと学習表を同じ入力でpaired評価する。
+3. **`ntop`→`nside`の順の小規模診断。** 勾配ゼロだった66件を中心に、深い順位で
+   near-nativeが回収されるかを測る。`ntop`は配備時top-1を直接変えず、nside=3の
+   reachabilityは99%なので、全面nside=4へ直行しない。候補回収が実効active Nを
+   十分増やすときだけ再学習する。
+4. **N=1000を完了。** 既存cacheのsunk costを利用するが、N=220→500がsuccess@10で
+   nullだった以上、本命とはしない。名目Nだけでなくsearch-positiveを持つactive N、
+   split composition、success@1/5、公式CAPRIを報告する。
+5. **refresh miningはseed 0のgo/no-go pilotだけ。** positive、random negative、
+   総pool size、optimizer stepを固定し、stale hard negativeだけをcurrent model由来の
+   hard negativeへ置換する。old-hard reservoirを残しcycling/forgettingを測る。
+   validationのpaired endpointに事前規定した明瞭な改善がなければ終了する。
+6. **独立したstep-budget対照は実施しない。** 既にmineとno-mining continuationを
+   同じround-0状態から比較して増分がnullである。exact step matchingはrefresh pilotの
+   内部対照としてのみ行う。現行accumulate miningの解釈を精緻化するためだけにGPUを
+   使わない。
+
+**miningの残る最強形。** 毎epoch同じtop-1500を再取得するだけでは69.3%重複を
+再現する可能性が高い。試すなら、蓄積ではなく同一サイズで置換し、current scorerとは
+独立に広く作った候補reservoir（深い`ntop`、必要なら小規模nside=4）からcurrent-score
+上位false positiveを選ぶ。これでもvalidationが動かなければmining lineを終了する。
+
+**容量仮説の反証可能な試験。** N scalingのflatnessだけでは「144パラメータだから容量が
+限界」とは言えない。まず同一候補集合・同一splitで、現行線形scoreを包含する
+非線形reranker（入力は同じPSC/ELEC/144 IFACE特徴）と比較し、線形結合の制約を診断する。
+次に改善した場合だけ、距離shellまたは局所環境で条件づけた複数IFACE表など、
+現行scoreをパラメータ tyingで厳密に包含するFFT互換scoreを実装し、未使用cohortを
+end-to-end paired評価する。現行144が十分に最適化され、rich modelだけが再現性のある
+改善を示したときに限り、ZDOCK functional formの容量をbinding constraintと結論する。
+同一特徴の非線形modelもnullなら容量制約は示されず、特徴表現またはデータが候補として残る。
+
+**+8.40 ppの主要な過大評価リスク。** 実装baselineとのpaired差そのものより、
+反復利用した同じPINDER-S 250件への研究者側のtest adaptation/winner's curseである。
+凍結recipeの未使用outer cohort評価がこれを検出する。公式harnessについては別途、
+expected ID、exactly K、missing penalty、atom-coordinate round trip、空のfingerprinted
+artifact directoryをfail-closedで検査する。Highの増分が小さいため、acceptableへの
+遷移が少数の閾値近傍例へ集中していないかもsystem別CAPRI遷移で報告する。
+
+**計算と停止条件。** 7 GPUなら250-system search条件は並列化し、baselineと学習表の
+各end-to-end比較を同じwaveで行う。固定pose上のreranker診断はsearchより安価である。
+FFT互換rich scoreは実装と追加相関が主費用で、距離/環境channel数にほぼ比例するため、
+rerankerが明確に勝つ前には実装しない。未使用cohortでgainが再現せず、apoでも改善せず、
+`ntop`診断がactive Nを実質的に増やさない場合は、N=1000完了後に追加モデル探索を止める。
+
+**追加の必須監査。** same-UniProt homodimerの対称解をnegative扱いする既知問題について、
+対称性対応評価または除外感度をheadlineと併記する。また本結果のbaselineは
+「本PyTorch実装＋公開表」であり、original ZDOCK binaryとの同一性を示さないため、
+原著実装を上回る主張には別のparity checkが必要である。
+
+##### §5.14.23の争点再検討と訂正（2026-07-28）
+
+**状況更新。** geometry guardは最近接距離の絶対閾値から、
+`MAX_FRAC_LIG_BELOW_CONTACT_FLOOR=0.05`へ変更した。誤って原点中心monomerを重ねた
+旧入力では2.0 Å未満に埋没するligand重原子割合が24.7〜100%（中央値60.7%）だったのに対し、
+正しいcomplex PDBは249件で0%、`7w93`だけ2323原子中1原子だった。したがって
+`7w93`を含む公式250件を評価し、内部guardでPINDERのcurationを上書きしない。
+
+PINDER公式harnessによる`pinder_s / holo` 250/250の確定値は、公開表baselineから
+N220 seed 0学習表へ、Max(Top 1) acceptable 66.40→74.80%（+8.40 pp）、
+medium 61.60→69.20%、high 30.80→32.40%、Max(Top 5) acceptable 81.20→86.00%、
+DockQ median Top 1 0.71→0.73、iRMS≤2 Å 61.20→68.00%、
+LRMS≤5 Å 58.40→65.20%、Fnat≥0.8 44.00→46.80%だった。
+
+**訂正1: 「未使用outer cohort」は同格の第二PINDER-Sを意味しない。**
+そのような公式cohortは存在しない。したがって「PINDER-Sと同品質のconfirmatory set」を
+最優先とした読みは撤回する。現在の+8.40 ppは、
+**反復的な設計判断に使った公式PINDER-S/holo上の探索的・記述的なpaired improvement**
+として主張できるが、未見PINDER-S母集団に対する選択後バイアスのない効果推定や、
+confirmatoryな$p$値とは呼ばない。
+
+独立transport確認を実施する場合は、候補(ii)を次のように具体化する。
+PINDER 2024-02 indexで`pinder_xl & ~pinder_s & holo_R & holo_L`は1705 systemで、
+すべて`split=test`、かつN220 fit+valおよびPINDER-Sとの`cluster_id`重複は実測0だった。
+この1705件を固定salt付きSHA-256で順序づけ、先頭250件を**結果を見る前に**凍結する。
+これは第二PINDER-Sではなく、selection stringencyの異なる未使用
+`PINDER-XL-minus-S/holo`へのtransport testである。
+
+事前登録するのはexact ID listとhash、N220 seed 0 checkpoint、公開表baseline、
+Hopf nside=3 / spacing 1.2 Å / top-5、全250件denominator、失敗・欠損はゼロ点、
+primaryをMax(Top 1) acceptableのpaired差とexact McNemar、secondaryを
+medium/high/Max(Top 5/連続中央値)、結果後のrecipe変更なし、とする。
+このフル探索費用を払わないならouter確認は計画から削除し、存在を仮定しない。
+
+**訂正2: 任意の非線形rerankerを容量診断の第一歩にはしない。**
+top-1500保持pose上の非線形modelはFFT retrievalを変えず、勝っても配備可能性を示さず、
+負けても現行FFT-compatible線形式の十分性を示さない。§5.14.23のこの提案は撤回する。
+
+代わりに、現行radial contact kernelを
+$K_0(d)=K_{\rm near}(d)+K_{\rm far}(d)$と厳密に分割し、
+
+$$S_{\rm IFACE}=\sum_{ij}e^{\rm near}_{ij}T^{\rm near}_{ij}
+                 +\sum_{ij}e^{\rm far}_{ij}T^{\rm far}_{ij}$$
+
+とするFFT-compatible nested extensionを第一候補にする。
+$e^{\rm near}_{ij}=e^{\rm far}_{ij}=e_{ij}$をtieすれば現行scoreをbitwiseまたは
+規定tol内で再現することを、feature scoreとFFT searchの両方でtestする。
+まず固定pose上でこの**同じ配備可能関数族**のuntied residualがvalidation改善するかをscreenし、
+改善時だけ追加FFT channelを実装してend-to-end比較する。実装費以外に、
+この順序を任意の非線形rerankerより後へ置く理由はない。
+
+ただし追加144自由度をactive N=148で判断するとdata不足と容量不足が交絡する。
+shell residualへ階層priorを置き、可能ならN=1000でもnull/untiedを比較する。
+rich modelのvalidation選択にPINDER-Sを使わず、最終PINDER-S値は探索的と明記する。
+
+**明確化3: apoの順位は主に外的妥当性によるが、interaction contrastも定義できる。**
+PINDER-Sで両方のapo monomerがあるのは93/250件である。この同じ93件について
+baseline/trainedをholoとapoの両方で走らせ、
+
+$$G_{\rm holo}=M({\rm trained,holo})-M({\rm baseline,holo}),\qquad
+G_{\rm apo}=M({\rm trained,apo})-M({\rm baseline,apo})$$
+$$\Delta_{\rm interaction}=G_{\rm apo}-G_{\rm holo}$$
+
+をsystem-paired bootstrapまたはclustered binary modelで評価する。
+apoの絶対低下はbaselineにも入るため、$\Delta_{\rm interaction}$は
+「apoが全手法に難しい」ことと、学習表のgainがapoで特異的に減衰することを分ける。
+さらにapo→holo interface RMSD/PINDER difficultyに対するgainの傾きと、
+内部top-1500 recall対Max(Top 1)を併記し、候補回収の失敗とranking transferを分ける。
+
+$G_{\rm apo}<G_{\rm holo}$だけでbound側鎖packingへの過学習を確定はできないが、
+負のinteractionが構造変位とともに強まればその仮説を支持する。
+apoは同じsystemなので独立confirmationではなく、順位2の根拠はまず実用的な外的妥当性、
+次にこのmodel×monomer interaction診断である。
+
+**上記のindex由来の数値を独立に再測した（2026-07-28）。** `pinder_xl & ~pinder_s` は
+1705件、`split` は全件 `test`、`holo_R & holo_L` も1705件で全件揃う。
+`cluster_id` の重複は、N220 seed 0 の `fit_ids + val_ids` 計275件（275 cluster）に対して
+`xl \ s` と0件、`pinder_s` とも0件。`pinder_s` と `xl \ s` の間も0件。
+PINDER-Sで `apo_R & apo_L` が両方あるのは 93 / 250 件（`predicted` は250件全て）。
+以上はcodexの報告と一致する。
+
 ---
 
 ## 6. 解釈と注意

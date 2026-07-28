@@ -279,13 +279,42 @@ def prepare_protein_from_pdb(
 
 
 #: A receptor and a ligand heavy atom cannot be closer than this in a real
-#: complex (the shortest real contact is a ~2.4 A hydrogen bond). Anything
-#: below it means the two chains are not in a common frame. PINDER's
-#: `test_set_pdbs` monomers are each centred on the origin, so pairing them
-#: superimposes the proteins: all 250 PINDER-S test systems came out at
-#: 0.01-0.03 A, and every TEST-set number in this repository up to 2026-07-26
-#: was computed against such a structure without anyone noticing.
+#: complex (the shortest real contact is a ~2.4 A hydrogen bond).
 MIN_PLAUSIBLE_CONTACT_ANGSTROM = 2.0
+
+#: Fraction of LIGAND atoms that may have a receptor atom below the floor
+#: before the two chains are declared not to share a coordinate frame.
+#:
+#: This guard exists for one specific mistake of ours, not to audit PINDER's
+#: curation. PINDER ships two kinds of file per system: ``pdbs/{id}.pdb`` (the
+#: complex, chains R and L in a common frame) and per-split monomers such as
+#: ``test_set_pdbs/{id}-R.pdb``, which are docking *inputs*, each independently
+#: centred on the origin. Pairing the second kind superimposes the proteins, and
+#: every TEST-set number in this repository up to 2026-07-26 was computed
+#: against such a structure. Reading the right file fixes it; the data were
+#: never at fault.
+#:
+#: Both caches still exist, so the separation is measured rather than guessed
+#: (2026-07-28, all 250 PINDER-S test systems):
+#:
+#: ===========================  ==========================  ================
+#: source                       frac. ligand atoms < 2.0 A  closest contact
+#: ===========================  ==========================  ================
+#: origin-centred monomers      0.247 - 1.000 (med 0.607)   0.000 - 0.405 A
+#: ``pdbs/{id}.pdb`` complexes  0.000 for all 249           2.021 - 3.225 A
+#: ===========================  ==========================  ================
+#:
+#: A frame collapse buries at least a quarter of the ligand; a correctly framed
+#: complex buries none of it. 0.05 sits five-fold below the worst observed
+#: failure with no correct structure anywhere near it.
+#:
+#: An absolute *distance* test cannot be used for this. It would reject
+#: 7w93__A1_A0A140N873--7w93__A2_A0A140N873, whose closest pair is 1.892 A with
+#: nothing else below 2.0 A in a 2323-atom homodimer -- a strained contact in an
+#: ordinary complex. Deciding that PINDER should not have shipped it is dataset
+#: curation, which is not this project's job; PINDER submits 250 systems and
+#: refusing one silently scores it DockQ = 0 against published numbers.
+MAX_FRAC_LIG_BELOW_CONTACT_FLOOR = 0.05
 
 
 def prepare_protein(
@@ -328,19 +357,23 @@ def prepare_protein(
 
 
     if check_geometry:
-        # Reject a reference complex that is sterically impossible. Chunked so
-        # a 10k x 10k pair matrix never materialises.
+        # Are the two chains in a common frame? Measured as the fraction of the
+        # ligand that is buried inside the receptor, which is what a collapsed
+        # frame does; a single strained contact in a real complex is not that.
+        # Chunked so a 10k x 10k pair matrix never materialises.
         best = float("inf")
+        lig_below = torch.zeros(native_lig.shape[0], dtype=torch.bool,
+                                device=native_lig.device)
         for i in range(0, rec_dec.shape[0], 2048):
-            best = min(best, float(torch.cdist(
-                rec_dec[i:i + 2048], native_lig).min()))
-            if best < MIN_PLAUSIBLE_CONTACT_ANGSTROM:
-                break
-        if best < MIN_PLAUSIBLE_CONTACT_ANGSTROM:
+            d = torch.cdist(rec_dec[i:i + 2048], native_lig)
+            best = min(best, float(d.min()))
+            lig_below |= (d < MIN_PLAUSIBLE_CONTACT_ANGSTROM).any(0)
+        frac = float(lig_below.sum()) / native_lig.shape[0]
+        if frac > MAX_FRAC_LIG_BELOW_CONTACT_FLOOR:
             raise ValueError(
-                f"{name}: closest receptor-ligand heavy-atom distance is "
-                f"{best:.2f} A, below the {MIN_PLAUSIBLE_CONTACT_ANGSTROM} A "
-                f"floor for a real contact. The two chains are almost "
+                f"{name}: {frac:.1%} of ligand heavy atoms have a receptor atom "
+                f"below the {MIN_PLAUSIBLE_CONTACT_ANGSTROM} A floor for a real "
+                f"contact (closest pair {best:.2f} A). The two chains are almost "
                 f"certainly not in a common coordinate frame - e.g. PINDER's "
                 f"test_set_pdbs monomers are each centred on the origin; read "
                 f"both chains from the complex file instead. Pass "

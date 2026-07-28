@@ -84,6 +84,73 @@ def _label(prot, poses, budget):
     return rmsd, torch.cat(parts, dim=0)
 
 
+
+#: PINDER's evaluator requires exactly two chains named R and L.
+_PINDER_CHAINS = ("R", "L")
+
+
+class ExportError(RuntimeError):
+    """A decoy could not be written.
+
+    Raised rather than logged because the caller wraps `evaluate_complex` in a
+    broad `except Exception` that files failures under "skipped". An export bug
+    would therefore look like a hard complex: earlier today a chain-id bug
+    skipped all 250 systems while the progress line still read
+    "25/250 (21.7s/complex)". A submission missing systems is not a smaller
+    submission -- PINDER fills the gaps with DockQ = 0 -- so this stops the run.
+    """
+
+
+def _usable_atom_lines(path, chain: str) -> list[str]:
+    """The ATOM lines `parse_pdb_plain` keeps, in file order.
+
+    The prep cache stores coordinates and derived features but no atom names,
+    residue numbers or chain ids, so a pose cannot be written to PDB from it
+    alone. Re-reading the source complex under the identical filter reproduces
+    the atom set and ordering the pipeline scored, so pose row i is filtered
+    atom i. Any drift between the two filters would silently write a decoy
+    whose atoms do not correspond to the scored ones, which is why the caller
+    asserts the counts match.
+    """
+    from zdock.atomtypes import _ATOMTYPE_LUT, _VDW_RADIUS
+    from zdock.dataset import _element_of
+
+    out = []
+    for line in open(path):
+        if line.startswith("ENDMDL"):
+            break
+        if not line.startswith("ATOM"):
+            continue
+        if line[16] not in (" ", "A") or line[21] != chain:
+            continue
+        a = line[12:16].strip()
+        r = line[17:20].strip()
+        a_norm = "O" if a == "OXT" else a
+        if (r, a_norm) not in _ATOMTYPE_LUT or _element_of(a) not in _VDW_RADIUS:
+            continue
+        out.append(line)
+    return out
+
+
+def _write_decoy(path, rec_lines, lig_lines, rec_xyz, lig_xyz) -> None:
+    """One PDB with the receptor as chain R and the posed ligand as chain L."""
+    serial = 0
+    with open(path, "w") as fh:
+        for lines, xyz, ch in ((rec_lines, rec_xyz, "R"),
+                               (lig_lines, lig_xyz, "L")):
+            for line, c in zip(lines, xyz.tolist()):
+                serial += 1
+                # keep everything after the coordinates, including the
+                # element symbol in columns 77-78 -- dropping it makes the
+                # reader guess, and "CA" then reads as calcium rather than
+                # a carbon alpha
+                fh.write(f"ATOM  {serial:5d}" + line[11:21] + ch + line[22:30]
+                         + f"{c[0]:8.3f}{c[1]:8.3f}{c[2]:8.3f}"
+                         + line[54:].rstrip("\n").ljust(26) + "\n")
+            fh.write("TER\n")
+        fh.write("END\n")
+
+
 @torch.no_grad()
 def evaluate_complex(prot, alpha, iface, beta, charge, args, rho=SC_RHO):
     device = prot.rec_xyz.device
@@ -153,7 +220,74 @@ def evaluate_complex(prot, alpha, iface, beta, charge, args, rho=SC_RHO):
         row[f"succ_dockq@{k}"] = int(bool((dq_s[:kk] >= args.dockq_thr).any()))
         row[f"succ_rmsd@{k}"] = int(bool((rm_s[:kk] <= args.rmsd_thr).any()))
         row[f"best_dockq@{k}"] = float(dq_s[:kk].max())
+
+    if getattr(args, "export_pdb_dir", ""):
+        row["exported"] = _export_top_k(prot, poses[order], args)
     return row
+
+
+def _export_top_k(prot, poses_sorted, args) -> int:
+    """Write the top-K poses as PINDER-shaped decoys. Returns how many."""
+    from pathlib import Path
+
+    src = Path(args.pdb_dir) / f"{prot.name}.pdb"
+    if not src.is_file():
+        raise ExportError(f"{prot.name}: no source complex at {src}")
+    # PINDER already normalises the complex file's chains to R (receptor) and
+    # L (ligand), so there is nothing to infer from the system id. Deriving the
+    # chain from the id is also wrong: the separator is a DOUBLE underscore
+    # ({pdb}__{chain}{copy}_{uniprot}), so `split("_")[1]` is the empty string.
+    rec_lines = _usable_atom_lines(src, "R")
+    lig_lines = _usable_atom_lines(src, "L")
+    if len(rec_lines) != prot.n_rec or len(lig_lines) != prot.n_lig:
+        # the filter did not reproduce the prepared atom set, so pose row i is
+        # not filtered atom i; writing anyway would score the wrong atoms
+        raise ExportError(
+            f"{prot.name}: PDB/prep atom mismatch "
+            f"(rec {len(rec_lines)} vs {prot.n_rec}, "
+            f"lig {len(lig_lines)} vs {prot.n_lig})")
+
+    # Matching counts do not prove matching ORDER. Compare the coordinates:
+    # the prep cache is the source complex shifted by the receptor centroid, so
+    # PDB row i and prep row i must agree to within rounding once that shift is
+    # removed. Measured over the 249 cached systems the worst disagreement is
+    # 7.5e-5 A, so 1e-2 is loose enough for PDB's three decimals and tight
+    # enough to catch a re-ordered or substituted source file.
+    pdb_rec = torch.tensor(
+        [[float(x[30:38]), float(x[38:46]), float(x[46:54])] for x in rec_lines],
+        dtype=prot.rec_xyz.dtype)
+    shift = pdb_rec.mean(0) - prot.rec_xyz.detach().cpu().mean(0)
+    worst = float((pdb_rec - (prot.rec_xyz.detach().cpu() + shift)).abs().max())
+    if worst > 1e-2:
+        raise ExportError(
+            f"{prot.name}: receptor coordinates disagree with the prep cache by "
+            f"up to {worst:.3g} A after removing the centroid shift, so pose "
+            f"row i is not PDB atom i")
+    # PINDER's harness expects {method}/{system_id}/{monomer}/models/model_K.pdb
+    # and infers the rank from the trailing integer of the file name. The
+    # monomer level is "holo" here: both partners come from the bound complex,
+    # which is the easiest of PINDER's three settings and must be reported as
+    # such rather than compared against apo or predicted numbers.
+    out = Path(args.export_pdb_dir) / prot.name / args.monomer / "models"
+    out.mkdir(parents=True, exist_ok=True)
+    # a re-run must not leave a previous run's models behind: PINDER reads the
+    # rank off the file name, so a stale model_5.pdb would be scored as this
+    # method's fifth pose
+    for stale in out.glob("*.pdb"):
+        stale.unlink()
+    rec = prot.rec_xyz.detach().cpu()
+    k = min(args.export_top_k, poses_sorted.shape[0])
+    if k < args.export_top_k:
+        raise ExportError(
+            f"{prot.name}: search returned {poses_sorted.shape[0]} poses, "
+            f"fewer than the {args.export_top_k} to export")
+    for i in range(k):
+        # write then rename, so an interrupted run leaves no partial PDB that
+        # would parse as a valid but truncated structure
+        tmp = out / f".model_{i + 1}.pdb.tmp"
+        _write_decoy(tmp, rec_lines, lig_lines, rec, poses_sorted[i].detach().cpu())
+        tmp.rename(out / f"model_{i + 1}.pdb")
+    return k
 
 
 def _mean(rows, key, mask=None):
@@ -186,6 +320,17 @@ def main() -> None:
     ap.add_argument("--rot-chunk", type=int, default=8, dest="rot_chunk")
     ap.add_argument("--dockq-budget", type=int, default=50_000_000, dest="dockq_budget")
     ap.add_argument("--oom-retries", type=int, default=3, dest="oom_retries")
+    ap.add_argument("--export-pdb-dir", default="", dest="export_pdb_dir",
+                    help="write the top-K poses here as {id}/model_k.pdb with "
+                         "chains R and L, for scoring by PINDER's own evaluator")
+    ap.add_argument("--export-top-k", type=int, default=5, dest="export_top_k")
+    ap.add_argument("--monomer", default="holo",
+                    choices=("holo", "apo", "predicted"),
+                    help="which PINDER monomer setting these decoys came from. "
+                         "This pipeline docks bound structures, so holo.")
+    ap.add_argument("--pdb-dir", default="external/pinder/pinder/2024-02/pdbs",
+                    dest="pdb_dir",
+                    help="source complexes, re-read for atom names and numbering")
     ap.add_argument("--rmsd-threshold", type=float, default=5.0, dest="rmsd_thr")
     ap.add_argument("--dockq-threshold", type=float, default=0.23, dest="dockq_thr")
     ap.add_argument("--limit", type=int, default=0)
@@ -242,6 +387,8 @@ def main() -> None:
             skipped.append({"id": pid, "n_rec": prot_cpu.n_rec,
                             "n_lig": prot_cpu.n_lig,
                             "reason": f"OOM: {str(exc)[:120]}"})
+        except ExportError:
+            raise                        # never file an export bug as "skipped"
         except Exception as exc:  # noqa: BLE001
             skipped.append({"id": pid, "reason": f"{type(exc).__name__}: {exc}"[:160]})
         finally:
@@ -251,6 +398,30 @@ def main() -> None:
         if (i + 1) % 25 == 0:
             print(f"  {i+1}/{len(ids)}  ({(time.time()-t0)/(i+1):.1f}s/complex)",
                   flush=True)
+
+    if getattr(args, "export_pdb_dir", ""):
+        root = Path(args.export_pdb_dir)
+        want = args.export_top_k
+        bad = []
+        for r in rows:
+            models = sorted((root / r["name"] / args.monomer / "models")
+                            .glob("model_*.pdb"))
+            ranks = sorted(int(m.stem.split("_")[1]) for m in models)
+            if ranks != list(range(1, want + 1)):
+                bad.append((r["name"], ranks))
+        print(f"\nexport: {len(rows)} systems evaluated, "
+              f"{len(rows) - len(bad)} with exactly {want} models each")
+        if bad:
+            raise SystemExit(
+                f"{len(bad)} systems do not have models 1..{want} "
+                f"(e.g. {bad[0][0]}: {bad[0][1]}). PINDER reads the rank off "
+                f"the file name and fills missing systems with DockQ = 0, so a "
+                f"partial export would be scored as a worse method rather than "
+                f"an incomplete one.")
+        if skipped:
+            print(f"export: {len(skipped)} systems were NOT evaluated and so "
+                  f"have no decoys; PINDER will penalise them with DockQ = 0. "
+                  f"Report that count alongside any leaderboard number.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
