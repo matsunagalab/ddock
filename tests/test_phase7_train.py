@@ -205,3 +205,89 @@ def test_train_with_consolidated_h5(device, dtype):
     assert all(torch.isfinite(torch.tensor(x)) for x in hist), (
         f"loss history contains non-finite values: {hist}"
     )
+
+
+# ---------------------------------------------------------------- top-tail loss
+
+
+def test_top_tail_zero_without_positives_or_negatives():
+    """A graph-connected zero, like every other loss here, so a mixed batch
+    still backprops when one complex has no positive."""
+    from zdock.train import loss_top_tail
+
+    s = torch.randn(20, requires_grad=True)
+    for dq in (torch.zeros(20), torch.ones(20)):
+        loss = loss_top_tail(s, dq)
+        assert float(loss) == 0.0
+        loss.backward(retain_graph=True)
+    assert s.grad is not None
+
+
+def test_top_tail_falls_when_the_best_positive_rises():
+    """The whole point: the term must respond to the top-1 decision."""
+    from zdock.train import loss_top_tail
+
+    dq = torch.tensor([0.9, 0.5] + [0.0] * 30)
+    lose = torch.tensor([0.0, -1.0] + [2.0] + [0.0] * 29)   # a negative on top
+    win = lose.clone()
+    win[0] = 5.0                                            # positive on top
+    assert float(loss_top_tail(win, dq)) < float(loss_top_tail(lose, dq))
+
+
+def test_top_tail_ignores_the_worst_positive():
+    """`loss_margin_hard_negatives` anchors on min(positive), so dragging one
+    poor positive down changes it; this term must not care, because Max(Top 1)
+    does not."""
+    from zdock.train import loss_margin_hard_negatives, loss_top_tail
+
+    dq = torch.tensor([0.9, 0.3] + [0.0] * 30)
+    a = torch.tensor([4.0, 1.0] + [0.5] * 30)
+    b = a.clone()
+    b[1] = -8.0                                    # same best positive, worse worst
+    # not bit-identical: the worst positive is exponentially suppressed, not
+    # excluded. 1e-3 SD against the ~9 SD the min-anchor term moves by.
+    assert abs(float(loss_top_tail(a, dq)) - float(loss_top_tail(b, dq))) < 1e-3
+    assert abs(float(loss_margin_hard_negatives(a, dq))
+               - float(loss_margin_hard_negatives(b, dq))) > 1.0
+
+
+def test_top_tail_looks_only_k_deep_into_the_negative_tail():
+    """Negatives below the top-k must not dilute the term -- that dilution is
+    exactly what makes the min-anchor hinge a broad regulariser."""
+    from zdock.train import loss_top_tail
+
+    dq = torch.cat([torch.tensor([0.9]), torch.zeros(200)])
+    s = torch.cat([torch.tensor([3.0]), torch.full((5,), 2.0),
+                   torch.full((195,), -5.0)])
+    few = torch.cat([torch.tensor([3.0]), torch.full((5,), 2.0)])
+    dq_few = torch.cat([torch.tensor([0.9]), torch.zeros(5)])
+    assert float(loss_top_tail(s, dq, k=5)) == \
+        pytest.approx(float(loss_top_tail(few, dq_few, k=5)))
+
+
+def test_top_tail_soft_max_sits_between_mean_and_max():
+    """tau -> 0 approaches the true maxima; a large tau pulls both sides
+    towards their means, which lowers the positive side and so RAISES the
+    penalty."""
+    from zdock.train import loss_top_tail
+
+    dq = torch.tensor([0.9, 0.8] + [0.0] * 10)
+    s = torch.tensor([2.0, 1.0] + [0.0] * 10)
+    sharp = float(loss_top_tail(s, dq, tau_pos=0.01, tau_neg=0.01, k=4))
+    soft = float(loss_top_tail(s, dq, tau_pos=2.0, tau_neg=2.0, k=4))
+    # softplus(margin + n - p) decreases in p, and mean-exp <= max, so a
+    # sharper p sits higher and gives the smaller penalty
+    assert sharp < soft
+
+
+def test_top_tail_does_not_reward_a_finely_sampled_basin():
+    """A sum-exp positive side would grow like tau*log(count), paying a complex
+    for having many near-native poses rather than for ranking one first."""
+    from zdock.train import loss_top_tail
+
+    s_few = torch.tensor([2.0, 1.9] + [0.0] * 50)
+    dq_few = torch.tensor([0.9, 0.9] + [0.0] * 50)
+    s_many = torch.tensor([2.0] + [1.9] * 60 + [0.0] * 50)
+    dq_many = torch.tensor([0.9] * 61 + [0.0] * 50)
+    assert abs(float(loss_top_tail(s_few, dq_few))
+               - float(loss_top_tail(s_many, dq_many))) < 0.05

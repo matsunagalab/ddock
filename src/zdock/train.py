@@ -201,6 +201,66 @@ def loss_margin_hard_negatives(
     return hinge.mean()
 
 
+def loss_top_tail(
+    scores: torch.Tensor,
+    dockq: torch.Tensor,
+    *,
+    positive_threshold: float = 0.23,
+    margin: float = 1.0,
+    k: int = 32,
+    tau_pos: float = 0.5,
+    tau_neg: float = 0.5,
+    tau_hinge: float = 1.0,
+) -> torch.Tensor:
+    """Soft "best positive must beat the top negatives" penalty.
+
+        p = tau_pos * log mean exp(s_P / tau_pos)           soft max over positives
+        n = tau_neg * log mean exp(topk(s_N) / tau_neg)     soft max over the top-k negatives
+        L = softplus((margin + n - p) / tau_hinge)
+
+    Both sides are mean-exp rather than sum-exp. ``tau * logsumexp`` exceeds the
+    true maximum by up to ``tau * log(count)``, so a sum on the positive side
+    would hand a complex with a large near-native basin a free ~2.6 SD at
+    tau = 0.5 and 200 positives -- the objective would reward basin size rather
+    than the top-1 decision. Mean-exp stays in [mean, max] and is invariant to
+    how finely the basin happens to be sampled.
+
+    Why this rather than `loss_margin_hard_negatives`: that function anchors on
+    ``min(positive)``, and measured on the frozen TEST pool the worst positive
+    sits a median 7.10 SD below the best one, so the hinge demands every
+    negative fall a margin below a pose 7 SD beneath the one that actually
+    decides Max(Top 1). The consequence is not merely a stricter constraint --
+    it changes what the term does. It is active on a median 75% of the ~1494
+    negatives per complex and divides by their count, so the few negatives that
+    outrank the best positive (median 3) receive about a thousandth of the
+    gradient. In effect the current term is a broad push-down of all negatives,
+    not a hard-negative term.
+
+    A hard ``max(positive)`` anchor would be active on 0% of negatives at the
+    median -- no gradient at all except on the complexes that already fail --
+    and would send the positive gradient to a single pose, so the argmax
+    switches with DockQ noise. Both ends are softened instead: `tau_pos`/
+    `tau_neg` control how far from a true max the two sides sit, and `k` bounds
+    how deep into the negative tail the term looks.
+
+    Edge cases match the other losses: no positives or no negatives gives a
+    graph-connected zero, so a mixed batch still backprops.
+    """
+    pos = dockq >= positive_threshold
+    neg = ~pos
+    if not pos.any() or not neg.any():
+        return (scores * 0.0).sum()
+    def _soft_max(x: torch.Tensor, tau: float) -> torch.Tensor:
+        n = torch.tensor(float(x.numel()), device=x.device, dtype=x.dtype)
+        return tau * (torch.logsumexp(x / tau, dim=0) - torch.log(n))
+
+    s_neg = scores[neg]
+    top = torch.topk(s_neg, min(k, s_neg.numel())).values
+    p = _soft_max(scores[pos], tau_pos)
+    n = _soft_max(top, tau_neg)
+    return torch.nn.functional.softplus((margin + n - p) / tau_hinge)
+
+
 def loss_basin(
     scores: torch.Tensor,
     dockq: torch.Tensor,

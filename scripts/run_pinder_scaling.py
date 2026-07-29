@@ -76,7 +76,8 @@ from zdock.prep_cache import load_prepared
 from zdock.score import (docking_score_elec, iface_score_matrix,
                          psc_score_from_terms, SC_REFERENCE_SPACING, SC_RHO)
 from zdock.rotation_grid import hopf_quaternions, random_quaternions
-from zdock.train import loss_basin, loss_margin_hard_negatives, loss_param_prior
+from zdock.train import (loss_basin, loss_margin_hard_negatives,  # noqa: E501
+                         loss_param_prior, loss_top_tail)
 
 KS = (1, 5, 10, 50, 100)
 
@@ -701,8 +702,21 @@ def mean_objective(feats, p: Params, p0: Params, beta0, args,
         # the moment that flag is passed.
         total = total + loss_basin(s, g.dockq, temperature=args.basin_temp,
                                    positive_threshold=args.dockq_thr)
-        total = total + args.lambda_margin * loss_margin_hard_negatives(
-            s, g.dockq, margin=args.margin, positive_threshold=args.dockq_thr)
+        # Which negative term (report section 5.14.26). `minanchor` is the
+        # recipe every result up to 2026-07-28 was produced with; it anchors on
+        # min(positive), which sits a median 7.10 SD below the pose that decides
+        # Max(Top 1), and is active on a median 75% of the ~1494 negatives, so
+        # it acts as a broad push-down rather than a hard-negative term.
+        if args.loss_neg == "minanchor":
+            total = total + args.lambda_margin * loss_margin_hard_negatives(
+                s, g.dockq, margin=args.margin,
+                positive_threshold=args.dockq_thr)
+        elif args.loss_neg == "toptail":
+            total = total + args.lambda_margin * loss_top_tail(
+                s, g.dockq, margin=args.margin,
+                positive_threshold=args.dockq_thr, k=args.toptail_k,
+                tau_pos=args.tau_pos, tau_neg=args.tau_neg,
+                tau_hinge=args.tau_hinge)
     total = total / max(1, len(feats))
     # rho is regularised towards its published initial value on the same
     # quadratic footing as alpha and the pair table.
@@ -1101,6 +1115,19 @@ def main() -> None:
                     help="0 = 10 * alpha0")
     ap.add_argument("--batch-size", type=int, default=16, dest="batch_size")
     ap.add_argument("--lambda-margin", type=float, default=0.5, dest="lambda_margin")
+    # The three-condition ablation of report section 5.14.26. `none` is the
+    # mechanism control: it removes the negative term entirely, so a difference
+    # between `none` and `minanchor` is what the min-anchor actually bought.
+    ap.add_argument("--loss-neg", default="minanchor", dest="loss_neg",
+                    choices=("minanchor", "none", "toptail"),
+                    help="negative term: min(positive)-anchored hinge (the "
+                         "recipe behind every result up to 2026-07-28), none, "
+                         "or the soft top-tail penalty")
+    ap.add_argument("--toptail-k", type=int, default=32, dest="toptail_k",
+                    help="how deep into the negative tail --loss-neg toptail looks")
+    ap.add_argument("--tau-pos", type=float, default=0.5, dest="tau_pos")
+    ap.add_argument("--tau-neg", type=float, default=0.5, dest="tau_neg")
+    ap.add_argument("--tau-hinge", type=float, default=1.0, dest="tau_hinge")
     ap.add_argument("--lambda-prior", type=float, default=0.1, dest="lambda_prior")
     ap.add_argument("--basin-temperature", type=float, default=0.5, dest="basin_temp")
     ap.add_argument("--margin", type=float, default=1.0)
@@ -1309,6 +1336,7 @@ def main() -> None:
         selection would silently continue a different run.
         """
         keys = ("iface_mode", "lambda_margin", "margin", "lambda_prior",
+                "loss_neg", "toptail_k", "tau_pos", "tau_neg", "tau_hinge",
                 "iface_lr", "alpha_lr", "rho_lr", "freeze_psc", "psc_mode",
                 "loss_prov", "basin_temp", "batch_size", "dockq_thr",
                 "pool_cap", "n_fit", "seed", "spacing", "rot_set",
