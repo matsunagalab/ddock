@@ -5066,6 +5066,264 @@ apoは同じsystemなので独立confirmationではなく、順位2の根拠は�
 PINDER-Sで `apo_R & apo_L` が両方あるのは 93 / 250 件（`predicted` は250件全て）。
 以上はcodexの報告と一致する。
 
+#### 5.14.24 +8.40 ppの内訳と、`ntop` 診断の決着（2026-07-28、GPU不要）
+
+**問い。** §5.14.23 が挙げた検査のうち、追加GPUを使わずに既存の出力だけで
+答えられるものを先に片付ける。(1) `Max(Top 1)` の +8.40 pp は
+DockQ 0.23 の閾値をわずかに跨いだ少数例の集積か。(2) same-UniProt homodimerの
+対称解をnegative扱いしている既知の制限が結果を作っていないか。
+(3) 深い `--ntop` に伸びしろはあるか。
+
+##### CAPRI遷移（`scripts/capri_transitions.py`、`pinder_s` / `holo` / `Max(Top 1)`）
+
+`MethodMetrics` のper-decoy frameをPINDERと同じ規則（提出decoyのmax）で集約した。
+`scripts/score_decoys_with_pinder.py` に `--metrics-out` を追加し、
+leaderboardの隣にper-decoy CSVを残すようにした（集約値からは「どの系が動いたか」が
+復元できないため）。
+
+| クラス | published | trained_N220 | 獲得 | 喪失 |
+| --- | --- | --- | --- | --- |
+| acceptable | 66.40 % | 74.80 % | 22 | 1 |
+| medium | 61.60 % | 69.20 % | 20 | 1 |
+| high | 30.80 % | 32.40 % | 6 | 2 |
+
+**閾値アーティファクトではない。** 新たにacceptableになった22件のうち、
+DockQが 0.23 + 0.02 以内にあるものは **0件**。22件のDockQは
+min 0.391 / median 0.675 / max 0.907 で、遷移の大半は
+`Incorrect 0.005–0.066 → Medium/High 0.5–0.9` である。すなわち top-1 pose が
+別のbasinへ移っており、境界をかすめて越えたのではない。
+唯一の大きな後退は `2a8f__A1_P15569--2a8f__B1_P15569`（High 0.890 → Incorrect 0.062）で、
+これはhomodimerである。
+
+##### homodimer cohort
+
+| cohort | n | published | trained_N220 | 差 |
+| --- | --- | --- | --- | --- |
+| same-UniProt homodimer | 71 | 54.93 % | 63.38 % | +8.45 pp |
+| それ以外 | 179 | 70.95 % | 79.33 % | +8.38 pp |
+
+**cohort差は無い。** 対称解をnegativeとして扱っている制限は実在するが、
++8.40 pp をこの制限が作っているわけではない。homodimerの絶対水準は
+16 pp 低く、これは制限そのものの影響として別に残る。
+
+##### ranking truncation（`scripts/rank_truncation_diag.py`）
+
+既存の per-complex CSV（`first_hit_rank`、`recall`、`ceiling_dockq`）だけで測れる。
+
+| | published | trained_N220 |
+| --- | --- | --- |
+| 回転格子で DockQ≥0.23 に到達可能 | 249 / 250 (99.6 %) | 249 / 250 |
+| 上位1500に near-native が入った | 237 (94.8 %) | **242 (96.8 %)** |
+| 到達可能だが上位1500に入らなかった | **13** | **8** |
+| 取得済みだが rank 1 ではない | 72 | 58 |
+
+first-hit rank の分布は published で `≤1: 165, ≤5: 200, ≤10: 207, ≤100: 228,
+≤1500: 237`、trained で `≤1: 184, ≤5: 213, ≤10: 219, ≤100: 237, ≤1500: 242`。
+
+**`ntop` を深くして救えるのは最大 13 / 250 = 5.2 %（学習後は 8 = 3.2 %）で、
+しかも救ったうえで1位に来なければ `Max(Top 1)` は動かない。** 残りはすべて
+ranking の問題である。§5.14.23 が優先度3に置いた `ntop`→`nside` 診断は、
+追加のGPU実験を要さずここで決着し、優先度から落とす。
+副次的な観察として、学習は**上位1500の保持率そのもの**も上げている
+（237→242）。探索の枝刈りがスコアに依存するため、良いスコアは
+「近native poseを1500件の中に残す」段階でも効いている。
+
+**限界。** 以上はすべて `pinder_s` / `holo`、N=220 seed 0 の1 checkpointに対する
+記述である。seed分散は§5.14.25で測る。
+
+#### 5.14.25 実行中: 公式指標でのN scalingとapo（2026-07-28 23:27 投入）
+
+**問い。** 公式PINDER指標での +8.40 pp は1 seed 1点であり、seed分散が無い。
+また N=220 と N=500 の比較は固定TESTプール上の自前DockQで行ったもので
+（§5.14.19、success@10 で null）、評価体系をPINDERへ移した後には測っていない。
+
+**投入した条件（追加学習なし、既存checkpointの end-to-end 探索のみ）。**
+`N220_seed1`, `N220_seed2`, `N500_seed0`, `N500_seed1`, `N500_seed2`
+を GPU 0/3/6 に3分割で流し、`data/pinder_eval/trained_<cond>/` へ公式提出形式で
+書き出してから harness で一括採点する（`scripts/run_official_nscaling.sh`）。
+29 s/複合体、1条件あたり約41分。
+
+続けて `scripts/overnight_queue.sh` が、(A) apo 93件の両条件、
+(C) N=1000 採掘の残りシャード 1/6・2/6・4/6・5/6 を順に流す。
+シャード0と3は採掘済み。`--mine-only` はシャード完走時にしかキャッシュを書かないため、
+中断した4本は先頭からやり直しになる（208複合体 × 約150 s ≒ 8.7 h/シャード、
+3 GPUで2波）。**朝までには終わらない。**
+
+`apo` は新スクリプト `scripts/eval_search_apo.py` で行う。apo monomerは別々に解かれた
+構造なので**共通frameが無く、内部DockQ・recall・rotation ceilingは定義できない**。
+このスクリプトは探索とdecoy書き出しだけを行い、採点はすべてPINDERに任せる。
+`check_geometry` は意図的に無効化する（apo入力は定義上「共通frameに無い2鎖」であり、
+guardが検出すべき対象そのものではない）。1件で経路を確認済み:
+`3k1i__D1_O25709--3k1i__A1_O25448` の apo decoyは
+iRMS 9.18 Å / LRMS 23.1 Å / Fnat 0.0 / DockQ 0.048、`native_contacts` 54 が正しく解決され、
+penalty行ではなく実測行として採点された（この系はbaseline・apoでは外れている）。
+
+##### 結果1: 公式指標でのseed分散とN scaling（2026-07-29 04:30完了）
+
+`pinder_s` / `holo`、公式harness、250/250。`Max(Top 1)` acceptable。
+
+| 条件 | acceptable | medium | high | Max(Top 5) acc | 該当数 /250 |
+| --- | --- | --- | --- | --- | --- |
+| published | 66.4 % | 61.6 % | 30.8 % | 81.2 % | 166 |
+| N=220 seed 0 | **74.8 %** | 69.2 % | 32.4 % | 86.0 % | 187 |
+| N=220 seed 1 | **74.8 %** | 69.2 % | 32.8 % | 85.6 % | 187 |
+| N=220 seed 2 | **74.8 %** | 69.2 % | 32.4 % | 85.6 % | 187 |
+| N=500 seed 0 | 73.2 % | 67.6 % | 32.4 % | 86.0 % | 183 |
+| N=500 seed 1 | 72.0 % | 67.2 % | 32.0 % | 86.0 % | 180 |
+| N=500 seed 2 | 72.8 % | 67.2 % | 32.4 % | 86.0 % | 182 |
+
+**seed分散は N=220 で厳密にゼロである。** 3 seedは acceptable 判定が
+**1複合体も違わない**（seed 0 vs 1、0 vs 2、1 vs 2 いずれも相違0件）。
+したがって +8.40 pp は seed noise ではない。published との対比は
+exact McNemar で 22勝1敗、$p = 5.7\times10^{-6}$。
+N=500 では seed 間で 1〜3 複合体が入れ替わるので、分散が無いのは N=220 固有の性質である。
+
+**N=500 は N=220 より一貫して悪い。** seed対ごとの paired exact McNemar は
+(4勝0敗, $p=0.125$)、(7勝0敗, $p=0.016$)、(5勝0敗, $p=0.063$)。
+3 seed の多数決でも 187 対 182（5勝0敗, $p=0.063$）。
+**16件の不一致すべてが N=220 側の勝ち**で、N=500 が勝った複合体は一つも無い。
+個々の $p$ は 0.05 前後だが、方向は完全に一貫している。
+
+これは §5.14.19 の固定プール上の結果（success@10 で null、AUCは N=500 が上）と
+矛盾しない。公式のtop-1指標では、データを増やしても改善せず、むしろわずかに悪い。
+**交絡の明示**: N=500 の fit集合は N=220 の上位集合ではないので、
+「件数」と「どの複合体が入るか」は分離できていない。
+
+##### 結果2: apo への転移（2026-07-29 05:35完了、93/93 docked、skip 0）
+
+`apo_R` と `apo_L` が両方ある **93件**。holo側も同じ93件に制限して比較する
+（250件の holo率と93件の apo率を並べると、apo構造の有無という選択と交絡する）。
+
+| monomer | published | trained_N220 | gain | 勝/敗 |
+| --- | --- | --- | --- | --- |
+| holo（93件に限定） | 49.46 % | 59.14 % | **+9.68 pp** | 10勝1敗 |
+| apo | 22.58 % | 26.88 % | **+4.30 pp** | 4勝0敗 |
+
+$$\Delta_\text{int}=G_\text{apo}-G_\text{holo}=-5.38\ \text{pp},\quad
+\text{95\% CI}\ [-11.83,\ +1.08],\quad P(\Delta_\text{int}<0)=0.934$$
+
+（複合体を再標本化した paired bootstrap、10,000回。`scripts/apo_holo_interaction.py`）
+
+**読み。** 学習した表は apo でも改善する（+4.30 pp、4勝0敗、負けなし）。
+利得は holo の半分以下に減衰しているように見えるが、**この減衰は統計的に確立していない**
+（CIが0を跨ぐ、不一致件数が holo 11件 / apo 4件と少ない）。
+すなわち「bound側鎖のpackingへの過学習」も「apoは誰にとっても難しいだけ」も、
+このデータでは棄却できない。判定には93件では検出力が足りず、
+`pinder_xl` のapo（342件）まで広げる必要がある。
+
+**apoの絶対水準は holo の半分以下である**（22.58 % 対 49.46 %、DockQ中央値 0.03 対 …）。
+またこの93件は holo でも平均より難しい（49.46 % 対 全250件の 66.4 %）。
+
+`trained_N220_seed1/2` と `trained_N500_*` の apo 行が 0.00 なのは、
+apo を published と trained_N220 の2条件でしか走らせていないためで、
+PINDER の欠損penalty（DockQ 0）で埋まった行である。結果ではない。
+
+#### 5.14.26 margin項は hard negative 項ではなく広域正則化だった（2026-07-28）
+
+**問い（利用者提起）。** 損失としてrank lossに再考の余地はあるか。
+
+**まず事実誤認の訂正（codexによる、検算済み）。** 「`loss_basin` は正例集合を
+一様に持ち上げるので top-1 に無関心」という私の読みは**誤り**である。
+
+$$L_\text{basin}=-\log\frac{\sum_P e^{s/T}}{\sum_{P\cup N} e^{s/T}}
+=\log\Bigl(1+\tfrac{N}{P}\Bigr)
+=\operatorname{softplus}\bigl[\mathrm{LSE}(s_N/T)-\mathrm{LSE}(s_P/T)\bigr]$$
+
+すなわち basin は既に「softmax重み付きの最良正例 vs softmax重み付きの最良負例」の
+比較であり、$T=0.5$ では LSE は best positive が支配する。基本設計は
+`Max(Top 1)` と整合している。
+
+##### 測定（`scripts/rank_loss_headroom.py`、固定TESTプール、search由来pose、N220 seed 0学習後、236複合体）
+
+スコアは複合体ごとに中心化し自身のSDで割る（学習時の `normalized_scores` と同じ。
+`margin = 1.0` はこの単位）。
+
+| | 値 |
+| --- | --- |
+| top-1 が正例 | 183 (77.5 %) |
+| top-1 が負例 | 53 (22.5 %) |
+| 外した53件の (best negative − best positive) | p10 0.36 / p25 0.63 / **median 1.29** / p75 2.48 / p90 4.06 SD |
+| うち 1.0 SD 以内 | 20件（外れの37.7 %） |
+| best positive を上回る負例の個数 | median 3 / p75 14 / p90 76 |
+| **(best positive − worst positive)** | p25 4.49 / **median 7.10** / p75 9.79 / p90 12.52 SD |
+
+`loss_margin_hard_negatives` のアンカーは `min(positive)` であり、それは
+best positive の中央値 **7.10 SD 下**にある。`Max(Top 1)` が要求するのは
+`max_pos > max_neg` だけなので、この項はおよそ 8 SD 分だけ過剰に厳しい条件を課す。
+
+##### hinge が実際に触っている負例の数
+
+| hinge が有効な負例の割合（複合体あたり負例は中央値1494件） | `min_pos` アンカー（現行） | `max_pos` アンカー |
+| --- | --- | --- |
+| p25 | 34.47 % | 0.00 % |
+| median | **74.95 %** | **0.00 %** |
+| p75 | 97.52 % | 0.13 % |
+
+有効件数の比は中央値 **740倍**。`hinge.mean()` は全負例で割るため、現行の項は
+約1120件の負例に $1/1494$ ずつ勾配を配っている。**名前に反して hard negative 項では
+なく、負例全体を押し下げる広域正則化として働いている。** 勝敗を決める上位数件
+（best positive を上回るのは中央値3件）の勾配は約1000倍に希釈される。
+
+**これは §5.14.21 の mining null の機構説明にもなる。** 損失が既に負例の3/4を
+押し下げている以上、新しく採掘した負例を追加しても損失の景色はほとんど変わらない。
+§5.14.21 では「新規負例はbandに入るが最難関より1.87 SD下」と記述したが、
+より根本的には**bandが広すぎた**ということである。
+
+##### 次の実験（codexとの議論、2026-07-28）
+
+`max_pos` へのhard切り替えは採らない。中央値で有効負例が0 %になり、53件の失敗以外で
+勾配が消えるうえ、勝者1 poseにしか正例勾配が流れずargmaxの切替とDockQノイズで
+高分散になる。代わりに soft top-tail:
+
+$$p_\tau=\tau_p\log\!\sum_{i\in P}e^{s_i/\tau_p},\quad
+n_{\tau,k}=\tau_n\log\operatorname{meanexp}\bigl(\mathrm{TopK}_{j\in N}(s_j)/\tau_n\bigr),\quad
+L_\text{top}=\operatorname{softplus}\bigl((m+n_{\tau,k}-p_\tau)/\tau_h\bigr)$$
+
+**3条件のablation**（同一fit・同一初期値・同一minibatch列、3 seed）:
+(1) 現行 basin + min-anchor hinge、(2) basin のみ（min-anchor の機構ablation）、
+(3) basin + soft top-tail。
+
+一次指標は凍結した開発集合での end-to-end `Max(Top 1)` acceptable。機構指標として
+top-1500 acceptable recall、recall条件付きTop 1、Medium/High、Top 1 DockQ を併記し、
+$P(\text{Top1 hit})=P(\text{retrieved})\cdot P(\text{Top1}\mid\text{retrieved})$ に
+分解して、min-anchor が持つかもしれない「正例basin全体を持ち上げて上位1500への保持を
+広げる」副次効果（§5.14.24 で観測した 237→242）を検証する。
+固定プールは勾配診断と高速screeningのみに使い、選択の一次根拠にしない。
+seedは独立標本として検定せず、複合体を再標本化して3 seed平均のpaired差をbootstrapする。
+
+`loss_listnet_dockq`（graded listwise、実装済みだが未使用）は Top 1 acceptable とは
+直接整合しないが、正例ゼロの72件に勾配を与えられる唯一の候補なので、
+subthreshold DockQ に分散がある複合体限定の補助損失としてのみ検討する。
+ただし現実装は正例ゼロ時に一様targetでスコアを平坦化するため、そのままでは使えない。
+
+**容量診断との順序。** 損失を先に直す。「容量がbinding」は損失に条件付けられた問いで
+あり、目的関数が配備指標とずれたまま shell 拡張すると追加容量を誤った分離に使う。
+最終的には（現行/新損失）×（144/shell拡張）の2×2が、objective不足とcapacity不足を
+最も明確に分離する。
+
+##### 実装（2026-07-29、未実行）
+
+`zdock.train.loss_top_tail` と `run_pinder_scaling.py --loss-neg
+{minanchor,none,toptail}` を追加した。既定は `minanchor`、すなわち
+2026-07-28 までの全結果を出したレシピのままで、明示的に指定しない限り挙動は変わらない。
+`--toptail-k`（既定32）、`--tau-pos` / `--tau-neg`（既定0.5）、`--tau-hinge`（既定1.0）。
+`resume_identity()` のキーにも加えたので、損失を変えたまま resume することはできない。
+
+**実装中に見つけた設計上の誤り。** 正例側を `tau*logsumexp` にすると、それは真のmaxを
+最大 $\tau\log|P|$ 上回る。$\tau=0.5$、正例200件なら 2.65 SD の下駄になり、
+**目的関数が「top-1を当てたこと」ではなく「near-native basinが大きいこと」を報酬にする**。
+両側とも mean-exp（$\tau\log\operatorname{mean}\exp$、値域 $[\text{mean},\max]$）に
+変更した。単体テスト6件を追加し、うち1件はこの性質そのもの
+（正例を2件から61件へ増やしても損失が0.05以内）を検査する。
+既存テストは `tests/test_scaling_streaming.py` と `tests/test_phase7_train.py` の
+43件が通る。
+
+**この節の最大の限界（codexの指摘）。** この損失仮説は **PINDER-S TEST の53失敗例を
+見て作られた**。以後TESTで選択しなくても、変更後のPINDER-S値は未使用標本での確認では
+ない。未使用 `pinder_train` から fit と interface-cluster disjoint な開発集合を確保し、
+そこで設計を凍結したうえで、独立confirmationは XL-minus-S 等で行う必要がある。
+現行の55件validationは Top 1 差の解像度が不足している。
+
 ---
 
 ## 6. 解釈と注意

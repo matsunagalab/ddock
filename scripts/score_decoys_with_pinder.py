@@ -99,6 +99,12 @@ def main() -> None:
                     help="system used for the native-against-itself check")
     ap.add_argument("--pdb-dir", default="external/pinder/pinder/2024-02/pdbs",
                     dest="pdb_dir")
+    # The leaderboard is an aggregate: it cannot say WHICH systems moved, so it
+    # cannot answer whether a hit-rate gain is a handful of complexes crossing
+    # the CAPRI threshold by a hair. Keep the per-decoy frame.
+    ap.add_argument("--metrics-out", default="", dest="metrics_out",
+                    help="per-decoy metrics CSV (default: <out> with "
+                         "'_per_decoy' appended)")
     args = ap.parse_args()
 
     print(_force_biotite_pdb_backend())
@@ -132,6 +138,12 @@ def main() -> None:
               f"{sorted(set(missing.id))[:5]}"
               f"{' ...' if missing.id.nunique() > 5 else ''}")
     print()
+
+    mpath = Path(args.metrics_out) if args.metrics_out else \
+        Path(args.out).with_name(Path(args.out).stem + "_per_decoy.csv")
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_csv(mpath, index=False)
+    print(f"per-decoy metrics -> {mpath}")
 
     # per-decoy CAPRI distribution, before any aggregation
     print("CAPRI class of every scored decoy")
