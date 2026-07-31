@@ -291,3 +291,69 @@ def test_top_tail_does_not_reward_a_finely_sampled_basin():
     dq_many = torch.tensor([0.9] * 61 + [0.0] * 50)
     assert abs(float(loss_top_tail(s_few, dq_few))
                - float(loss_top_tail(s_many, dq_many))) < 0.05
+
+
+# ------------------------------------------------------- pairwise shaping loss
+
+
+def test_shape_zero_when_nothing_is_near_native():
+    """gamma = u(max DockQ), so a pool of pure garbage contributes nothing."""
+    from zdock.train import loss_shape_pairwise
+
+    s = torch.randn(50, requires_grad=True)
+    loss = loss_shape_pairwise(s, torch.zeros(50))
+    assert float(loss) == 0.0
+    loss.backward()
+    assert s.grad is not None
+
+
+def test_shape_weight_scales_with_how_close_the_best_pose_is():
+    """The whole point of using the absolute scale: a complex whose best pose is
+    DockQ 0.02 must matter far less than one at 0.20."""
+    from zdock.train import loss_shape_pairwise
+
+    s = torch.tensor([0.0, 1.0] + [0.5] * 20)      # the better pose ranks below
+    near = torch.tensor([0.20, 0.0] + [0.0] * 20)
+    far = torch.tensor([0.02, 0.0] + [0.0] * 20)
+    a = float(loss_shape_pairwise(s, near))
+    b = float(loss_shape_pairwise(s, far))
+    assert a > b > 0
+    # QUADRATIC, not linear: gamma gates the complex and (u_i - u_j) weights the
+    # pair, and both carry u(q_max) when the rival pose has DockQ 0. So the
+    # median zero-positive complex (best DockQ 0.073) is down-weighted to
+    # (0.073/0.23)^2 = 0.10, not 0.32 -- shaping is driven by the near misses.
+    assert a / b == pytest.approx((0.20 / 0.02) ** 2, rel=1e-3)
+
+
+def test_shape_rewards_putting_the_better_pose_first():
+    from zdock.train import loss_shape_pairwise
+
+    dq = torch.tensor([0.20, 0.01] + [0.0] * 20)
+    bad = torch.tensor([0.0, 2.0] + [0.0] * 20)     # worse pose on top
+    good = torch.tensor([2.0, 0.0] + [0.0] * 20)
+    assert float(loss_shape_pairwise(good, dq)) < float(loss_shape_pairwise(bad, dq))
+
+
+def test_shape_ignores_pairs_that_are_not_meaningfully_different():
+    """delta_q keeps DockQ noise from being taught as an ordering."""
+    from zdock.train import loss_shape_pairwise
+
+    s = torch.tensor([0.0, 1.0] + [0.0] * 20)
+    dq = torch.tensor([0.101, 0.100] + [0.099] * 20)   # every gap below delta_q
+    assert float(loss_shape_pairwise(s, dq, delta_q=0.02)) == 0.0
+    # and the same pool with one genuinely better pose is not zero
+    dq2 = dq.clone()
+    dq2[0] = 0.200
+    assert float(loss_shape_pairwise(s, dq2, delta_q=0.02)) > 0.0
+
+
+def test_shape_saturates_at_the_acceptable_threshold():
+    """u is clamped at 1, so an acceptable pose and a high-quality one carry the
+    same relevance -- above the threshold this term is not the right tool."""
+    from zdock.train import loss_shape_pairwise
+
+    s = torch.tensor([0.0, 1.0] + [0.0] * 20)
+    at = torch.tensor([0.23, 0.0] + [0.0] * 20)
+    above = torch.tensor([0.90, 0.0] + [0.0] * 20)
+    assert float(loss_shape_pairwise(s, at)) == \
+        pytest.approx(float(loss_shape_pairwise(s, above)))

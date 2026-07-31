@@ -261,6 +261,74 @@ def loss_top_tail(
     return torch.nn.functional.softplus((margin + n - p) / tau_hinge)
 
 
+def loss_shape_pairwise(
+    scores: torch.Tensor,
+    dockq: torch.Tensor,
+    *,
+    positive_threshold: float = 0.23,
+    lambda_weight: float = 1.0,
+    n_anchor: int = 16,
+    k_neg: int = 32,
+    delta_q: float = 0.02,
+    tau: float = 1.0,
+) -> torch.Tensor:
+    """Ordering signal for complexes whose best pose is not even acceptable.
+
+    Measured over the N=1000 mining pools, 461 of 1250 complexes (36.9%) have no
+    search-derived pose at DockQ >= 0.23. Under a binary-relevance objective they
+    are silent: their gradient is identically zero, and adding more such
+    complexes is what "more data" has been buying (report section 5.14.27).
+
+    A per-complex rank normalisation would wake them up by declaring their best
+    pose correct, which it is not -- their best DockQ has median 0.073 and
+    reaches 0.15 in only 16.3% of them. So the ordering is used, but its weight
+    comes from the calibrated absolute scale:
+
+        u(q)   = min(q / threshold, 1)          relevance, 1 at acceptable
+        gamma  = u(max q)                       0.32 for the median such complex
+        L      = gamma * mean over pairs (i, j) with q_i - q_j >= delta_q of
+                     (u_i - u_j) * softplus((s_j - s_i) / tau)
+
+    So "which pose should rank higher" is decided by the DockQ order, and "how
+    much this complex should matter at all" by how close its best pose comes to
+    acceptable.
+
+    The down-weighting is QUADRATIC in that closeness, not linear: gamma gates
+    the complex and (u_i - u_j) weights the pair, and against a rival at DockQ 0
+    both equal u(q_max). The median zero-positive complex (best DockQ 0.073)
+    therefore enters at (0.073/0.23)^2 = 0.10, and the term is effectively driven
+    by the near misses -- the 16.3% whose best pose reaches 0.15. That is the
+    intended bias: those are the complexes a better ranking could plausibly
+    convert, and it keeps the loss from chasing pools whose best pose is 0.02.
+
+    Pairs are not all-against-all. `i` ranges over the `n_anchor` poses with the
+    highest DockQ and `j` over the `k_neg` highest-SCORING poses -- the ones
+    actually threatening them. Averaging over ~1.5M pairs would repeat the
+    dilution that makes `loss_margin_hard_negatives` a broad regulariser.
+
+    Nothing here uses enumerated poses: the signal stays inside the distribution
+    the FFT search returns at deployment, unlike `--loss-prov all`.
+    """
+    if dockq.numel() == 0:
+        return (scores * 0.0).sum()
+    u = (dockq / positive_threshold).clamp(max=1.0)
+    gamma = float(u.max())
+    if gamma <= 0.0:
+        return (scores * 0.0).sum()
+    m = min(n_anchor, dockq.numel())
+    k = min(k_neg, scores.numel())
+    ai = torch.topk(dockq, m).indices
+    bj = torch.topk(scores, k).indices
+    du = u[ai].unsqueeze(1) - u[bj].unsqueeze(0)          # (m, k) relevance gap
+    dq = dockq[ai].unsqueeze(1) - dockq[bj].unsqueeze(0)
+    keep = dq >= delta_q
+    if not keep.any():
+        return (scores * 0.0).sum()
+    ds = scores[bj].unsqueeze(0) - scores[ai].unsqueeze(1)  # (m, k) score gap
+    pen = du * torch.nn.functional.softplus(ds / tau)
+    return lambda_weight * gamma * pen[keep].mean()
+
+
 def loss_basin(
     scores: torch.Tensor,
     dockq: torch.Tensor,

@@ -77,7 +77,7 @@ from zdock.score import (docking_score_elec, iface_score_matrix,
                          psc_score_from_terms, SC_REFERENCE_SPACING, SC_RHO)
 from zdock.rotation_grid import hopf_quaternions, random_quaternions
 from zdock.train import (loss_basin, loss_margin_hard_negatives,  # noqa: E501
-                         loss_param_prior, loss_top_tail)
+                         loss_param_prior, loss_shape_pairwise, loss_top_tail)
 
 KS = (1, 5, 10, 50, 100)
 
@@ -692,7 +692,18 @@ def loss_view(f: Feats, loss_prov: str) -> Feats:
 
 
 def mean_objective(feats, p: Params, p0: Params, beta0, args,
-                   charge_dummy, device):
+                   charge_dummy, device, *, with_prior: bool = True):
+    """The training objective. ``with_prior=False`` returns the data terms only.
+
+    Checkpoint selection must use the data terms alone. The prior depends on the
+    parameters and not at all on the validation complexes, so including it makes
+    the selection criterion prefer tables near the published one *regardless of
+    how well they predict* -- and the two forces are not comparable in size. At
+    the parameters a direct convex fit reaches, the prior is 0.1 * 6.86^2 = 4.70
+    against a data loss of about 2.95, so the better-predicting table would be
+    rejected by a criterion that is mostly measuring distance from the start
+    (report section 5.14.30).
+    """
     total = torch.zeros((), device=p.alpha.device, dtype=p.alpha.dtype)
     for f in feats:
         g = loss_view(f, args.loss_prov).to(device)
@@ -700,6 +711,17 @@ def mean_objective(feats, p: Params, p0: Params, beta0, args,
         # Forward the pool's own threshold: the loss functions default to 0.23
         # independently of --dockq-threshold, so the two would silently diverge
         # the moment that flag is passed.
+        # A complex whose best pose is not even acceptable is silent under
+        # every term below -- 461 of 1250 at N=1000 (report section 5.14.27).
+        # `--loss-shape pairwise` gives it an ordering signal instead, weighted
+        # by how close its best pose comes to the threshold, and takes the
+        # complex out of the binary terms entirely so the two never mix.
+        if args.loss_shape != "none" and float(g.dockq.max()) < args.dockq_thr:
+            total = total + args.lambda_shape * loss_shape_pairwise(
+                s, g.dockq, positive_threshold=args.dockq_thr,
+                n_anchor=args.shape_anchors, k_neg=args.shape_k,
+                delta_q=args.shape_delta_q, tau=args.shape_tau)
+            continue
         total = total + loss_basin(s, g.dockq, temperature=args.basin_temp,
                                    positive_threshold=args.dockq_thr)
         # Which negative term (report section 5.14.26). `minanchor` is the
@@ -729,14 +751,20 @@ def mean_objective(feats, p: Params, p0: Params, beta0, args,
     # the same footing and the modes stay comparable.
     prior = prior + ((p.log_clash - p0.log_clash).pow(2).sum()
                      if p.mode == "free" else (p.rho - p0.rho).pow(2))
-    return total + args.lambda_prior * prior
+    return (total + args.lambda_prior * prior) if with_prior else total
 
 
 @torch.no_grad()
 def _val_loss(val_feats, p: Params, p0: Params, beta0, args,
               charge_dummy, device):
-    return float(mean_objective(val_feats, p, p0, beta0,
-                                args, charge_dummy, device))
+    """Validation loss for checkpoint selection: data terms only.
+
+    Every result up to 2026-07-30 was selected with the prior included; pass
+    ``--val-loss objective`` to reproduce those runs exactly.
+    """
+    return float(mean_objective(val_feats, p, p0, beta0, args, charge_dummy,
+                                device,
+                                with_prior=args.val_loss == "objective"))
 
 
 def train_params(fit_feats, val_feats, p: Params, p0: Params, beta0,
@@ -1128,6 +1156,28 @@ def main() -> None:
     ap.add_argument("--tau-pos", type=float, default=0.5, dest="tau_pos")
     ap.add_argument("--tau-neg", type=float, default=0.5, dest="tau_neg")
     ap.add_argument("--tau-hinge", type=float, default=1.0, dest="tau_hinge")
+    # Report section 5.14.28. Off by default: every result up to 2026-07-29 was
+    # produced without it, and it changes which complexes contribute at all.
+    ap.add_argument("--loss-shape", default="none", dest="loss_shape",
+                    choices=("none", "pairwise"),
+                    help="ordering signal for complexes with no acceptable "
+                         "pose, which are otherwise silent")
+    ap.add_argument("--lambda-shape", type=float, default=1.0, dest="lambda_shape")
+    ap.add_argument("--shape-anchors", type=int, default=16, dest="shape_anchors",
+                    help="how many highest-DockQ poses anchor the pairs")
+    ap.add_argument("--shape-k", type=int, default=32, dest="shape_k",
+                    help="how many highest-SCORING poses they are compared against")
+    ap.add_argument("--shape-delta-q", type=float, default=0.02, dest="shape_delta_q",
+                    help="minimum DockQ gap for a pair to be taught")
+    ap.add_argument("--shape-tau", type=float, default=1.0, dest="shape_tau")
+    # 2026-07-31: checkpoint selection used the prior-inclusive objective, so it
+    # preferred tables near the published one on top of whatever the data said.
+    ap.add_argument("--val-loss", default="data", dest="val_loss",
+                    choices=("data", "objective"),
+                    help="what the fixed-validation checkpoint criterion is: "
+                         "the data terms only (default), or the full training "
+                         "objective including the prior, which is what every "
+                         "run up to 2026-07-30 used")
     ap.add_argument("--lambda-prior", type=float, default=0.1, dest="lambda_prior")
     ap.add_argument("--basin-temperature", type=float, default=0.5, dest="basin_temp")
     ap.add_argument("--margin", type=float, default=1.0)
@@ -1337,6 +1387,9 @@ def main() -> None:
         """
         keys = ("iface_mode", "lambda_margin", "margin", "lambda_prior",
                 "loss_neg", "toptail_k", "tau_pos", "tau_neg", "tau_hinge",
+                "val_loss",
+                "loss_shape", "lambda_shape", "shape_anchors", "shape_k",
+                "shape_delta_q", "shape_tau",
                 "iface_lr", "alpha_lr", "rho_lr", "freeze_psc", "psc_mode",
                 "loss_prov", "basin_temp", "batch_size", "dockq_thr",
                 "pool_cap", "n_fit", "seed", "spacing", "rot_set",

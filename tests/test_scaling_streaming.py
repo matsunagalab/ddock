@@ -663,3 +663,42 @@ def test_voxel_table_spacing_must_match_the_run(tmp_path):
     sel, _, _, _, info = mod.select_split(
         _Args(n_fit=8, grid_voxels=str(tmp_path / "voxels.json"), **common))
     assert info["n_excluded_oversized"] == 1
+
+
+def test_val_loss_excludes_the_prior():
+    """Checkpoint selection must not be steered by distance from the published
+    table. The prior does not depend on the validation complexes at all, so
+    including it made the criterion prefer a nearer table over a better one.
+    """
+    import types
+
+    mod = _load_run_module()
+    device = torch.device("cpu")
+    dq = [0.9] + [0.0] * 7
+    feats = [_fake_feats(mod, "a", 8, dq, 0)]
+    args = types.SimpleNamespace(
+        loss_prov="all", basin_temp=0.5, dockq_thr=0.23, lambda_margin=0.5,
+        margin=1.0, lambda_prior=0.1, loss_neg="minanchor", loss_shape="none",
+        lambda_shape=1.0, shape_anchors=16, shape_k=32, shape_delta_q=0.02,
+        shape_tau=1.0, toptail_k=32, tau_pos=0.5, tau_neg=0.5, tau_hinge=1.0,
+        val_loss="data")
+    alpha = torch.tensor(1.0, dtype=torch.float64)
+    rho = torch.tensor(3.5, dtype=torch.float64)
+    p0 = mod.Params(alpha.clone(), rho.clone(),
+                    iface_ij(dtype=torch.float64, flat=True).clone())
+    p = mod.Params(alpha.clone(), rho.clone(),
+                   iface_ij(dtype=torch.float64, flat=True).clone() + 3.0)
+    dummy = torch.zeros(0, dtype=torch.float64)
+
+    data = mod.mean_objective(feats, p, p0, 3.0, args, dummy, device,
+                              with_prior=False)
+    full = mod.mean_objective(feats, p, p0, 3.0, args, dummy, device,
+                              with_prior=True)
+    assert float(full) > float(data), "the prior must cost something here"
+
+    args.val_loss = "data"
+    assert mod._val_loss(feats, p, p0, 3.0, args, dummy, device) == \
+        pytest.approx(float(data))
+    args.val_loss = "objective"
+    assert mod._val_loss(feats, p, p0, 3.0, args, dummy, device) == \
+        pytest.approx(float(full))
