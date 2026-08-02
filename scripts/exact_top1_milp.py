@@ -177,6 +177,13 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=8)
     ap.add_argument("--time-limit", type=float, default=300.0, dest="time_limit")
     ap.add_argument("--seed", type=int, default=0)
+    # The incumbent is not just a bound, it is a table -- fitted by maximising
+    # the deployed metric directly. Saving it lets the obvious question be
+    # answered: does a table that is exactly optimal on n complexes generalise?
+    ap.add_argument("--save-tables", default="", dest="save_tables",
+                    help="directory for each subset's incumbent table (.npy)")
+    ap.add_argument("--val-pool-glob", default="", dest="val_pool_glob",
+                    help="score every incumbent on the validation pool too")
     args = ap.parse_args()
 
     run = Path(args.run)
@@ -221,8 +228,24 @@ def main() -> None:
             print(f"{s:7d} {len(sub):4d}  MILP failed")
             continue
         inc, bnd, e_m, rnd = out
+        extra = ""
+        if args.val_pool_glob:
+            if "V" not in dir():
+                val_ids = set(json.load(open(run / "split.json"))["val_ids"])
+                V = Problem(load(args.val_pool_glob, val_ids, alpha, clash, beta,
+                                 args.thr, e0), alpha, clash, beta, args.thr, e0)
+            vh = V.top1(e_h)
+            vm = V.top1(e_m)
+            v0 = V.top1(e0)
+            extra = (f"   val: e0 {100 * v0[0] / v0[1]:.1f}%  "
+                     f"hinge {100 * vh[0] / vh[1]:.1f}%  "
+                     f"MILP {100 * vm[0] / vm[1]:.1f}%")
+        if args.save_tables:
+            Path(args.save_tables).mkdir(parents=True, exist_ok=True)
+            np.save(Path(args.save_tables) / f"milp_n{len(sub)}_s{s}.npy", e_m)
         print(f"{s:7d} {len(sub):4d} {h_ok:7d} {inc:7d} {min(bnd, len(sub)):7d} "
-              f"{min(bnd, len(sub)) - inc:5d} {rnd:7d} {time.time() - t0:7.1f}")
+              f"{min(bnd, len(sub)) - inc:5d} {rnd:7d} {time.time() - t0:7.1f}"
+              f"{extra}")
 
     print("\nMILP > hinge means the surrogate is leaving value on the table.")
     print("MILP == bound means the certificate is tight; a gap means the search "
