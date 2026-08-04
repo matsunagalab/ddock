@@ -158,6 +158,9 @@ def main() -> None:
     ap.add_argument("--rho0", type=float, default=SC_RHO)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--shard", default="0/1",
+                    help="i/n -- take every n-th system starting at i, so "
+                         "several GPUs can split one directory")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -182,6 +185,8 @@ def main() -> None:
     ids = sorted(p.name for p in src_root.iterdir() if p.is_dir())
     if args.limit:
         ids = ids[: args.limit]
+    si, sn = (int(x) for x in args.shard.split("/"))
+    ids = ids[si::sn]
     print(f"{len(ids)} systems from {src_root}\n")
 
     moved, dq_before, dq_after, t0 = [], [], [], time.time()
@@ -210,11 +215,15 @@ def main() -> None:
             out_scores.append(best)
             moved.append((float(np.linalg.norm(x[:3])), float(np.linalg.norm(x[3:]))))
         order = np.argsort(-np.asarray(out_scores))       # re-rank on the new score
-        pt = torch.as_tensor(np.stack(out_poses), device=device, dtype=dtype)
-        base_t = torch.as_tensor(np.stack([read_ligand(m) for m in models]),
-                                 device=device, dtype=dtype)
-        dq_before.append(float(dockq_batch(prot.rec_xyz, base_t, prot.native_lig).dockq[0]))
-        dq_after.append(float(dockq_batch(prot.rec_xyz, pt, prot.native_lig).dockq[int(order[0])]))
+        # DockQ only for the two poses that are reported. Scoring all K at once
+        # asks for a (K, N_lig, N_rec) distance matrix, which is 40 GB at K=50
+        # on a large complex; the official harness computes the rest anyway.
+        pair = torch.as_tensor(np.stack([read_ligand(models[0]),
+                                         out_poses[int(order[0])]]),
+                               device=device, dtype=dtype)
+        dq = dockq_batch(prot.rec_xyz, pair, prot.native_lig).dockq
+        dq_before.append(float(dq[0]))
+        dq_after.append(float(dq[1]))
 
         out = dst_root / pid / args.monomer / "models"
         out.mkdir(parents=True, exist_ok=True)
