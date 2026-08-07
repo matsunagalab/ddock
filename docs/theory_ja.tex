@@ -1,0 +1,555 @@
+% コンパイル: tectonic docs/theory_ja.tex
+%   （XeLaTeX 系。lualatex を使う場合は下の documentclass を
+%    \documentclass[11pt,a4paper]{ltjsarticle} に置き換え、
+%    xeCJK のブロックを削除する）
+\documentclass[11pt,a4paper]{article}
+\usepackage{xeCJK}
+\setCJKmainfont{Noto Serif CJK JP}
+\setCJKsansfont{Noto Sans CJK JP}
+\setCJKmonofont{Noto Sans Mono CJK JP}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{geometry}
+\geometry{margin=25mm}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SOthree}{\mathrm{SO}(3)}
+\newcommand{\dockq}{\mathrm{DockQ}}
+\newtheorem{prop}{命題}
+\newtheorem{defn}{定義}
+
+\title{学習可能なFFTドッキング\\
+{\large スコア関数の線形性を使って「どこで損をしているか」を測る}}
+\author{DDOCK プロジェクト実験ノート}
+\date{2026年8月}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+2つのタンパク質がどう結合するかを予測する剛体ドッキングにおいて、
+古典的手法ZDOCKのスコア関数の$144$個のパラメータだけを学習で決め直した。
+本稿は、その理論的背景と、実験の経緯を数式とともに整理する。
+
+中心となる観察は、\textbf{スコアが学習パラメータについてアフィンである}という
+一点である。これにより、(i)~学習を凸最適化として大域最適に解くことができ、
+(ii)~到達可能な性能の上限を線形計画で計算でき、
+(iii)~「損失が悪いのか・容量が足りないのか・最適化が下手なのか」を分離して
+測定できる。この性質を用いて誤差を4つの成分へ分解し、
+公式ベンチマークで acceptable $66.4\% \to 84.0\%$、high $30.8\% \to 73.6\%$ を得た。
+同時に、データ量の増加・パラメータ数の増加・hard negative採掘が
+\emph{効かない}ことを再現可能な形で示した。
+\end{abstract}
+
+\tableofcontents
+
+\section{問題設定}
+
+\subsection{剛体ドッキング}
+
+2つのタンパク質$A, B$の立体構造が別々に既知であるとき、
+両者が結合した複合体の構造を予測する問題を考える。
+$A$を\textbf{受容体}（固定）、$B$を\textbf{リガンド}（可動）と呼ぶ。
+タンパク質を剛体とみなすと、$B$の配置は
+\begin{equation}
+  g = (R, t) \in \mathrm{SE}(3) = \SOthree \times \R^3
+\end{equation}
+という$6$自由度で表される。$R$は回転、$t$は並進である。
+リガンドの原子座標を$\{y_1,\dots,y_{N_L}\}$とすると、配置$g$における座標は
+\begin{equation}
+  y_i(g) = R\,(y_i - \bar y) + \bar y + t
+\end{equation}
+となる（$\bar y$は重心）。この$g$を\textbf{pose}と呼ぶ。
+
+予測の目標は、正解の配置$g^\star$（実験構造から定まる）に近い$g$を見つけることである。
+
+\subsection{スコア関数}
+
+配置の良し悪しを実数値で測る関数$S(g)$を\textbf{スコア関数}と呼び、
+$\arg\max_g S(g)$を答えとする。ZDOCK 3.0.2 のスコアは3項からなる：
+\begin{equation}
+  S(g) \;=\; \underbrace{\alpha\,S_{\mathrm{PSC}}(g)}_{\text{形状相補性}}
+        \;+\; \underbrace{\sum_{i=1}^{12}\sum_{j=1}^{12} e_{ij}\,T_{ij}(g)}_{\text{原子対の統計ポテンシャル}}
+        \;+\; \underbrace{\beta\,S_{\mathrm{ELEC}}(g)}_{\text{静電相互作用}} .
+  \label{eq:score}
+\end{equation}
+
+ここで中央の項が本研究の対象である。
+全原子を$12$種類の\textbf{原子タイプ}に分類し
+（実際には $(\text{残基名},\text{原子名})$ の$167$通りの組を$12$個へ写像する）、
+\begin{equation}
+  T_{ij}(g) \;=\; \#\{(a,b) : \mathrm{type}(a)=i,\ \mathrm{type}(b)=j,\ \|x_a - y_b(g)\| < r_c\}
+\end{equation}
+すなわち「受容体側のタイプ$i$の原子と、リガンド側のタイプ$j$の原子が
+距離$r_c$以内で接触した回数」を数える。$e_{ij}$はその重みで、
+$12\times12 = 144$個ある。これを並べたベクトルを
+\begin{equation}
+  e = (e_{11},\dots,e_{12,12}) \in \R^{144}
+\end{equation}
+と書く。\textbf{本研究で学習するのはこの$e$だけ}であり、
+$\alpha, \beta$ および$S_{\mathrm{PSC}}$内部の係数は固定する。
+
+\subsection{FFTによる全探索}
+
+$6$次元空間$\mathrm{SE}(3)$を素朴に離散化すると組合せ爆発する。
+ZDOCKは以下の構造を使って回避する。
+
+まず$\SOthree$を有限集合
+$\mathcal{Q} = \{R_1,\dots,R_M\}$（$M = 1944$）に離散化する。
+各$R_m$を固定すると、並進についてのスコアは\textbf{相関}の形になる。
+受容体とリガンドをそれぞれ格子上の関数
+$F^{(k)}_R : \Lambda \to \R$、$F^{(k)}_L : \Lambda \to \R$
+（$\Lambda$は$1.2$\,\AA{}間隔の3次元格子、$k$はチャネル）で表すと、
+\begin{equation}
+  T_{ij}(R_m, t) \;=\; \sum_{u \in \Lambda} F^{(i)}_R(u)\, F^{(j)}_L(u - t)
+  \;=\; \bigl(F^{(i)}_R \star F^{(j)}_L\bigr)(t)
+  \label{eq:corr}
+\end{equation}
+と書ける。相関は畳み込み定理により
+\begin{equation}
+  F^{(i)}_R \star F^{(j)}_L
+  = \mathcal{F}^{-1}\Bigl[\overline{\mathcal{F}[F^{(i)}_R]} \cdot \mathcal{F}[F^{(j)}_L]\Bigr]
+\end{equation}
+と計算でき、格子点数$n$に対して$O(n\log n)$で\textbf{全並進位置}が一度に得られる。
+
+\begin{prop}[加法性の要請]
+式\eqref{eq:corr}が成り立つのは、スコアが
+\emph{原子対についての和}になっているからである。
+すなわち
+\begin{equation}
+  S(g) = \sum_{a \in A}\sum_{b \in B} w\bigl(\mathrm{type}(a), \mathrm{type}(b), \|x_a - y_b(g)\|\bigr)
+\end{equation}
+という形（\textbf{ペア加法的}）であることが、FFTによる全探索の必要条件である。
+\end{prop}
+
+この制約は本研究を通じて繰り返し現れる。原子タイプを細分しても距離を多段にしても
+加法性は保たれるが、「この接触は、あの接触も同時にあるときだけ有利」という
+協同効果は表現できない。
+
+各回転について並進の上位を取り、全体で上位$K$件（既定$K = 1500$）を残す。
+
+\section{評価}
+
+\subsection{DockQとCAPRI分類}
+
+予測poseと正解の一致度は$\dockq \in [0,1]$で測る。
+これは接触の再現率$f_{\mathrm{nat}}$、界面RMSD、リガンドRMSDを合成した量で、
+国際コンペCAPRIの基準により4段階に離散化される：
+\begin{equation}
+  \mathrm{CAPRI}(\dockq) =
+  \begin{cases}
+    \text{Incorrect}  & \dockq < 0.23,\\
+    \text{Acceptable} & 0.23 \le \dockq < 0.49,\\
+    \text{Medium}     & 0.49 \le \dockq < 0.80,\\
+    \text{High}       & \dockq \ge 0.80 .
+  \end{cases}
+\end{equation}
+
+\subsection{報告する指標}
+
+複合体の集合$\mathcal{C}$（$|\mathcal{C}| = 250$）について、
+各複合体で上位$K$件を提出したとき
+\begin{align}
+  \mathrm{Max}(\mathrm{Top}\,k)_{\text{acc}}
+  &= \frac{1}{|\mathcal{C}|}\sum_{c \in \mathcal{C}}
+     \mathbf{1}\Bigl[\max_{p \in \mathrm{Top}_k(c)} \dockq(p) \ge 0.23\Bigr],\\
+  \mathrm{Oracle}@K &= \mathrm{Max}(\mathrm{Top}\,K) .
+\end{align}
+$\mathrm{Max}(\mathrm{Top}\,1)$が実運用の指標であり、
+$\mathrm{Oracle}@K$は「候補の中から常に正しく選べたら」という上限である。
+両者の差が\textbf{順位づけの損失}を表す。
+
+\section{学習問題}
+
+\subsection{アフィン性}
+
+式\eqref{eq:score}を$e$について整理する。
+$\alpha, \beta$ および$S_{\mathrm{PSC}}$の係数が固定であるから、
+pose $p$のスコアは
+\begin{equation}
+  \boxed{\;s_p(e) \;=\; c_p \;+\; \langle A_p,\, e\rangle\;}
+  \label{eq:affine}
+\end{equation}
+と書ける。ここで
+\begin{align}
+  c_p &= \alpha\, S_{\mathrm{PSC}}(p) + \beta\, S_{\mathrm{ELEC}}(p)
+         \quad(\text{$e$に依存しない定数}),\\
+  A_p &= \sigma \cdot \mathrm{vec}\bigl(T(p)^{\!\top}\bigr) \in \R^{144}
+         \quad(\sigma = -1 \text{ は符号の約束}).
+\end{align}
+
+式\eqref{eq:affine}が本研究の出発点である。以下のすべてがここから従う。
+
+\subsection{目的：Top-1の的中}
+
+複合体$c$について、候補集合$\mathcal{P}_c$（正例、$\dockq \ge 0.23$）と
+$\mathcal{N}_c$（負例）が与えられる。
+「複合体$c$を解けた」とは
+\begin{equation}
+  \exists\, p \in \mathcal{P}_c \;\text{s.t.}\; \forall n \in \mathcal{N}_c:\;
+  s_p(e) > s_n(e)
+  \label{eq:solved}
+\end{equation}
+であり、最大化したいのは
+\begin{equation}
+  H(e) \;=\; \sum_{c} \mathbf{1}\bigl[\text{式\eqref{eq:solved}が成立}\bigr].
+  \label{eq:objective}
+\end{equation}
+
+式\eqref{eq:solved}を$e$について書き直すと、
+\begin{equation}
+  \langle A_p - A_n,\; e\rangle \;>\; c_n - c_p
+  \label{eq:linear-ineq}
+\end{equation}
+という\textbf{線形不等式}になる。$\exists$（論理和）があるため
+$H$自体は非凸だが、この構造が後の議論をすべて可能にする。
+
+\subsection{当初の損失関数}
+
+本研究は当初、次の3項を最小化していた（$s$は複合体ごとに中心化し標準偏差で割った値）：
+\begin{equation}
+  \mathcal{L}(e) \;=\;
+  \underbrace{\mathcal{L}_{\mathrm{basin}}}_{\text{(a)}}
+  + 0.5\,\underbrace{\mathcal{L}_{\mathrm{margin}}}_{\text{(b)}}
+  + 0.1\,\underbrace{\|e - e_0\|^2}_{\text{(c)}} .
+  \label{eq:oldloss}
+\end{equation}
+
+\paragraph{(a) basin損失（multi-positive InfoNCE）}
+離散化と対称性により正例は複数存在するので、
+その集合全体の確率質量を持ち上げる：
+\begin{equation}
+  \mathcal{L}_{\mathrm{basin}}
+  = -\log \frac{\sum_{p \in \mathcal{P}} e^{s_p/\tau}}{\sum_{q \in \mathcal{P}\cup\mathcal{N}} e^{s_q/\tau}},
+  \qquad \tau = 0.5 .
+\end{equation}
+これは
+\begin{equation}
+  \mathcal{L}_{\mathrm{basin}}
+  = \log\Bigl(1 + \tfrac{N}{P}\Bigr)
+  = \mathrm{softplus}\bigl[\mathrm{LSE}(s_{\mathcal{N}}/\tau) - \mathrm{LSE}(s_{\mathcal{P}}/\tau)\bigr]
+\end{equation}
+と変形でき（$\mathrm{LSE}$は log-sum-exp）、
+実は「softmax重み付き最良正例 vs.\ softmax重み付き最良負例」の比較である。
+$\tau$が小さいほど最良の要素が支配する。
+
+\paragraph{(b) hard negative損失}
+\begin{equation}
+  \mathcal{L}_{\mathrm{margin}}
+  = \frac{1}{|\mathcal{N}|}\sum_{n \in \mathcal{N}}
+    \max\Bigl(0,\; m + s_n - \min_{p \in \mathcal{P}} s_p\Bigr), \qquad m = 1 .
+  \label{eq:minanchor}
+\end{equation}
+
+\paragraph{(c) 事前分布}
+公開表$e_0$からの逸脱を罰する二次項。
+
+\section{診断I：損失の欠陥}
+
+\subsection{アンカーの位置}
+
+式\eqref{eq:minanchor}は$\min_{p} s_p$、すなわち\textbf{最悪の正例}を基準にする。
+しかしTop-1の的中に必要なのは$\max_p s_p > \max_n s_n$だけである。
+実測すると（複合体ごとの標準偏差を単位として）
+\begin{equation}
+  \operatorname{median}_c\Bigl[\max_{p} s_p - \min_{p} s_p\Bigr] = 7.10\ \mathrm{SD}
+\end{equation}
+であり、マージン$m = 1$と合わせて\textbf{約8\,SD分}だけ過剰に厳しい条件を課していた。
+
+その帰結は「厳しすぎる」に留まらない。この項が有効（$\max(0,\cdot)$の中が正）
+となる負例の割合は、$\min$アンカーで中央値$74.95\%$、
+$\max$アンカーなら中央値$0\%$である（比にして約$740$倍）。
+$|\mathcal{N}| \approx 1494$で割っているので、
+\textbf{勝敗を決める上位数件（$\max_p s_p$を上回るのは中央値3件）の勾配が
+約1000倍に希釈}されていた。名前に反して、これは
+hard negative項ではなく\emph{負例全体を押し下げる広域正則化}であった。
+
+\subsection{事前分布による到達不能性}
+
+学習後の表は$\|e - e_0\|_2 = 1.37$の位置にあった。一方、
+後述する凸最適化で得られる良い解は$6.86$の位置にある。
+罰則$0.1\|e-e_0\|^2$の値はそれぞれ
+\begin{equation}
+  0.1 \times 1.37^2 = 0.188, \qquad 0.1 \times 6.86^2 = 4.70
+\end{equation}
+であり、データ項全体（実測$\approx 2.95$）より大きい。
+\textbf{良い解のある領域へ行くこと自体が目的関数によって禁じられていた}。
+
+さらに、checkpointを選ぶvalidation損失にもこの罰則が含まれていた。
+罰則は検証データに依存しないので、選択基準は
+「予測が良い表」ではなく「公開表に近い表」を測っていたことになる。
+
+\section{診断II：凸最適化と容量の上限}
+
+\subsection{凸な代理問題}
+
+式\eqref{eq:solved}の$\exists$を、複合体ごとに1つの正例$p(c)$を
+\textbf{固定}することで除去すると、目的関数は凸になる：
+\begin{equation}
+  \min_{e}\;
+  \frac{1}{|\mathcal{C}|}\sum_{c}
+  \max\Bigl(0,\; \max_{n \in \mathcal{N}_c}\bigl[\epsilon + s_n(e) - s_{p(c)}(e)\bigr]\Bigr)
+  + \frac{\lambda}{2}\|e - e_0\|^2 .
+  \label{eq:convex}
+\end{equation}
+$\max$の中は$e$のアフィン関数なので、その$\max$は凸、$\max(0,\cdot)$も凸、
+和と二次項を足しても凸である。したがって
+\textbf{局所解が存在せず、L-BFGSで大域最適が得られる}。
+学習率・初期値・停止規則・checkpoint選択という不確定要素がすべて消える。
+
+$\lambda$は交差検証で選ぶ。実測では$\lambda$を4桁動かしても
+CV性能は$49.14\%$--$49.76\%$とほぼ平坦であり、
+\textbf{正則化の強さはレバーではなかった}。効いたのは目的関数の形である。
+
+\subsection{容量の上限}
+
+式\eqref{eq:linear-ineq}が線形不等式であることから、
+「複合体$c$を解ける$e$は存在するか」は\textbf{線形計画の実行可能性問題}になる。
+複合体ごとに独立に解くと、$\|e-e_0\|_\infty \le 1$の範囲で
+$100\%$の複合体が個別には解ける。
+
+しかし配備される表は\textbf{全複合体で共有}される。
+共有した場合の真の最大値$H^\star = \max_e H(e)$を求めるには、
+式\eqref{eq:objective}の$\exists$を二値変数で表した混合整数計画が要る：
+\begin{align}
+  \max_{e,\,y,\,z} \quad & \sum_c y_c \\
+  \text{s.t.}\quad
+  & \sum_{p \in \mathcal{P}_c} z_{cp} = y_c, \qquad \forall c \\
+  & \langle A_p - A_n,\, e\rangle \ \ge\ c_n - c_p + \epsilon - M(1 - z_{cp}),
+    \quad \forall c, p, n \\
+  & \|e - e_0\|_\infty \le R, \qquad y, z \in \{0,1\} .
+\end{align}
+$M$は十分大きい定数（big-M）で、$z_{cp} = 0$のとき制約を無効化する。
+負例の制約は膨大なので、切除平面法（違反したものだけ追加）で扱う。
+
+実測では$n = 12$複合体で厳密解が得られ（$12/12$、ヒンジ解は$11$）、
+$n \ge 25$では上界が自明化して破綻した。
+また、この最適解を\emph{学習器}として使うと
+公開表より汎化が悪い（$28.9\%$ vs.\ $38.8\%$）。
+マージンも正則化もなく的中数だけを最大化するため、
+「スコア差$0.001$で勝った」複合体を量産し、新しいデータで反転するからである。
+
+\section{診断III：回転格子が品質の天井を作る}
+
+\subsection{離散化誤差}
+
+正解の回転$R^\star$は格子$\mathcal{Q}$上にない。最近接格子点までの角度を
+\begin{equation}
+  \theta^\star = \min_{m} d\bigl(R_m, R^\star\bigr)
+\end{equation}
+とすると（$d$は回転間の測地距離）、実測で中央値$9.5^\circ$、最大$14.4^\circ$である。
+この誤差はどんなスコア関数でも取り除けない。
+
+\subsection{角度と品質の関係}
+
+正解poseをランダムな軸まわりに角度$\theta$だけ回して公式採点した結果：
+
+\begin{center}
+\begin{tabular}{lccccccc}
+\toprule
+$\theta$ & $0^\circ$ & $2^\circ$ & $4^\circ$ & $6^\circ$ & $8^\circ$ & $10^\circ$ & $12^\circ$\\
+\midrule
+Acceptable & 100 & 100 & 100 & 100 & 100 & 100 & 99.6\\
+Medium     & 100 & 100 & 100 & 99.6 & 99.6 & 98.4 & 96.0\\
+\textbf{High} & \textbf{100} & \textbf{100} & \textbf{98.8} & \textbf{81.2} & \textbf{48.4} & \textbf{18.0} & \textbf{4.8}\\
+$\dockq$中央値 & 1.000 & 0.970 & 0.930 & 0.870 & 0.800 & 0.740 & 0.680\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Highには$\theta \lesssim 5^\circ$が必要}であり、
+Acceptableは$12^\circ$でもほぼ無傷である。
+すなわち回転格子は\emph{品質}のみを制約する。
+
+実際、格子上で到達可能な上限を公式指標で測ると
+Acceptable $100\%$、Medium $99.6\%$、\textbf{High $39.6\%$}であり、
+学習後の実測は$38.0\%$であった。\textbf{到達可能分の$96\%$を既に取っていた}。
+
+$\SOthree$の被覆半径は回転数$M$に対しておよそ$M^{-1/3}$で縮むので、
+角度を半分にするには$M$を$8$倍にする必要がある。
+$\theta$の中央値を$9.7^\circ \to 4.9^\circ$にするには$M: 1944 \to 15552$である。
+
+\subsection{局所精密化}
+
+格子を細かくする代わりに、探索で得たposeを$\mathrm{SE}(3)$上で連続的に動かす。
+$6$パラメータ$x = (\omega_1,\omega_2,\omega_3, t_1,t_2,t_3)$による剛体変換
+\begin{equation}
+  g_x(y) = \exp\bigl([\omega]_\times\bigr)(y - \bar y) + \bar y + t
+\end{equation}
+（$[\omega]_\times$は歪対称行列、Rodriguesの公式）について
+$S$を最大化する。
+
+勾配法を用いない理由がある。$S_{\mathrm{PSC}}$は格子への最近接割り当てと
+硬い距離しきい値を含むため、座標について\textbf{区分定数}であり、
+勾配がほとんど至るところ$0$である。よってパターン探索
+（各軸の$\pm$方向$12$候補を一括評価し、改善がなければ歩幅を半減）を用いる。
+
+事前に、正解の近傍でスコアの極大がどこにあるかを測った：
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & 公開表 & 学習後の表 \\
+\midrule
+極大の回転ずれ（中央値） & $1.4^\circ$ & $\mathbf{1.0^\circ}$ \\
+極大の並進ずれ & $1.02$\,\AA & $\mathbf{0.84}$\,\AA \\
+そこでの$\dockq$ & $0.849$ & $\mathbf{0.890}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+極大は正解と一致しないが、\textbf{Highが要求する$5^\circ$の内側}にある。
+したがって登れば品質は上がる。また学習が
+\emph{スコアの地形そのもの}を改善していたことが分かる。
+
+結果：High $38.0\% \to 68.4\%$（$78$勝$2$敗、$p = 5\times10^{-21}$）。
+格子の上限$39.6\%$を突破したのは、精密化が格子の外へ出る操作だからである。
+
+\section{誤差の分解}
+
+上位$50$件を精密化した後の測定：
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & Acceptable & Medium & High\\
+\midrule
+Top-1（実運用） & $84.00$ & $82.40$ & $73.60$\\
+$\mathrm{Oracle}@50$（精密化前） & $94.80$ & $90.00$ & $44.80$\\
+$\mathrm{Oracle}@50$（精密化後） & $\mathbf{94.80}$ & $91.60$ & $\mathbf{79.60}$\\
+\midrule
+（参考）HDOCK & $94.4$ & $94.0$ & $93.6$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+読み方は次のとおり。
+\begin{itemize}
+  \item \textbf{候補回収}：$\mathrm{Oracle}@50$のAcceptableが$94.80\%$。
+        正解は候補に入っている。探索の改良は不要。
+  \item \textbf{品質}：精密化前のHigh Oracle $44.80\%$は探索の失敗ではなく
+        回転格子の制約であり、精密化が$79.60\%$まで回復させた。
+  \item \textbf{順位づけ}：Acceptableで$94.80 - 84.00 = 10.8$\,pp を選び間違えている。
+  \item \textbf{残る品質不足}：High Oracle $79.60\%$は
+        HDOCKの$93.6\%$に届かない。完璧に選んでも足りない。
+\end{itemize}
+
+\section{効かなかったもの（negative results）}
+
+\subsection{データ量}
+
+訓練複合体数$N$を$220 \to 500 \to 1000$と増やしても改善しない。
+公式指標で$74.80 \to 72.67 \to 72.93\%$（各3 seed）であり、
+$6$組のseed対すべてで$N=220$が勝ち、負けた複合体は一つもない。
+
+線形計画で「最適な表」の学習曲線を引くと、
+\begin{center}
+\begin{tabular}{lrrrrrr}
+\toprule
+学習複合体数 $n$ & 25 & 50 & 100 & 200 & 400 & 637 \\
+LP上限 (\%)     & 30.9 & 32.0 & 42.5 & 44.5 & 47.4 & 46.7 \\
+\bottomrule
+\end{tabular}
+\end{center}
+となり、$n \approx 400$で飽和する。
+$144$個のパラメータを決めるには数百複合体で足りている。
+
+\subsection{パラメータ数}
+
+部分空間を変えて凸最適化で当てはめた結果（固定validation）：
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+モデル & 自由度 & Top-1 \\
+\midrule
+公開表 & $0$ & $38.82\%$ \\
+$\alpha$, clash, $\beta$のみ & $5$ & $40.1\%$ \\
+\textbf{sym}（対称零和成分） & $\mathbf{12}$ & $\mathbf{50.00\%}$ \\
+add（行＋列成分） & $23$ & $48.0\%$ \\
+full & $144$ & $42.76\%$ \\
+複合体を大きさで2分割 & $288$ & $47.4\%$ \\
+同 4分割 & $576$ & $46.1\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{$12$個の自由度が$144$個を上回る}。パラメータを増やす方向は効かない。
+
+ここで sym 部分空間とは、$e = e_0 + B\theta$ と書いたとき
+$B$の列が「全体の水準」と「対称な零和モード」
+$\frac{1}{\sqrt{24}}(a\otimes\mathbf{1} + \mathbf{1}\otimes a)$
+（$a$は零和ベクトル）で張られるものである。
+
+\subsection{その他}
+
+\begin{itemize}
+  \item hard negative採掘（round 1）：null。
+        新規負例の$69.3\%$が重複、最難関より$1.87$\,SD下。
+  \item 探索深度$K$の拡大：救えるのは最大$13/250 = 5.2\%$。
+  \item 精密化後の分布で表を学習し直す：$123$件中$+1$件（$+0.82$\,pp）。
+  \item basin安定性（終点を叩いて戻る割合）：単独ではAUC $0.738$の判別力を持つが、
+        スコアと組み合わせると寄与ゼロ。学習を挟むと$-0.25$--$-4.28$\,pp。
+\end{itemize}
+
+\section{結果と現在地}
+
+公式PINDERベンチマーク（\texttt{pinder\_s}/holo、$250$件、$\mathrm{Max}(\mathrm{Top}\,1)$）：
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+ & Acceptable & Medium & High & $\dockq$中央値\\
+\midrule
+公開表（出発点） & $66.40$ & $61.60$ & $30.80$ & $0.71$\\
+公開表 + 精密化 & $74.40$ & $72.40$ & $60.40$ & $0.88$\\
+学習（凸）のみ & $76.80$ & $72.40$ & $38.00$ & $0.76$\\
+\textbf{学習 + 精密化} & $\mathbf{84.00}$ & $\mathbf{82.40}$ & $\mathbf{73.60}$ & $\mathbf{0.91}$\\
+\midrule
+PatchDock & $53.6$ & $52.4$ & $43.6$ & ---\\
+FRODOCK & $89.6$ & $87.6$ & $84.8$ & ---\\
+HDOCK & $94.4$ & $94.0$ & $93.6$ & ---\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$2\times2$の分解によれば、Highの伸びは\textbf{ほぼ全部が精密化}であり
+（精密化 $+29.6$/$+30.4$\,pp、学習 $+7.2$/$+8.0$\,pp、交互作用 $+0.8$）、
+Acceptableでは学習の寄与が大きいが交互作用が$-4.4$\,ppと負である
+（両者が同じ複合体を部分的に直している）。
+
+\section{未解決の問題}
+
+\begin{enumerate}
+  \item \textbf{順位づけの$10.8$\,pp。}
+        パラメータ学習では回収できないことが確定した。
+        非加法なモデル、あるいは現在のスコアが見ていない特徴量が要る。
+        basin安定性は失敗した。
+  \item \textbf{Highの品質。} Oracle $79.60\%$がHDOCKの$93.6\%$に届かない。
+        「精密化エネルギー」（正解で最小になる滑らかな別関数）の学習が候補だが、
+        その前に\emph{探索範囲が原因か、エネルギーが原因か}を切り分ける必要がある。
+  \item \textbf{sym(12)の実地検証。} 固定プールで$+7.24$\,pp だが、
+        表を変えると探索が返す候補も変わるため、end-to-end評価が必要。
+  \item \textbf{方法論上の限界。} 本ベンチマークを設計判断に反復使用しているため、
+        現在の数値は探索的である。未使用のcohort（\texttt{pinder\_xl} $\setminus$
+        \texttt{pinder\_s}、$1705$件、クラスタ重複$0$を実測）での確認が要る。
+\end{enumerate}
+
+\section{方法論としての要点}
+
+本研究の技術的な核は、式\eqref{eq:affine}のアフィン性である。これにより
+\begin{itemize}
+  \item 学習を凸最適化として\textbf{大域最適}に解けるので、
+        性能が出ないときに「最適化のせい」を排除できる；
+  \item 到達可能性の\textbf{上限}を線形計画で計算できるので、
+        「容量のせい」かどうかを判定できる；
+  \item 特徴量をキャッシュしておけば任意のパラメータで即座に再スコアできるので、
+        診断が安価である。
+\end{itemize}
+
+一方、この性質は「$144$個のパラメータの線形モデル」という
+古典的な設定に依存しており、ニューラルネットワークに基づく手法には移せない。
+逆に、加法性はFFTによる全探索を可能にしており、
+その結果として候補回収率は$96$--$97\%$と高い
+（サンプリングに基づく手法にはこの保証がない）。
+\textbf{加法性は探索においては強みであり、順位づけにおいては制約である。}
+
+\end{document}

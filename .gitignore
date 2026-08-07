@@ -40,3 +40,10 @@ logs/
 
 # Literature PDFs (publisher copies — not redistributable)
 ref/
+
+# LaTeX build products (regenerate with `tectonic docs/theory_ja.tex`)
+docs/*.pdf
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
