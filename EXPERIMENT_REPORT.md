@@ -6378,7 +6378,8 @@ tectonic docs/theory_ja.tex        # docs/theory_ja.pdf が出る
 ```
 
 `ltjsarticle` + `lualatex` に戻す手順は .tex 冒頭のコメントに記した。
-PDF は生成物なので `.gitignore` に入れてある。
+PDF (`docs/theory_ja.pdf`, 265 KB) も TeX 環境なしで読めるようコミットしてある
+（.tex を直したら再ビルドして一緒にコミットすること）。
 
 > **重要な訂正（2026-07-26）。この節と §7 の以下の記述は §5.12〜§5.14 で
 > 無効化された。** TEST セットの参照構造が 250/250 で立体的に不可能だった
