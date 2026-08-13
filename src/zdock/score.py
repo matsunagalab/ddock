@@ -711,6 +711,7 @@ def docking_score_elec(
     psc_d: float = PSC_D,
     return_components: bool = False,
     psc_decompose: bool = False,
+    rec_weight: torch.Tensor | None = None,
 ):
     """Return a (F,) tensor of docking scores.
 
@@ -805,7 +806,16 @@ def docking_score_elec(
     # H[j] = Σ_atoms_of_type_j (within rcut=6 of cell) indicator. Weight 1.
     H = torch.zeros((12, nx, ny, nz), device=device, dtype=dtype)
     rec_group_iface = (rec_atomtype_id - 1).to(torch.long).clamp(0, 11)
-    rec_weights_ones = torch.ones(rec_xyz.shape[0], device=device, dtype=dtype)
+    # `rec_weight` restricts which receptor atoms count, without changing the
+    # grid. Passing an indicator for a subset and summing the results over a
+    # partition of the receptor reproduces the unrestricted `T` exactly, which
+    # is what lets a sub-typed feature be built from this same path instead of
+    # a parallel reimplementation. Filtering `rec_xyz` instead would move the
+    # grid (its extent is derived from the receptor) and the parts would no
+    # longer add up. Default None keeps every atom at weight 1.
+    rec_weights_ones = (torch.ones(rec_xyz.shape[0], device=device, dtype=dtype)
+                        if rec_weight is None
+                        else rec_weight.to(device=device, dtype=dtype))
     _grouped_spread_neighbors_add(
         H, rec_xyz, rec_group_iface, rec_weights_ones, rcut_iface,
         x_grid, y_grid, z_grid,

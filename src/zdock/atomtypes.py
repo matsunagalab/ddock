@@ -49,7 +49,17 @@ _ACE_SCORE: tuple[float, ...] = (
 
 # docking.jl `get_iface_ij()` — symmetric 12×12 matrix of pairwise atom-type
 # interaction energies. Row/col ordering: R+, Polar, mc, RHK_mc, CG, WY_sc,
-# MEW_sc, DE-, DE_mc, ILV_sc, K+, AILMV_mc (see thesis Fig 3.3).
+# MFW_sc, DE-, DE_mc, ILV_sc, K+, AILMV_mc.
+#
+# Verified 2026-08-10 against the primary source: Mintseris et al. 2007
+# (10.1002/prot.21502) Supporting Table II, in `ref/jws-prot.21502.doc`. All
+# 144 entries agree to the three decimals the table prints, and Supporting
+# Table I reproduces `_atomtype_rules.ATOMTYPE_RULES` exactly (167 rules, no
+# difference either way). Section 5.7 of the report had flagged both as
+# unverifiable because the supporting information was not to hand.
+#
+# The seventh type is MFW_sc (Met/Phe/Trp side chains) -- this comment said
+# "MEW_sc" until the table was checked. Names only; no value changed.
 _IFACE_IJ: tuple[tuple[float, ...], ...] = (
     ( 0.678,  0.133, -0.007,  0.727,  0.091, -0.742, -0.625, -0.064, -0.382, -0.302,  1.221,  0.187),
     ( 0.133,  0.180,  0.065,  0.295,  0.057, -0.631, -0.663,  0.612,  0.342, -0.275,  0.604,  0.248),
