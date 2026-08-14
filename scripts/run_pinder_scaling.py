@@ -546,7 +546,10 @@ def mine_complex(prot, p: Params, beta0, charge0, args, round_idx: int,
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             rot_chunk = max(1, rot_chunk // 2)
-            frame_chunk = max(25, frame_chunk // 2)
+            # Never increase a chunk that the voxel-aware rule already put
+            # below 25.  The old floor silently made the first retry larger on
+            # 24 GiB cards and prevented the documented halve-to-one rescue.
+            frame_chunk = max(1, frame_chunk // 2)
             pose_chunk = max(1, pose_chunk // 2)
             args_retry = attempt + 1
             print(f"    [{prot.name}] OOM (attempt {args_retry}) -> retry with "
@@ -1121,6 +1124,15 @@ def main() -> None:
                          "wrong checkpoint cannot be picked up by mistake.")
     ap.add_argument("--pool-cache", default="data/scaling/pool_cache",
                     dest="pool_cache", help="'' disables")
+    ap.add_argument(
+        "--pool-cache-read", action="append", default=[], dest="pool_cache_read",
+        help="read-only cache directory from an older nested N. The largest "
+             "N <= --n-fit whose full recipe suffix matches is reused; new "
+             "entries are still written only to --pool-cache")
+    ap.add_argument(
+        "--fail-on-skip", action="store_true", dest="fail_on_skip",
+        help="after writing a resumable partial shard, exit nonzero if any "
+             "complex still failed after the OOM rescue pass")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # optimization (identical to the stabilized §5.5 configuration)
     ap.add_argument("--epoch-passes", type=int, default=100, dest="epoch_passes",
@@ -1355,15 +1367,9 @@ def main() -> None:
     history = []
     n_skipped_total = 0
 
-    def pool_cache_key(rnd: int) -> str | None:
-        if not args.pool_cache:
-            return None
-        Path(args.pool_cache).mkdir(parents=True, exist_ok=True)
-        # The round-0 pool depends on the selection and the BASELINE parameters,
-        # neither of which depends on --seed (select_split has no RNG and the
-        # split files are byte-identical across seeds). So every seed would mine
-        # exactly the same pool. Key the cache on what actually determines it.
-        key = (f"n{args.n_fit}_r{rnd}_sp{args.spacing}_{args.pool}"
+    def pool_cache_recipe(rnd: int) -> str:
+        """Cache identity other than the prefix-stable selection size."""
+        key = (f"r{rnd}_sp{args.spacing}_{args.pool}"
                f"_{args.rot_set}{args.hopf_nside}_ntop{args.mine_ntop}"
                f"_nr{args.near_rot}_tc{args.trans_cells}"
                f"_a{args.alpha0}_rho{args.rho0}"
@@ -1377,6 +1383,16 @@ def main() -> None:
         if rnd > 0:
             key += f"_p{param_fingerprint(p)}"
         return key
+
+    def pool_cache_key(rnd: int) -> str | None:
+        if not args.pool_cache:
+            return None
+        Path(args.pool_cache).mkdir(parents=True, exist_ok=True)
+        # The round-0 pool depends on the selection and the BASELINE parameters,
+        # neither of which depends on --seed (select_split has no RNG and the
+        # split files are byte-identical across seeds). So every seed would mine
+        # exactly the same pool. Key the cache on what actually determines it.
+        return f"n{args.n_fit}_{pool_cache_recipe(rnd)}"
 
     def resume_identity() -> dict:
         """What must match for a resumed round to be the same experiment.
@@ -1494,12 +1510,47 @@ def main() -> None:
         return Path(args.pool_cache) / f"{key}{suffix}.pt"
 
     def pool_cache_read(rnd: int) -> list[Path]:
-        """Every file that can contribute, whole-set and sharded alike."""
+        """Every compatible file that can contribute, without mutating it.
+
+        ``n_fit`` is not part of a per-complex candidate set.  Because
+        ``select_split`` is prefix-stable, an older N can seed a larger run as
+        long as every recipe field after the N prefix is identical.  For each
+        explicitly read-only directory, choose only its largest compatible N
+        to avoid loading the same prefix repeatedly from N=220/500/1000.
+        """
         key = pool_cache_key(rnd)
         if key is None:
             return []
         d = Path(args.pool_cache)
-        return sorted(d.glob(f"{key}.pt")) + sorted(d.glob(f"{key}.*of*.pt"))
+        paths = sorted(d.glob(f"{key}.pt")) + sorted(d.glob(f"{key}.*of*.pt"))
+        recipe = pool_cache_recipe(rnd)
+        for raw in args.pool_cache_read:
+            source = Path(raw)
+            if not source.is_dir():
+                raise SystemExit(f"--pool-cache-read is not a directory: {source}")
+            candidates = (sorted(source.glob(f"n*_{recipe}.pt"))
+                          + sorted(source.glob(f"n*_{recipe}.*of*.pt")))
+            by_n: dict[int, list[Path]] = {}
+            for candidate in candidates:
+                prefix = candidate.name.split("_", 1)[0]
+                try:
+                    source_n = int(prefix.removeprefix("n"))
+                except ValueError:
+                    continue
+                if source_n <= args.n_fit:
+                    by_n.setdefault(source_n, []).append(candidate)
+            if not by_n:
+                raise SystemExit(
+                    f"{source} has no cache with N <= {args.n_fit} and exact "
+                    f"recipe suffix {recipe}; refusing to re-mine silently")
+            source_n = max(by_n)
+            chosen = sorted(by_n[source_n])
+            print(f"  read-only cache source: N={source_n}, "
+                  f"{len(chosen)} file(s) from {source}", flush=True)
+            paths.extend(chosen)
+        # A read directory may equal the write directory. Load a physical file
+        # once even if it matched both routes.
+        return list(dict.fromkeys(path.resolve() for path in paths))
 
     #: per-round mining bookkeeping, written into round<r>_metrics.json
     mine_stats: dict[int, dict] = {}
@@ -1674,6 +1725,8 @@ def main() -> None:
         # de-duplication, the positive freeze and the cap all belong to
         # `absorb`, and running them here as well would apply them twice.
         mined_raw: dict[str, Feats] = {}
+        cached_for_write: dict[str, Feats] = {}
+        freshly_mined: dict[str, Feats] = {}
         sources = pool_cache_read(rnd) if targets else []
         if sources:
             for src in sources:
@@ -1691,6 +1744,8 @@ def main() -> None:
                             f"last one would make the pool depend on glob "
                             f"order. Delete the stale shard.")
                     tgt[f.name] = f
+                    if cpath is not None and src == cpath.resolve():
+                        cached_for_write[f.name] = f
             for pid, f in mined_raw.items():
                 if pid in fit_set:
                     absorb(pid, f, rnd)
@@ -1726,11 +1781,13 @@ def main() -> None:
             nf, meta = try_mine(pid, rnd)
             if nf is None:
                 failed.append((pid, meta))
-            elif rnd == 0:
-                absorb(pid, nf, rnd)
             else:
-                mined_raw[pid] = nf
-                absorb(pid, nf, rnd)
+                freshly_mined[pid] = nf
+                if rnd == 0:
+                    absorb(pid, nf, rnd)
+                else:
+                    mined_raw[pid] = nf
+                    absorb(pid, nf, rnd)
             if (ci + 1) % 50 == 0:
                 el = time.time() - t_mine
                 print(f"  round {rnd}: mined {ci+1}/{len(targets)} "
@@ -1753,7 +1810,7 @@ def main() -> None:
                                    + "\n")
                     n_skipped += 1
                     continue
-                nf, meta2 = try_mine(pid, rnd, rot_chunk=1, frame_chunk=25,
+                nf, meta2 = try_mine(pid, rnd, rot_chunk=1, frame_chunk=1,
                                      pose_chunk=1)
                 if nf is None:
                     skip_log.write(json.dumps(
@@ -1764,6 +1821,7 @@ def main() -> None:
                           f"(n_rec={meta2.get('n_rec')} n_lig={meta2.get('n_lig')})",
                           flush=True)
                 else:
+                    freshly_mined[pid] = nf
                     if rnd > 0:
                         mined_raw[pid] = nf
                     absorb(pid, nf, rnd)
@@ -1775,23 +1833,33 @@ def main() -> None:
                     print(f"    [{pid}] rescued at rot_chunk=1", flush=True)
         n_skipped_total += n_skipped
         mine_seconds = time.time() - t_mine
-        if cpath is not None and (targets or n_from_cache == 0):
+        if cpath is not None and freshly_mined:
             # round 0 caches the pools themselves; a later round caches the raw
             # candidate sets it mined, keyed by the parameters that found them.
-            store = pools.values() if rnd == 0 else \
-                [mined_raw[p] for p in targets if p in mined_raw]
-            if rnd == 0 or store:
-                torch.save({"n_skipped": n_skipped,
-                            "pools": [{"name": f.name, "sc": f.sc, "T": f.T,
-                                       "elec": f.elec, "rmsd": f.rmsd,
-                                       "dockq": f.dockq, "origin": f.origin,
-                                       "prov": f.prov, "pose_key": f.pose_key}
-                                      for f in store]}, cpath)
-                print(f"  round {rnd}: cached {len(list(store))} candidate "
-                      f"set(s) -> {cpath}", flush=True)
+            # On an incremental retry, preserve only entries already in this
+            # process's own shard and add the newly successful targets. Never
+            # copy read-only source pools into every new shard: older runs did
+            # that and inflated six N=1000 files from 1,250 unique complexes to
+            # 3,543 stored entries.
+            store_map = {**cached_for_write, **freshly_mined}
+            store = list(store_map.values())
+            torch.save({"n_skipped": n_skipped,
+                        "pools": [{"name": f.name, "sc": f.sc, "T": f.T,
+                                   "elec": f.elec, "rmsd": f.rmsd,
+                                   "dockq": f.dockq, "origin": f.origin,
+                                   "prov": f.prov, "pose_key": f.pose_key}
+                                  for f in store]}, cpath)
+            print(f"  round {rnd}: cached {len(store)} candidate "
+                  f"set(s) -> {cpath}", flush=True)
 
         if args.mine_only:
-            print(f"  --mine-only: wrote {cpath}; stopping before training",
+            if args.fail_on_skip and n_skipped:
+                raise SystemExit(
+                    f"--fail-on-skip: {n_skipped} complex(es) still failed "
+                    f"after rescue; partial cache {cpath} is resumable")
+            action = (f"updated {cpath}" if freshly_mined
+                      else "all assigned candidate sets came from cache")
+            print(f"  --mine-only: {action}; stopping before training",
                   flush=True)
             return
 

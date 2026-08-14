@@ -8,14 +8,15 @@ that is not a function of the present one.
 
 The model is section 5.14.38's, and it is strictly nested:
 
-    S_IFACE = <W(e_base), T> + sum_b <W(B_sym gamma_b), T_b>,   sum_b gamma_b = 0
+    S_IFACE = <W(e_base), T>
+              + sum_b <W(B_table sum_r H_band[b,r] eta_r), T_b>
 
-The zero-sum constraint is what makes gamma = 0 reproduce the deployed model
-exactly rather than approximately: the shells partition T, so a table that
-treats every shell alike is the table we already have. Imposing it by
-eliminating the last shell (gamma_3 = -gamma_1 - gamma_2) leaves 24 free
-directions on top of the 12 of the base, which is the "effective 24" the plan
-quotes.
+The columns of B_table and H_band are orthonormal; H_band is also zero-sum.
+Thus eta = 0 reproduces the deployed model exactly, while |eta|^2 is exactly
+the sum of squared Frobenius norms of the per-band table contrasts.  This is
+the same function family as eliminating the last band, but not the same ridge
+geometry.  For three bands it leaves 24 free directions on top of the 12 of
+the base, which is the "effective 24" the plan quotes.
 
 Group-wise ridge throughout: the base directions and the shell contrasts are
 different objects and a shared penalty would confound "distance does not help"
@@ -44,18 +45,28 @@ from scipy.optimize import minimize
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from capacity_series import table_basis  # noqa: E402
+from capacity_series import table_basis, zero_sum_basis  # noqa: E402
 
 from zdock.atomtypes import iface_ij  # noqa: E402
 from zdock.score import IFACE_PAIR_OFFSET, IFACE_SIGN  # noqa: E402
 
 
+def band_contrast_basis(n_bands: int) -> np.ndarray:
+    """Orthonormal basis of band contrasts whose columns sum to zero."""
+    if n_bands < 2:
+        raise ValueError("partition contrasts require at least two bands")
+    return zero_sum_basis(n_bands)
+
+
 class ShellDesign:
-    """`score = c + Phi @ theta`, theta = (base 12 | shell contrasts 12*(B-1))."""
+    """Linear score design in an orthonormal table x band parameterisation."""
 
     def __init__(self, entries, alpha, clash, beta, thr, e0, use_shells=True,
-                 col_scale=None, mode="partition"):
-        B = table_basis("sym")
+                 col_scale=None, mode="partition", basis_mode="sym"):
+        B = table_basis(basis_mode)
+        self.base_dim = B.shape[1]
+        self.table_basis = B
+        self.band_basis = None
         self.Phi, self.c, self.pos, self.names = [], [], [], []
         for name, e in entries:
             sc, T, Tb = e["sc"], e["T"], e["Tb"]
@@ -70,14 +81,28 @@ class ShellDesign:
                 ab = [(IFACE_SIGN * Tb[:, k].transpose(-2, -1)
                        .reshape(F, -1)).numpy() for k in range(nb)]
                 if mode == "partition":
-                    # The shells partition T, so a table treating them alike is
-                    # the table we already have. gamma_last = -sum(others) puts
-                    # gamma = 0 exactly at the base model.
-                    add = [(ab[k] - ab[-1]) @ B for k in range(nb - 1)]
+                    # H has orthonormal, zero-sum columns.  If eta_r is the
+                    # table coefficient for column r, delta_G_b = sum_r
+                    # H[b,r] B eta_r and therefore
+                    # sum_b ||delta_G_b||_F^2 = sum_r ||eta_r||_2^2.
+                    H = band_contrast_basis(nb)
+                    if self.band_basis is None:
+                        self.band_basis = H
+                    elif self.band_basis.shape != H.shape:
+                        raise ValueError("all entries must use the same bands")
+                    add = []
+                    for r in range(H.shape[1]):
+                        mixed = sum(H[k, r] * ab[k] for k in range(nb))
+                        add.append(mixed @ B)
                 else:
                     # Bands outside the 6 A window are not a re-partition of T
-                    # but extra information, so they enter additively and no
-                    # constraint is needed: delta = 0 is already the base model.
+                    # but extra information.  The identity band basis keeps
+                    # their independent table perturbations orthonormal.
+                    H = np.eye(nb)
+                    if self.band_basis is None:
+                        self.band_basis = H
+                    elif self.band_basis.shape != H.shape:
+                        raise ValueError("all entries must use the same bands")
                     add = [ab[k] @ B for k in range(nb)]
                 phi = np.concatenate([phi] + add, axis=1)
             self.Phi.append(phi.astype(np.float64))
@@ -86,16 +111,19 @@ class ShellDesign:
             self.names.append(name)
 
         self.d = self.Phi[0].shape[1]
-        # fitted once on fit, passed to val -- see the note in
-        # nonlinear_channels.Design; recomputing it per set silently makes the
-        # same theta mean a different function on the two sets
-        if self.d > 12:
-            if col_scale is None:
-                col_scale = np.concatenate(
-                    [np.abs(P[:, 12:]) for P in self.Phi]).mean(0) + 1e-12
-            for P in self.Phi:
-                P[:, 12:] /= col_scale
-        self.col_scale = col_scale
+        # `col_scale` remains in the public constructor because existing
+        # callers pass the fit design's value into validation.  Data-dependent
+        # feature scaling is deliberately no longer applied: it turns raw
+        # ridge into sum_j scale_j^2 * physical_coefficient_j^2.  Unit scales
+        # make that legacy call pattern harmless while preserving the common
+        # Frobenius geometry.
+        n_extra = self.d - self.base_dim
+        if col_scale is not None and np.asarray(col_scale).shape != (n_extra,):
+            raise ValueError(
+                f"col_scale has shape {np.asarray(col_scale).shape}, "
+                f"expected {(n_extra,)}"
+            )
+        self.col_scale = np.ones(n_extra, dtype=np.float64)
 
         A, cn, Ap, cp, spans, off = [], [], [], [], [], 0
         for P, c, pos in zip(self.Phi, self.c, self.pos):
@@ -144,8 +172,8 @@ class ShellDesign:
 
 def solve(design, lam, lam_extra=None, idx=None, eps=1.0, maxiter=400):
     pen = np.full(design.d, lam)
-    if lam_extra is not None and design.d > 12:
-        pen[12:] = lam_extra
+    if lam_extra is not None and design.d > design.base_dim:
+        pen[design.base_dim:] = lam_extra
 
     def fg(th):
         h, g = design.hinge(th, idx, eps)

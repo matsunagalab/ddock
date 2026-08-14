@@ -8605,6 +8605,579 @@ interaction 群に階層 ridge / group-lasso を掛け、**全 interaction ゼ�
 > 豊かな特徴が fit に存在することを利用しつつ、
 > 複合体間でどう共有するかを低次元・凸・nested に学ぶ段階である。**
 
+#### 5.14.56 certified convex solve: 未収束交絡は無く、容量--転移の形は本物（2026-08-14）
+
+**問い（§5.14.55 の優先1）。** §5.14.51--54 の容量数値はすべて
+`scipy.optimize.minimize` を非滑らかヒンジに掛けたもので、大きいアームでは
+L-BFGS-B が success を報告していなかった。したがって fit の値は
+**その族が達成する量の下界**であって容量ではない。
+「表現力を増やすと fit は上がるが転移しない」という結論は3つの下界の比較なので、
+**取りこぼしが小さくアーム間で揃っている場合にしか成立しない。**その取りこぼしを測る。
+
+##### 定式化
+
+epigraph 化すると QP になる:
+
+$$\min_{\theta,\ \xi\ge0}\ \frac1C\sum_c\xi_c+\frac\lambda2\lVert\theta\rVert^2
+\qquad\text{s.t.}\quad \xi_c\ \ge\ b_{cn}+\langle a_{cn},\theta\rangle\ \ \forall n$$
+
+$b_{cn}=\epsilon+c_n-c_{p(c)}$、$a_{cn}=A_n-A_{p(c)}$ で、
+`fit_shell.ShellDesign.hinge` と厳密に同じもの（アンカー正例は従来どおり固定）。
+
+**certification には両側が要る。落とし穴は、ソルバ自身の gap が
+「渡された restricted 問題」に対する値でしかないことである**（codex の指摘）。
+正しくは
+
+- **上界** $U=\frac1C\sum_c\max(0,\max_n[b_{cn}+\langle a_{cn},\theta\rangle])+\frac\lambda2\lVert\theta\rVert^2$
+  を**全制約について**評価する。構成上つねに primal feasible。
+- **下界** $D(\alpha)=\sum\alpha_{cn}b_{cn}-\frac1{2\lambda}\lVert\sum\alpha_{cn}a_{cn}\rVert^2$
+  は $\alpha\ge0$ かつ $\sum_n\alpha_{cn}\le1/C$ を満たす**任意の** $\alpha$ で有効。
+  これは epigraph 形の KKT がそのまま与える
+  （$\partial/\partial\xi_c$ から $\sum_n\alpha_{cn}+\mu_c=1/C$、
+  $\partial/\partial\theta$ から $\theta=-\frac1\lambda\sum\alpha_{cn}a_{cn}$）。
+
+restricted 解の双対を working set の外で0で埋め、非負化と複合体ごとの縮約で
+実行可能領域へ射影すれば、**全問題に対する妥当な双対点**になる。
+
+##### 実装と検証（`scripts/certified_solve.py`、新規）
+
+OSQP + cutting-plane。**合成データでの単体検証**を先に行った（40複合体、$d=6$）:
+
+| | 値 |
+| --- | --- |
+| gap $(U-D)/\max(1,\lvert U\rvert)$ | **0.000e+00** |
+| 再構成した双対の停留条件残差 | **4.4e-15** |
+| certified な最適値 | **1.8935965744** |
+| 参照（Nelder-Mead、20万評価） | 1.9203230236 |
+
+**certified 解のほうが汎用最適化器より 1.4 % 良い。**測りたかったものがまさにこれである。
+
+> **実装上のバグ（記録）。** 最初の停止判定は「omitted な制約の違反 $v_{cn}>0$」で
+> 判定していた。正しくは $\xi_c$ を超えるかどうかである
+> （$\xi_c$ は working set 内の最悪負例を既に吸収している）。
+> 0 と比較すると**既に満たされている制約を無限に追加し続ける**。
+> 実データで round 6 に gap 1.4e-15 で収束していたのに36ラウンド回り続けた。
+> なお $U$ は最初から全制約で評価しているので、**この誤りは certificate 自体を
+> 汚染していない**（gap が閉じた時点で全問題に対して最適である）。
+
+##### 結果（fit 637 / val 152、$\lambda=10^{-3}$）
+
+| アーム | $d$ | fit | validation | **certified gap** | max omitted violation |
+| --- | --- | --- | --- | --- | --- |
+| sym | 12 | 310/637 = 48.67 % | **76/152 = 50.00 %** | **1.08e−15** | 0.00e+00 |
+| full | 144 | 345/637 = 54.16 % | 71/152 = 46.71 % | **1.74e−14** | 0.00e+00 |
+| full+元素バンド | 432 | 379/637 = 59.50 % | 72/152 = 47.37 % | **3.10e−14** | 0.00e+00 |
+
+**3アームすべてが機械精度で certified**（gap $\sim10^{-14}$、未追加制約の違反ゼロ）。
+
+##### 判定: 未収束交絡は存在しなかった
+
+L-BFGS 版（§5.14.54）と比べる:
+
+| アーム | L-BFGS の fit | **certified の fit** | 差 |
+| --- | --- | --- | --- |
+| sym(12) | 48.67 % | 48.67 % | ±0 |
+| full(144) | 53.85 % | 54.16 % | +0.31 pp |
+| full+bands(432) | 59.50 % | 59.50 % | ±0 |
+
+**取りこぼしは最大 0.31 pp で、しかも中間アームだけである。**
+したがって §5.14.54 の形——**自由度を増やすと fit は単調に上がり
+（48.67 → 54.16 → 59.50）、validation は下がる（50.00 → 46.71 → 47.37）**——は
+最適化の産物ではなく、凸代理問題の真の解が示す性質である。
+
+とくに **fit の +5.34 pp（144→432、元素バンドの寄与）は certified な差**であり、
+「元素解像度の情報は実在する」という §5.14.54 の結論は補強された。
+
+##### 射程（codex の指摘を反映）
+
+- **これは Top-1 の最大値ではない。**最適化しているのは固定アンカーヒンジで、
+  Top-1 は certified 解から読み取った副次量にすぎない。
+  各族の Top-1 容量でも、その上界でもない。
+- 正確な言い方は「フロンティア」ではなく
+  **certified surrogate regularization path** である。数学的に frontier と呼べるのは
+  surrogate loss--norm 側で、Top-1 はその経路上の副次評価である。
+- $\lambda=10^{-3}$ の1点のみ。**λ 選択に使う各 fold・各 λ も certify しないと
+  optimizer 交絡が λ 選択に残る**（未実施）。
+- 正則化幾何がアーム間で揃っていない。「base + 零和元素 contrast」と
+  「元素別独立表」は同じ関数族でも単純な $\lVert\theta\rVert^2$ は同じ罰則ではない。
+  **物理的な表 perturbation に対する Frobenius penalty を定義するか
+  直交基底化が要る**（未実施、次段の必須項目）。
+- validation は反復使用済みなので、この再計算値は**歴史的診断に限定**され、
+  新方式や λ の選択には使えない。
+- 637/152 は「固定プール内に acceptable pose がある複合体」に条件づけられている。
+
+##### 追記訂正: certificate の成立範囲と座標 ridge の交絡（2026-08-14）
+
+§5.14.56 の certificate と数値自体は無効ではない。ただし成立する結論は、
+**「実装されていた座標 ridge、$\lambda=10^{-3}$ の各凸代理問題について、
+L-BFGS の未収束による質的な取り違えは無かった」まで**である。
+
+一方、**「共通の正則化幾何の下で自由度だけを増やすと validation が単調に悪化する」
+という解釈は保留する。** validation の実測列も
+$50.00\to46.71\to47.37\%$ であり、そもそも単調減少ではない。
+
+原因は `scripts/fit_shell.py` の旧 `ShellDesign` が `d > 12` の全アームで
+列12以降を fit pose 上の平均絶対特徴量で割っていたことである。したがって
+feature-scaled coordinate ridge だったのは432アームだけではない。
+full(144) でも flatten 順の最初の12列だけが非scale、残る132列がscaleされ、
+full+bands(432) では残る420列がscaleされていた。よって sym/full/432 は
+共通 Frobenius penalty の比較ではなかった。
+
+また §5.14.56 の **「元素情報は実在する」も強すぎる。**同節から言えるのは
+**「元素 band 自由度が training pool の順位を追加で適合できた」まで**であり、
+転移可能な化学信号か、training pool のノイズへの適合かは未識別である。
+既存結果は研究史として残し、共通幾何での再計算を次節に記録する。
+
+#### 5.14.57 共通 Frobenius 幾何での3アーム再 certificate（2026-08-14）
+
+**問い。** §5.14.56 の3アーム差が、data-dependent な列scaleではなく、
+同じ物理表摂動へ同じ罰則を課す共通 Frobenius 幾何でも残るかを調べる。
+
+##### 実装
+
+表方向には既存の正規直交基底 $B$ を使う。sym(12) の global 列と11本の
+zero-sum symmetric 列は正規直交であり、full(144) は恒等基底である。
+元素band方向にも3次元の Helmert zero-sum 基底 $H\in\mathbb R^{3\times2}$ を使い、
+
+$$
+\delta G_b=\sum_{r=1}^{2}H_{br}\,\mathrm{mat}(B\eta_r)
+$$
+
+とした。$B^\top B=I$、$H^\top H=I$ なので、
+
+$$
+\sum_{b=1}^{3}\lVert\delta G_b\rVert_F^2
+=\sum_{r=1}^{2}\lVert\eta_r\rVert_2^2
+$$
+
+が厳密に成立する。旧来の「最後のbandを他2本の負の和として消去する」表現と
+関数族・自由度は同じだが、ridge の幾何は異なる。fit由来の列scaleは除去し、
+互換性のため `col_scale` 引数と属性だけを単位ベクトルとして残した。
+したがって3アームすべてで目的関数の二次項は
+
+$$
+\frac\lambda2\left(\lVert\Delta G_\mathrm{base}\rVert_F^2
++\sum_b\lVert\delta G_b\rVert_F^2\right)
+$$
+
+の該当部分に一致する。`scripts/certified_solve.py` は monkey patch ではなく
+`basis_mode=sym/full` を `ShellDesign` へ明示的に渡すよう変更した。
+
+**回帰テスト。** `tests/test_regularization_geometry.py` に以下を固定seedで追加した。
+
+- 同じ sym 表摂動を sym 12係数と full 144係数で表したとき、
+  係数ridgeと Frobenius penalty、および pose score が一致する。
+- Helmert band 係数の二乗和と、配備される3本の zero-sum band 表の
+  Frobenius energy の総和が一致する。
+- full(144) が列scaleされていないことを `ShellDesign` 自体で確認する。
+
+対象テストは `2 passed in 2.97s`。全既定テストも
+`141 passed, 2 skipped, 1 deselected in 630.99s` で完走した。
+
+##### データ・loss・実行条件
+
+- pool: `data/scaling/elem_pool*/shell_*of3.pt`
+- split: `data/scaling/runs_nfixed/N1000_seed0/split.json` の固定
+  fit 637 / validation 152。新しい分割・選別はしていない。
+- acceptable: DockQ $\ge0.23$。各複合体の正例anchorは従来と同じ固定規則。
+- loss: worst-negative hinge、$\epsilon=1$、$\lambda=10^{-3}$。
+  Top-1 は最適化対象でなく、certified surrogate 解から読む副次量。
+- solver: OSQPによるepigraph QP + cutting-plane。上界は全制約、下界は
+  全問題で実行可能な双対点から計算。乱数を使う最適化はない。
+- hardware: Intel Xeon Gold 6326 2.90 GHz、2 socket × 16 core、32 CPU、CPU実行。
+- command:
+
+```bash
+uv run python scripts/certified_solve.py \
+  --pool 'data/scaling/elem_pool*/shell_*of3.pt' \
+  --run data/scaling/runs_nfixed/N1000_seed0 \
+  --arms sym,full,full+bands --lam 0.001
+```
+
+##### 測定結果
+
+| アーム | $d$ | fit | validation | certified objective $U\simeq D$ | relative gap | max omitted | round | KKT停留残差 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sym | 12 | 310/637 = 48.67 % | **76/152 = 50.00 %** | 78.908551 | **1.08e−15** | **0.00e+00** | 7 | 8.4e−12 |
+| full | 144 | 344/637 = 54.00 % | 71/152 = 46.71 % | 69.836548 | **2.44e−15** | **0.00e+00** | 10 | 5.8e−12 |
+| full+元素band | 432 | 379/637 = 59.50 % | 72/152 = 47.37 % | 60.666666 | **1.52e−14** | **0.00e+00** | 12 | 1.0e−11 |
+
+`max omitted violation` は本節からtol超過分だけでなく、未追加制約の実際の
+最大excessを記録するよう修正した。最終roundでは3アームとも実測0である。
+
+§5.14.56 の feature-scaled coordinate ridge との差:
+
+| アーム | 旧 fit | 共通Frobenius fit | fit差 | 旧 validation | 共通Frobenius validation | validation差 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| sym | 310/637 | 310/637 | 0件（0.00 pp） | 76/152 | 76/152 | 0件（0.00 pp） |
+| full | 345/637 | 344/637 | **−1件（−0.16 pp）** | 71/152 | 71/152 | 0件（0.00 pp） |
+| full+元素band | 379/637 | 379/637 | 0件（0.00 pp） | 72/152 | 72/152 | 0件（0.00 pp） |
+
+##### 解釈
+
+**測定事実。** 幾何を揃えても fit は
+$48.67\to54.00\to59.50\%$ と増えた。一方 validation は
+$50.00\to46.71\to47.37\%$ で、単調悪化ではない。full+band は full に対し
+fitで +35/637 = +5.49 pp、validationで +1/152 = +0.66 pp だが、
+validationでは依然 sym より4件少ない。幾何修正による旧Top-1との差は
+full fitの−1件だけで、他はnullだった。
+
+**解釈。** data-dependent列scaleは、この $\lambda$ 1点での離散Top-1系列を
+質的には説明しなかった。ただし、これは「旧解と新解が同じ」ことを意味しない。
+certified な連続目的関数と係数は異なり得る。支持されるのは、共通Frobenius幾何でも
+**元素band自由度がtraining poolを追加適合できるが、固定validationへの転移改善は
+確認できない**という限定された記述である。転移可能な元素化学信号の証拠ではない。
+
+##### 限界と次段階
+
+- $\lambda=10^{-3}$ の1点だけであり、共通幾何でのblocked CV pathは未実施。
+- validation 152件は反復使用済みで、方法・$\lambda$選択には使えない。
+- 固定poolかつ acceptable poseを含む複合体への条件付き結果であり、
+  candidate生成を含むend-to-end性能ではない。
+- Top-1は凸代理問題の最適化対象ではない。低ランク・核ノルムなど次の構造的
+  正則化を比較する前に、各inner fold・各$\lambda$を同じ幾何でcertifyする。
+
+#### 5.14.58 固定 validation 152件は +2 pp をほぼ検出できない（2026-08-14、検出力監査）
+
+**問い。** §5.14.45--57 では介入を変えても validation が ±0 または負になる一方、
+fit は自由度とともに上がった。この反復nullは「介入が効かない」のか、それとも
+**固定validation 152件のpaired binary endpointが小さい改善を検出できない**のか。
+次のK=30・5アームへ計算資源を投じる前に、測定器自体の検出力を評価する。
+
+##### 定式化と実装
+
+base失敗→新方式成功をwin、base成功→新方式失敗をlossとし、
+
+$$
+q=P(\mathrm{win})+P(\mathrm{loss}),\qquad
+\delta=P(\mathrm{win})-P(\mathrm{loss})
+$$
+
+と置く。$q$ は不一致率、$\delta$ はsuccess率の絶対差である。
+$N$ 独立interface clusterのとき、exact McNemarが実際に使う不一致数と、
+その中のwin数は
+
+$$
+M\sim\mathrm{Binomial}(N,q),\qquad
+W\mid M\sim\mathrm{Binomial}\left(M,\frac{q+\delta}{2q}\right)
+$$
+
+となる。`scripts/detection_power.py` は各 $M$ に対する両側exact binomial検定の
+棄却確率を計算し、$M$ の分布で厳密に平均する。正規近似は使わない。
+$|\delta|>q$ は、純改善数が全不一致数を超えるので実現不可能として停止する。
+
+不一致 $M$ 件で到達できる最小両側$p$値は、全件が同方向の場合の
+
+$$p_{\min}(M)=\min(1,2^{1-M})$$
+
+である。したがって **$M\le5$ では、データが全勝でも $\alpha=0.05$ に届かない。**
+§5.14.12 の $M=4\Rightarrow p_{\min}=0.125$ と一致し、$M=6$ で初めて
+$p_{\min}=0.03125$ になる。
+
+実行条件はCPUのみ、乱数なし、$alpha=0.05$両側、目標power 80 %。
+hardwareは Intel Xeon Gold 6326 2.90 GHz、32 CPU。コマンド:
+
+```bash
+uv run python scripts/detection_power.py --json /tmp/detection_power.json
+```
+
+JSONは一時出力であり、repositoryへは保存しない。スクリプト内で
+$M=4/6$ の既知値とexact $p$値をassertしている。
+
+##### 既報paired比較から回収した不一致数
+
+| 比較 | 母集団・endpoint | win/loss | $M$ | $q$ | 観測exact $p$ | $p_{\min}(M)$ |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| C2射影 | homodimer 71、acceptable | **0/9** | 9 | 12.68 % | **0.00391** | 0.00391 |
+| C2 filter 10°/5 Å | homodimer 71、acceptable | 4/8 | 12 | 16.90 % | 0.388 | 0.000488 |
+| `trans_per_rotation` 1→10 | pilot 30、acceptable | 0/0 | 0 | 0 % | 1 | 1 |
+| 精密化 K=50→1000 | pilot 45、acceptable | 2/2 | 4 | 8.89 % | 1 | **0.125** |
+| 相関チャンネル積 | 固定validation 152 | **保存なし** | — | — | 1† | — |
+| 加法的 $\log n$ | 固定validation 152 | **保存なし** | — | — | 1† | — |
+| 3 shell、CV選択 | 固定validation 152 | 0/0 | 0 | 0 % | 1 | 1 |
+| 3 shell、$\lambda=10^{-4}$感度 | 固定validation 152 | 4/4 | 8 | **5.26 %** | 1 | 0.00781 |
+| 6--9/9--12 Å、CV選択 | 固定validation 152 | 0/0 | 0 | 0 % | 1 | 1 |
+| 外側band、$\lambda=10^{-4}$感度 | 固定validation 152 | 2/2 | 4 | 2.63 % | 1 | **0.125** |
+| 元素band、sym | OOM救済前validation 140 | 2/3 | 5 | **3.57 %** | 1 | **0.0625** |
+
+回収できた $M$ の経験分布は、感度pathを含めると
+**[0, 0, 0, 4, 4, 5, 8, 9, 12]**、選択済み/default比較だけでは
+**[0, 0, 0, 4, 5, 9, 12]** だった。ただし下記のとおり母集団が異なるため、
+この中央値や平均を単一の$q$推定値としては使わない。
+
+† 76→76なのでwin=lossであり観測exact $p=1$ は確定するが、その共通値と
+$M=2\,\mathrm{win}$ は分からない。
+
+**積と $\log n$ の内訳は得られなかった。** §5.14.51 は76→76という周辺合計だけを
+記録し、per-complex hit vectorを保存していないため、0/0か内部相殺かを識別できない。
+既存の再実行コマンドも全mode・全$p$・全正則化gridを再探索する設計で、
+内訳だけを得るには過剰だった。CPU再計算を試みたが、結果出力前に中止し、
+値は使用していない。したがってこの2アームの $q$ を0と仮定していない。
+今後の全比較はhit vectorとIDを必須成果物にする。
+
+これらは母集団・endpointが異なり、感度pathの行は同じ152件を再使用している。
+したがって「実験を独立標本としてpoolした$q$推定値」ではない。計画用には、
+
+- 固定validationの非zero実測: 元素symの **3.57 %**
+- 小型特徴介入の感度path上限: shellの **5.26 %**
+- 別pilotの高い不一致: 精密化 **8.89 %**
+- 異なる機構・母集団の上限感度: C2 filter **16.90 %**
+
+をシナリオとしてそのまま使う。
+
+##### exact McNemarの検出力
+
+| 仮定した不一致率 $q$ | 根拠 | true +2 pp: N=152 / N=637 | true +5 pp: N=152 / N=637 | true +10 pp: N=152 / N=637 |
+| ---: | --- | ---: | ---: | ---: |
+| **3.57 %** | 元素 5/140 | **10.28 / 72.32 %** | 実現不能 | 実現不能 |
+| **5.26 %** | shell感度 8/152 | **9.74 / 53.30 %** | 74.19 / 100.00 % | 実現不能 |
+| **8.89 %** | 精密化 4/45 | **8.00 / 34.93 %** | 45.58 / 99.06 % | 実現不能 |
+| **16.90 %** | C2 filter 12/71 | **5.99 / 20.38 %** | 25.04 / 85.22 % | **83.41 / 100.00 %** |
+
+「実現不能」は検出力0という意味ではなく、**そのtrue effectなら必ず$q\ge|\delta|$に
+変わるので、その行の$q$仮定と両立しない**という意味である。
+
+**測定事実。** validation 152のtrue +2 ppに対するpowerは、観測範囲で
+**5.99--10.28 %**しかない。したがって約90 %の確率で見逃す。
++5 ppも$q=5.26\%$で74.19 %、$q=8.89\%$で45.58 %であり、常に十分ではない。
++10 ppは実測高不一致$q=16.90\%$なら83.41 %で、ようやく80 %を超える。
+
+これは76/152単独のWilson 95 %区間 **42.15--57.85 %** より直接的な結果である。
+paired設計は独立2群より有利だが、介入が動かす複合体が少なすぎるため、
+exact検定へ入る $M$ 自体が不足する。
+
+##### +2 pp、80 % powerに必要な独立cluster数
+
+| $q$ | 必要な適格cluster $N$ | 現152から追加 | 現fit 637から移せるか | 現在の適格率63.12 %で必要なraw件数 |
+| ---: | ---: | ---: | --- | ---: |
+| 3.57 % | **751** | 599 | 数学的には可、ただしfit残り**38** | 1,190 |
+| 5.26 % | **1,090** | 938 | **不可** | **1,727** |
+| 8.89 % | **1,823** | 1,671 | 不可 | 2,889 |
+| 16.90 % | **3,405** | 3,253 | 不可 | 5,395 |
+
+`split.json` とPINDER indexを照合すると、元のfit 1000件・validation 250件は
+いずれも **1複合体=1 interface cluster** で、解析対象637/152もその部分集合である。
+したがって定義済みinterface clusterに関する限り $N_\mathrm{eff}=637/152$ であり、
+重複clusterによる追加の割引はない。ただし、これは未知の上位homologyや
+同じ学習済みmodelを共有するOOF予測間の依存を消すものではない。
+
+現fitから599件をvalidationへ移せば最も楽観的な$q=3.57\%$では751件に届くが、
+学習用が38件しか残らず実験が別物になる。**fit→validation移動は代案にならない。**
+
+PINDER index上の `pinder_xl \ pinder_s` は **1,705件=1,705 cluster**で、
+現fit/validationとのcluster重複は0だった。ただし現在の固定poolは
+1,250 raw件中789件（63.12 %）だけがacceptable poseを持つ条件付き解析である。
+同率ならXL 1,705件から得る適格clusterは期待 **1,076件**:
+
+- $q=3.57\%$なら +2 pp power **93.18 %**で十分。
+- $q=5.26\%$なら **79.47 %**で、80 %目標の1,090件にほぼ等しいが少し不足。
+- $q=8.89\%$なら **55.91 %**で不足。
+
+適格率を事前に仮定してXLを選別してはならない。全1,705件をまず固定レシピで処理し、
+欠損・探索失敗を記録した上で、(a) 全件denominatorと (b) candidate-conditionalを
+事前規定して報告する必要がある。またXLをhyperparameter選択に使えばconfirmatory cohortを
+失うため、**開発用clusterをPINDER trainから1,100件以上追加し、XLは最後に封印解除する**
+のが第一選択である。
+
+##### fit 637のblocked 5-fold OOF gate
+
+fitのsource 1000件も全て別clusterであり、解析637件の各OOF予測は自分のclusterを
+学習していない。この独立cluster近似の下でtrue +2 ppをexact McNemarで有意に検出する
+powerは、関連する$q=3.57--5.26\%$で **72.32--53.30 %**。80 %に届かない。
+高い$q=8.89--16.90\%$では **34.93--20.38 %**まで下がる。
+
+さらに §5.14.55 の「OOF +2 pp」は有意性でなくpoint-estimate gateだった。
+true effectがちょうど+2 ppの場合に、観測OOF差が+2 pp以上になる確率は
+$q=3.57--16.90\%$の全シナリオで **50.89--51.31 %**にすぎない。
+すなわち**真に+2 ppあるモデルも約半数はgateで落ちる。**逆にtrue 0で誤ってgateを
+通る確率は$q$により0.45--11.40 %である。
+
+**判定。** OOF +2 pp gateは安価なscreenとしては実行可能だが、
+「+2 ppを再現性高く検出する基準」ではない。代案は次のいずれかである。
+
+1. 開発OOFを少なくとも **1,090適格cluster**へ増やし、point差だけでなく
+   paired exact/cluster bootstrap区間を添える。
+2. 現637のままならgateを探索的screenと明記し、落ちたモデルを「無効」と結論しない。
+   複数seedのCV反復は学習不安定性を測るが、独立cluster数を増やさないのでpowerの代用にしない。
+3. score gapやrankなど連続paired endpointを機構的な副指標に使う。
+   ただし最終Top-1改善の証明を連続指標で置き換えない。
+
+##### これまでのnullの再分類——本節の結論
+
+| 介入 | 本データで確定したこと | 母集団の小改善について言えること | 判定と代案 |
+| --- | --- | --- | --- |
+| **C2射影** | 0勝9敗、$p=0.00391$。tested homodimerでは純損 | +2 ppの見逃し以前に方向が負 | **tested射影は効かない/有害。** 続けるなら射影でなく、C2を入力だけから同定した拘束探索を別実験にする |
+| **C2 filter** | 4勝8敗。選択した10°/5 Åで正味負 | N=71なので小改善一般は除外不能 | **tested filterに改善なし。** nativeを使わないC2層別器を外部固定できなければ中止 |
+| **trans_per_rotationを同じscoreで再順位** | pilot 30で0勝0敗、全く同じwinner | 小改善の一般化は全くpoweredでない | **このpilotでは効かない。** 追加poseは別の精密化score/クラスタ選択へ渡して検定する |
+| **精密化数50→1000** | 2勝2敗、$M=4$で有意化不能。ただしOracleはK=25で100 % | +2 ppは検出できない | **母集団効果は検出不能。** 45件では「候補数より順位づけが律速」という機構だけ支持。次は精密化数でなくenergyを変える |
+| **積・$\log n$** | 76→76で、このpoolの正味改善は0。勝敗内訳なし | 0/0か相殺か未識別で、母集団の小改善は除外不能 | **母集団効果は検出できなかった。** hit vectorを再構成して$q$を得てから、独立な大標本で再検定する |
+| **3 shell / 外側band、CV選択** | ともに0勝0敗。この152件では判定を1件も変えない | true +2 ppを約90 %見逃すので母集団nullは不可 | **tested fitはこのpoolで効かないが、一般効果は検出不能。** sensitivityで4/4・2/2まで動くため、大標本か別familyでのみ再検定 |
+| **元素band sym** | 2勝3敗、$M=5$なので全勝でも$p\ge0.0625$ | +2 pp power約10 % | **検出できなかった。** 「転移しない」のconfirmatory主張には少なくとも751--1,090適格clusterが必要 |
+
+したがって、**これまでのnullを一括して「効かなかった」と書くのは誤りである。**
+防御可能なのは、(i) C2射影はtested cohortで有害、(ii) いくつかの介入はこの有限poolで
+実際にwinnerを変えなかった、(iii) 元素・距離・精密化等の母集団+2 ppは
+**測定器の低powerのため検出できなかった**、の3段階である。
+
+##### 限界と次段階
+
+- powerは $q$ と $\delta$ を固定したplanning calculationであり、次のK=30モデルの$q$は未知。
+  過去比較は非交換的なので、3.57--5.26 %を精密な推定値とは扱わない。
+- 元素bandの$q=3.57\%$はOOM救済前の140件だけに条件づく。脱落12件のmissingnessが
+  非ランダムなら152件全体の$q$を推定せず、必要$N=751$も楽観・悲観どちらにも動く。
+- exact計算はcluster間独立を仮定する。blocked splitは既知cluster重複を除くが、
+  同じfold modelを共有するOOF予測の依存とmodel-selection variabilityは含まない。
+  よってOOF powerは楽観的でありうる。
+- validation 152とPINDER-Sは方法選択に反復使用済み。新しい$p$値をconfirmatoryとは呼ばない。
+- candidate-conditional 789/1,250というestimand自体が探索成功に条件づく。
+  新scoreがcandidate生成を変える場合、固定pool powerはend-to-end powerではない。
+- 次の実験はK=30特徴生成の前に、**開発用1,100適格clusterをどこから確保するか、
+  XLを封印するか**を決める。確保できない場合、5アームは探索的screenに格下げし、
+  nullから一般的なnegative conclusionを出さない。
+
+#### 5.14.59 開発コホートを1,750 poolへ拡張する採掘ジョブ（2026-08-14、投入時点）
+
+**問いと理由。** §5.14.58では固定validation 152件のtrue +2 ppに対する
+exact McNemar powerが5.99--10.28 %、80 % powerに必要な適格clusterが
+主要シナリオで751--1,090件だった。現poolの適格clusterは789件なので、
+K=30特徴・5 armを比較する前に、方法選択用の開発コホートを約1,100適格clusterへ増やす。
+PINDER-XLはconfirmatory transport cohortとして封印し、この採掘には使わない。
+
+##### 投入前に確認した測定事実
+
+`scripts/run_pinder_scaling.py::select_split` は、master listを同一のprep、幾何、
+homodimer、voxel filterへ通した `usable` のprefixを選び、5件ごとの先頭をvalidation、
+残りをfitにする。実コードで `n_fit=1000` と1,400を比較した結果:
+
+| | 旧 | 拡張 | nested検証 |
+| --- | ---: | ---: | --- |
+| total | 1,250 | 1,750 | 旧selectionは新selectionの**完全なprefix** |
+| fit | 1,000 | 1,400 | 旧fitは新fitの厳密な部分集合 |
+| validation | 250 | 350 | 旧validationは新validationの厳密な部分集合 |
+| usable | 2,142 | 2,142 | 同じfilter、追加prep不要 |
+
+新規採掘対象は正確に500件である。旧6 cache shardも読み取りauditし、
+**1,250 unique ID、declared skip 0、FFT探索由来poseにpositive/negativeの両方を持つ
+適格clusterはfit 637 + validation 152 = 789**を再現した。旧cacheは過去のincremental
+writeにより3,543 entry（重複2,293）を保存していたが、重複IDのpose identityは一致し、
+unique coverageは1,250/1,250だった。
+
+一方、完全なcache keyには `n_fit` が入るため、`--n-fit 1400` は `n1400_...`、
+旧poolは `n1000_...` となる。**完全なfilenameを同一に偽装すると異なるselectionを
+同じkeyへ書くので不可**である。代わりに `--pool-cache-read` を追加し、`n_fit` 以外の
+recipe suffixが厳密一致する最大の旧Nだけを読み取り専用sourceとして使う。
+今回一致させたsuffixは
+`r0_sp1.2_reachable_hopf3_ntop1500_nr8_tc1_a1.0_rho3.5_hd1_mv31250000_bg1_pk2`。
+テスト実行では旧6 shardから1,250件を読み、**to mine = 0**で終了したため、
+read-throughが旧cacheを変更せず再利用することを確認した。
+
+##### 実装と失敗時contract
+
+- `run_pinder_scaling.py`: `--pool-cache-read`、`--fail-on-skip` を追加した。
+  新shardには新規成功分だけを書き、旧read-only poolを複製しない。OOM後は既存の
+  `rot_chunk=1, frame_chunk=25, pose_chunk=1` rescueを行い、それでも失敗したIDが
+  1件でもあればpartial cacheを保存した後にnonzero終了する。
+- `scripts/audit_pool_expansion.py`: 旧+新cacheのunionをsplitの1,750 IDと照合し、
+  missing/extra、異なるpose identityを持つ重複、cache内skip、rescue/unrescuedを集計する。
+  同時に `prov==0` のFFT探索poseだけで適格数を数える。完全一致しなければnonzero終了する。
+- `scripts/slurm/expand_pool_n1400_m1.sbatch`: 2 shardの終了値にかかわらず最後のauditを試み、
+  `data/scaling/runs_n1400_expand_20260814/pool_audit.json` に欠損集合を残す。
+  したがってOOM・欠損を除いたcomplete-caseだけで静かに次段へ進むことはない。
+
+##### 固定した採掘条件
+
+| 項目 | 値 |
+| --- | --- |
+| 選定 | `n_fit=1400`, `n_total=1750`, validation 20 %, seed 0、prefix nested |
+| pool | reachable、round 0 baseline、`mine-only`、2 shard |
+| FFT | spacing 1.2 Å、Hopf nside 3（1,944 rotations）、top 1,500 |
+| native近傍列挙 | near rotations 8、translation ±1 cell |
+| baseline score | $\alpha_0=1.0$, $\rho_0=3.5$、PSC decompositionあり |
+| size/filter | `max_grid_voxels=31,250,000`、bad geometry・homodimer除外 |
+| chunk | frame 100、rotation 2、feature budget $10^9$、DockQ budget $5\times10^7$ |
+| cache | 旧 `data/scaling/pool_cache` はread-only、新規は `pool_cache_n1400_20260814` |
+| TEST | selection・採掘・適格判定に不使用。legacy startupでcacheをloadするがmine-onlyでは評価しない |
+
+**期待値であって結果ではない。** 現789/1,250=63.12 %をそのまま外挿すると、
+1,750件から適格clusterは約**1,105件**になる。しかし新しいprefix部分の適格率が同じ保証はなく、
+1,100到達はjob終了後のauditでのみ判定する。
+
+##### hardware、事前コスト見積もり、投入
+
+旧N=1000採掘の実測140--180秒/複合体から、新規500件は
+**19.4--25.0 GPU時間**。m1のQuadro RTX 8000 48 GBを2枚使うので、
+予想wall timeは**9.7--12.5時間（約10--13 node-hours）**、cache読込とauditを含む。
+速度ばらつきとOOM rescueの余裕を含め、18時間を申請した。CPU 2、RAM 24 GB。
+`floyd` は明示的に除外し、m1を固定した。投入コマンド:
+
+```bash
+sbatch scripts/slurm/expand_pool_n1400_m1.sbatch
+```
+
+最初のjob **135769** は `PD` のまま、初期化失敗にもfail-fastするためshellを
+`set -euo pipefail`へ直した時点で取消した（採掘開始前、出力なし）。修正版のSlurm job IDは
+**135772**。投入時点でm1の2 GPUは別jobが使用中であり、開始時刻はそれらの解放と
+scheduler priorityに依存する。ログは `logs/pool_n1400_135772.{out,err}` とshard別logへ出す。
+
+##### 結論、限界、完了後の判定
+
+これはモデル比較の結果ではなく、**検出可能な開発測定器を作るためのデータ採掘**である。
+job完了の必要条件はpool union 1,750/1,750、unrescued 0、異種duplicate 0。
+適格clusterが1,100以上ならK=30・5 armのblocked OOFへ進む。1,100未満なら結果を除外せず、
+不足数を埋めるまで同じdeterministic prefixを100 raw件単位で追加する。OOM/欠損が残れば
+chunkをさらに下げてそのIDだけ再実行し、complete-case解析には進まない。
+最終的な+2 ppのconfirmatory判定は、なお未使用のtransport cohortを必要とする。
+
+##### 追記: m1 2-GPU要求は開始不能、m1+m2の3 shardへ再投入（2026-08-14）
+
+**旧投入の失敗。** job 135772はm1上で `--gres=gpu:8000:2` を同時要求したが、
+利用者のMD job 134942 `free_lig2a_closed_nobi` がm1の1 GPUを5日以上継続使用していた。
+したがって空きは最大1 GPUで、135772は `PD (Resources)` のまま開始不能だった。
+この占有は投入前の `squeue -w m1` に表示されており、**scheduler全体の空きではなく
+指定nodeで同時に満たせるGRESを判定すべきだった。** 135772は実行時間0、生成物なしで取消した。
+
+代案としてnodeごとにjobを分け、同じselection・score・FFT recipeを3 shardへ固定した。
+output directoryは `data/scaling/runs_n1400_expand_20260814`、write cacheは
+`data/scaling/pool_cache_n1400_20260814` のままで、旧poolは引き続きread-onlyである。
+
+| job | node / GPU | shard | 新規担当 | VRAM向けchunk | 申請時間 | 投入直後 |
+| --- | --- | --- | ---: | --- | ---: | --- |
+| **135966** | m1 / Quadro RTX 8000 48 GB ×1 | 0/3 | 167 | frame 100, rot 2, feature $10^9$, DockQ $5\times10^7$ | 14 h | **R** |
+| **135967** | m2 / RTX 3090 24 GB + A5000 24 GB | 1/3, 2/3 | 166, 167 | frame 50, rot 1, feature $4\times10^8$, DockQ $2.5\times10^7$ | 18 h | **R** |
+| **135968** | m2 / CPU 1、GPUなし | audit | 3 shard union | 12 GB RAM | 1 h | `PD (Dependency)` |
+
+3 jobすべてに `--exclude=floyd` を指定した。m1/m2 minerはともに
+`n_fit=1400, n_total=1750, seed=0, spacing=1.2, hopf nside=3, ntop=1500,
+near_rot=8, trans_cells=1, alpha0=1.0, rho0=3.5` と同じcache recipeである。
+chunkは計算の分割だけを変え、pose集合・score・ラベルの定義は変えない。
+
+**OOM contractの追加修正。** 従来のretryは `frame_chunk=max(25, chunk//2)` だったため、
+voxel-aware初期値が25未満ならOOM後にchunkを逆に増やす欠陥があった。下限を1へ直し、
+最終rescueも `rot_chunk=1, frame_chunk=1, pose_chunk=1` とした。m2では初期chunk自体も
+上表のとおり下げ、`oom_retries=5`、`--fail-on-skip` を維持する。
+
+audit 135968は次で投入し、**両minerのsuccess/failureにかかわらず**起動する:
+
+```bash
+sbatch --dependency=afterany:135966:135967 scripts/slurm/audit_pool_n1400.sbatch
+```
+
+audit側でもdeterministic splitをmaster listから独立再構成する。workerがsplit/cache/logを
+一切書く前に失敗しても、旧1,250件との差分をmissing IDとしてJSONへ残せる。
+人工的に新cacheと3 split/logを欠損させた試験では、
+`status=incomplete, present=1250/1750, missing=500` を
+`/tmp/audit_pool_failure_contract.json` に書いてexit 1となった。
+
+**更新した事前見積もり。** m1の167件は旧実測140--180秒/件から**6.5--8.5時間**。
+m2は24 GB向けrot/chunk縮小の低速化を含め、各166--167件を**8.5--12時間**と見積もる。
+2 GPU同時なのでm2 node wallも8.5--12時間、auditは0.5時間未満。
+全体はm2律速で約9--12.5時間、GPU costは概算23--33 GPU時間である。
+
+**投入時点の測定事実。** 135966と135967は即座に `R`、135968は正しく
+`PD (Dependency)` になった。3 workerともselection 1,750 = fit 1,400 + validation 350、
+usable 2,142、旧N=1000 cache 6 filesのread-only認識までlogで確認した。
+採掘結果、OOM/rescue数、適格cluster数は未確定であり、audit完了後に本節へ追記する。
+
 > **重要な訂正（2026-07-26）。この節と §7 の以下の記述は §5.12〜§5.14 で
 > 無効化された。** TEST セットの参照構造が 250/250 で立体的に不可能だった
 > （PINDER の `test_set_pdbs/` モノマーが各々原点中心の「ドッキング入力」で
