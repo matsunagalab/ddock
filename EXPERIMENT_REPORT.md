@@ -7055,3 +7055,172 @@ CUDA/MPSはこの実行環境で利用不可。異なる処理の並列実行と
 入力場Vではなく実FFT格子Vを使う必要がある。省メモリ化とCUDA性能は未測定。
 次は、apoのみから作るモードと結合幾何を保つ内部座標写像、同じ非線形priorからのKを接続し、
 実タンパク質入力・正規baseline再現を整えてから、選択前誘導適合のR2−R1を比較する。
+
+### 9.15 実構造の内部座標・ANM・非線形精密化への接続（2026-11-16）
+
+利用者の「ここまでをcommit and pushして続きを」に従い、§9.14までを
+`ff711c9`（Add physical induced-fit FFT prototype and numerical validation）として
+`origin/main`へpushした。その後の継続実装と実験を以下に記録する。
+
+**問い。** 入力単量体だけから作る変形基底を結合幾何を保つ内部座標へ写し、
+その同じ非線形写像・変形priorをFFT応答と精密化で共有できるか。
+微小変位のmetricが正しいだけで有限変形が実用的になるとは仮定しない。
+
+**実装。**
+
+- `pdb_input.py`：第一MODEL・明示した単鎖・標準20残基の重原子を読み、AtomKey、
+  altloc選択、元座標系、serial、挿入コード、TERを保存。zero診断または完全対応した
+  明示電荷mappingが必須。PDB出力はatom対応を保ち、座標を0.001 Åへ丸める。
+  `validate_torsion_input()` は既知SSBOND/LINK/CONECT、内部TER分断を保守的に拒否する。
+- `kinematics.py`：単鎖主鎖φ/ψの微分可能な逐次回転。最初のN/CA/Cを固定し、
+  先頭φ・末尾ψ・Pro φを除く。N/CA/C/O必須、側鎖欠損は許容。距離で検出した
+  disulfide／非peptide結合／深い重複を拒否する。既知結合情報の完全な化学解釈ではない。
+- `modes.py`：CA central-spring ANM、全数値ゼロモード除去、切断network拒否、
+  actual anchored CA Jacobianへのfit、CA Gram行列の正規化。
+  `Edef=γ/2 Σ(dij(a)−dij(0))² + η/2||a||²` の同じ写像のHessianをKにする。
+  ηは正のspring曲率の中央値×1e-4で、非線形energyにも含める。
+- `relax.py`：同じ再構築field energy＋Edefを、姿勢6自由度と振幅について同時に下げる。
+  最初の実装はprojected gradient＋backtracking。角度・並進・振幅・実CA RMSD・
+  最大原子変位・grid supportを制約する。L-BFGSや全原子力場へ置換したわけではない。
+  小さいbacktracking stepを収束と呼ばず、単位stepのprojected残差と状態名を分ける。
+- `search.py`：各原子のモードJacobianのoperator normから保守的な応答半径を得る
+  `bounded_radius()` を追加。探索と精密化で同じ半径を使い、非線形実変位も別途検査する。
+- `verify_internal_modes.py`、`verify_internal_fit.py`：実単量体の幾何／微分検査と、
+  断片＋合成プローブのFFT→精密化の接続を、入力hash・ソースhash・全試行つきJSONへ保存。
+  後続armが失敗しても先行armの結果を残す。
+
+**データ・漏洩・split・loss。** [RCSBの1UBQ PDB](https://files.rcsb.org/download/1UBQ.pdb)を取得。
+chain Aの602重原子、76残基。複合体の正解、DockQ、PINDER、DB5.5、学習済み重みは使わない。
+学習・train/validation/test選択・loss最適化はない。1UBQは今回の幾何／数値開発用入力として
+利用履歴に残し、後で未使用test扱いしない。電荷は明示的zero診断であり、Amber付与や
+protonationを済ませた物理的protein scoringとは呼ばない。
+
+**hardware・基本parameter。** CPU float64、Python3.12.11、PyTorch2.13.0、macOS27.0.1 arm64。
+再現CLIは1thread。複数検証が並列実行されているためwalltimeは速度比較に使わない。
+ANM cutoff12 Å、γ=1、M=4（全鎖）／2（断片）、ηの相対係数1e-4。
+全鎖には147torsion、ANM edge850本、6 zero modes／222 positive modes、torsion CA rank146。
+
+#### 9.15.1 無正則化torsion fitの失敗と角度正則化
+
+最初のSVD least-squares fitは、小さいJacobian特異値まで逆数化して過大な二面角係数を作った。
+CAの微小metricは合っていても、固定振幅 `a=[0.1,-0.1,0.05,0.02]`（norm0.151327 Å）で
+最大角度4912.6 rad、実CA RMSD11.025 Åを発生した。これは数値的にfiniteだが、
+小変形の物理応答として失敗である。後から結果を削除しない。
+
+角度fitに `σ/(σ²+λfit²)` のTikhonov filterを導入し、`λfit/σmax` の4条件を診断した。
+nativeラベルによる較正ではない。以下は同じaを使った値だが、条件ごとに基底自体が変わるので
+同じ実変形を比較した性能順位ではない。
+
+| λfit/σmax | 最大角度 rad | 実CA RMSD Å | 非線形strain ε |
+| ---: | ---: | ---: | ---: |
+| 0（元実装） | 4912.599 | 11.024898 | 25349.0664 |
+| 1e-4 | 0.864007 | 0.137620 | 0.264405 |
+| 1e-3（初期既定） | 0.512257 | 0.177123 | 0.540241 |
+| 1e-2 | 0.135901 | 0.150067 | 1.278370 |
+
+初期既定1e-3のANM方向fit相対残差は0.08190／0.26270／0.15530／0.28761。
+λfit=0.564318、最大角度係数5.86870 rad/Å。1e-3が最適という結論ではなく、
+過大角度と方向fitの精度のtradeoffである。ηをsolverへ追加するだけでは元の問題は直らない。
+
+この固定a診断の再現は、`read_pdb_monomer(..., chain='A', charge_policy='zero_diagnostic')`、
+`validate_torsion_input()`、`TorsionKinematics.from_monomer()`を経て、各比率で
+`build_torsion_modes(..., n_modes=4, fit_relative_damping=ratio)`を呼び、
+`model.coordinates(a)`、`model.angle_basis @ a`、`model.deformation_energy(a)`を評価する。
+全鎖の保存済みCLIは、下記の別seed方向の診断を含む。
+
+#### 9.15.2 全鎖の幾何・微分・有限変位
+
+保存済み最終 `1UBQ_internal_modes_checked.json` はseed0/1/2、正規化した乱数方向、
+振幅norm0.1／0.5の6条件を含む。微小metric最大誤差1.11e-15、reference prior勾配norm3.78e-15。
+座標方向微分の中心差分h=1e-5との相対誤差は最大1.71e-9。
+主鎖結合長・結合角・peptide ωの変化は、それぞれ最大1.47e-13 Å／2.15e-13 rad／1.27e-13 rad。
+これらはメモリ上のfloat64値で、丸めたPDB出力の精度を表すものではない。
+
+| seed | 振幅norm | 実CA RMSD Å | 最大原子変位 Å | 最大角度 rad |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.1 | 0.091862 | 1.54850 | 0.320425 |
+| 1 | 0.1 | 0.103249 | 1.25010 | 0.409787 |
+| 2 | 0.1 | 0.098877 | 1.14325 | 0.179467 |
+| 0 | 0.5 | 0.472565 | 6.51853 | 1.60213 |
+| 1 | 0.5 | 0.784317 | 7.03957 | 2.04893 |
+| 2 | 0.5 | 0.449257 | 5.08271 | 0.897336 |
+
+**解釈。** 結合幾何を保つことは確認できたが、有限CA RMSDは振幅normを超え得る。
+さらにCA RMSDが小さくても、側鎖／一部原子は大きく動く。scriptの`passed`は幾何・微分・
+reference priorの数値合格であり、有限変位の安全性や構造妥当性の合格ではない。
+実CA RMSDと最大原子変位を精密化で別々に制限する根拠になった。
+
+#### 9.15.3 断片＋合成プローブの応答過大評価と制約の整合
+
+1UBQ先頭4残基（36重原子）を固定規則で取り、2個の合成carbonを相手とする数値接続試験。
+入力中心化を保存、電荷0、field surface幅0.5 Å、repulsion weight3、charge weight0、
+screening switch2–3 Å、grid22×25×24、spacing1.5 Å、origin(-15,-18,-16.5) Å。
+M=2、1回転、各回転4 peakからTop1。両armはa=0から同じ局所solver、最大8 iteration／100 energy評価、
+並進上限0.5 Å、回転上限0.15 rad、最大原子変位0.5 Å。構造正解や成功率は定義していない。
+
+初期探索は振幅半径0.1のみを制限し、精密化の最大原子変位上限と一致していなかった。
+応答側が選んだa*は実CA RMSD0.11232 Å／最大原子変位3.31369 Åで、精密化の許容範囲外。
+予測利得−43.6896に対し、実際のその変位の利得は−19.1743。局所精密化も評価予算を消費した。
+
+| 探索条件 | 選択 | 初期energy | 予測利得 | 精密化後energy | accepted steps／energy評価 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 振幅のみ0.1 | rigid | −3.747009 | 0 | −3.772925 | 8／63 |
+| 振幅のみ0.1 | response | 20.400696 | −43.689590 | 14.432391 | 6／100（budget終了） |
+| 原子変位に合わせた共通半径 | rigid | −3.747009 | 0 | −3.777642 | 8／17 |
+| 原子変位に合わせた共通半径 | response | −3.368745 | −0.436044 | −3.857365 | 8／17 |
+
+修正は `c=max_i||B_i||₂=35.79811` として、`δeff=min(0.1,0.5/c)=0.01396722` を
+**両armの探索・精密化で共有**するもの。非線形実変位の検査も維持した。
+修正後の応答a*は実CA RMSD0.0125943 Å、最大原子変位0.495917 Åで制約内。
+予測利得−0.436044に対する実利得は−0.293877で、近似誤差はなお残る。
+最終CA RMSDはrigid選択0.0127364／response選択0.0125963 Å、最大原子変位0.485263／0.496290 Å。
+両armとも8iteration上限であり、最適化の収束を確認したという意味ではない。
+
+修正後のFFT対直接energy誤差は最大1.33e-15、利得の非線形座標FDとの誤差は最大1.22e-8。
+最終の結合長・角・ωの変化は3e-15以下。このtoyではresponse側の最終energyが低いが、
+これは同じモデル内のenergy比較だけで、native構造精度、apo成功率、HDOCK優位性の証拠ではない。
+制約変更前後で探索空間も変わるため、同一表の別行をそのまま統計的改善量とは扱わない。
+
+**失敗・修正・検証履歴。**
+
+- modesの初回18 testsは9 pass／9 fail。失敗はTorch2.13内部JVP importの既知deprecationと
+  warnings-as-errorsの衝突で、既存と同じ限定filterを使用。その後、角度fitの弱いJacobian方向を
+  検証するtestを追加して19 pass。kinematicsは10 pass、PDBは20からpreflight追加後24 pass。
+- 実PDB smokeの最初の2呼出は誤module名`pdbio`と必須chain keyword未指定で、実計算前に失敗。
+  正しいAPIで実行した後に上記無正則化の有限変形破綻を見つけた。
+- relax初回は3 pass／1 fail。例外文面のtest期待値（radius／bounds）の不一致であり、修正後4 pass。
+- 全体は132 tests通過後、探索側最大原子変位のtestを追加し、最終 **133 passed in 1.52s**。
+  既存FFT回帰2件を含む。Hessian／有限差分、結合幾何、Pro環、primitive量、入力・出力対応、
+  source metadata、例外、予算制約を検査した。
+- response過大利得は数値テストの不一致ではなく、近似・制約設計の失敗として区別した。
+  保存済みCLIには例外、skip、OOMはない。旧artifactを残し、checked版にはfinite／部分結果／
+  提案変位の実評価を補強した。後から良い条件だけ残していない。
+
+**再現コマンドと保存先。** 入力PDBと生成JSON/PDBはignoredなdata/以下。取得元とSHA256はJSONに記録。
+
+```bash
+curl -fL https://files.rcsb.org/download/1UBQ.pdb -o data/inducedfit/inputs/1UBQ.pdb
+.venv/bin/python -m pytest tests/test_inducedfit_data.py tests/test_inducedfit_fields.py \
+  tests/test_inducedfit_response.py tests/test_inducedfit_search.py \
+  tests/test_inducedfit_kinematics.py tests/test_inducedfit_modes.py \
+  tests/test_inducedfit_pdb_input.py tests/test_inducedfit_relax.py \
+  tests/test_search.py::test_sc_fft_matches_direct_xcorr \
+  tests/test_search.py::test_sc_fft_matches_docking_score_elec_synthetic -q
+.venv/bin/python scripts/verify_internal_modes.py \
+  --pdb data/inducedfit/inputs/1UBQ.pdb --chain A \
+  --out data/inducedfit/verification/1UBQ_internal_modes_checked.json \
+  --modes 4 --fit-relative-damping 0.001 --seeds 0 1 2 --amplitudes 0.1 0.5 --threads 1
+.venv/bin/python scripts/verify_internal_fit.py \
+  --pdb data/inducedfit/inputs/1UBQ.pdb --chain A \
+  --out data/inducedfit/verification/1UBQ_fragment_fit_checked.json --residues 4 --iterations 8
+.venv/bin/python scripts/verify_internal_fit.py \
+  --pdb data/inducedfit/inputs/1UBQ.pdb --chain A \
+  --out data/inducedfit/verification/1UBQ_fragment_fit_bounded_checked.json \
+  --residues 4 --iterations 8 --bound-linear-atom-motion
+```
+
+**結論・限界・次実験。** 入力PDB→内部座標基底→同じpriorのK→FFT応答→非線形精密化を接続した。
+微分の正しさと有限変形の妥当性は別であり、角度fitと全原子変位を制御する必要が実例で分かった。
+重原子・標準単鎖・既知crosslinkなしという制限、Ramachandranと内部非結合力場の不足、
+coarse shapeモデル、電荷診断、局所反復上限が残る。次は力場由来のchemistryと実データmanifest、
+正規baseline再現を整え、複数apo系で同じ制約・候補予算のR2−R1を検証する。

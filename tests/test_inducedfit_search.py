@@ -121,6 +121,20 @@ def test_translation_tiling_does_not_change_selection(system):
         torch.testing.assert_close(left.amplitudes, right.amplitudes)
 
 
+def test_per_atom_motion_bound_limits_search_response(system):
+    _, ligand, _, _, basis, _, quats, prepared = system
+    limit = 1e-3
+    effective = prepared.bounded_radius(.1, limit)
+    result = search_response(prepared, ligand, quats[:1], radius=.1,
+                             max_atom_displacement=limit, top_k=2)
+    assert 0 < effective < .1
+    assert len(result) == 2
+    for candidate in result:
+        displacement = torch.einsum("m,mnc->nc", candidate.amplitudes, basis)
+        assert displacement.norm(dim=-1).max() <= limit + 1e-12
+        assert candidate.amplitudes.norm() <= effective + 1e-12
+
+
 @pytest.mark.parametrize("kwargs", [dict(radius=-1), dict(radius=float("nan")), dict(top_k=0),
                                    dict(peaks_per_rotation=1.5), dict(selection="native")])
 def test_invalid_search_configuration_fails(system, kwargs):

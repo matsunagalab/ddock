@@ -14,10 +14,20 @@ JVP、非周期FFT相関、変位制約付き応答、固定基底での候補�
 新規73件＋既存FFT回帰2件の **75テストが通過**。seed0/1/2の合成原子系で、FFT対直接energyの
 最大絶対誤差は `2.22e-16`、変位上限0.01の9候補すべてで制約を満たした。詳細は研究ログ§9.14。
 
-これはP0/P1/P3の数値基盤であり、各段階全体の完了ではない。実タンパク質のPDB前処理・電荷付与、
-ANM／内部座標、geometryを守る非線形精密化、実データmanifest作成・HDOCK比較、抗体拡張は未実装。
-下記の将来CLIも `verify_induced_fit.py` 以外は未実装である。
-供給したCartesian基底と電荷を使う合成系の結果を、apo予測精度の証拠にはしない。
+初期段階はP0/P1/P3の数値基盤として `ff711c9` にcommit・pushした。
+その後、PDB重原子の診断用読込、単鎖φ/ψ写像、ANMの内部座標への投影、同じ非線形priorからのK、
+姿勢＋内部座標の制約付き精密化を追加した。継続分を含む **133テストが通過**。
+1UBQ全鎖602原子／76残基の幾何・微分と、先頭4残基＋合成プローブのFFT→精密化接続を検証した。
+詳細は研究ログ§9.15。これはapo予測精度の評価ではない。
+
+実タンパク質の力場電荷・protonation、Ramachandran／内部非結合相互作用の妥当性、実データmanifest作成、
+HDOCK比較、抗体closureは残っている。下記の将来CLI群は未実装で、現在使える診断CLIは
+`verify_induced_fit.py`、`verify_internal_modes.py`、`verify_internal_fit.py` の3つ。
+各段階全体の完了とは扱わない。
+
+実構造で、無正則化のtorsion fitによる過大角度と、CA振幅だけを制限した応答の過大利得が見つかった。
+角度fitの明示的Tikhonov dampingと、最大原子変位に合わせた保守的な振幅半径を追加した。
+失敗・修正前後の全条件を研究ログに残し、改善したtoy energyをprotein性能の証拠にしない。
 
 ```bash
 .venv/bin/python -m pytest tests/test_inducedfit_data.py tests/test_inducedfit_fields.py \
@@ -25,6 +35,13 @@ ANM／内部座標、geometryを守る非線形精密化、実データmanifest�
 .venv/bin/python scripts/verify_induced_fit.py \
   --out data/inducedfit/verification/synthetic_radius001.json \
   --seeds 0 1 2 --threads 1 --radius 0.01
+.venv/bin/python scripts/verify_internal_modes.py \
+  --pdb data/inducedfit/inputs/1UBQ.pdb --chain A \
+  --out data/inducedfit/verification/1UBQ_internal_modes_checked.json
+.venv/bin/python scripts/verify_internal_fit.py \
+  --pdb data/inducedfit/inputs/1UBQ.pdb --chain A \
+  --out data/inducedfit/verification/1UBQ_fragment_fit_bounded_checked.json \
+  --residues 4 --iterations 8 --bound-linear-atom-motion
 ```
 
 現プロトタイプは正しさを優先し、分子場の格子shapeに対して相関FFTを各軸 `2n−1` に拡張する。
@@ -151,7 +168,9 @@ SOAP等のNN用前処理器が持つ勾配統計を、タンパク質の物理�
 | ファイル（実装予定） | 責務 |
 | --- | --- |
 | `src/zdock/inducedfit/types.py` | `DockingInput`, atom/residue/chain key, frame変換, `GridSpec`, `CandidateSet` |
-| `src/zdock/inducedfit/prepare.py` | 電荷／入力geometry／atom対応、内容hash付きcache、cache miss時の再生成 |
+| `src/zdock/inducedfit/prepare.py` | 内容hash付きmetadata、reference-free入力契約。力場電荷・実tensor cacheは今後 |
+| `src/zdock/inducedfit/pdb_input.py` | PDB重原子・atom対応・明示電荷mappingまたはzero診断、既知crosslinkの拒否 |
+| `src/zdock/inducedfit/kinematics.py` | 単鎖の主鎖二面角写像、結合幾何・Pro環の保持 |
 | `src/zdock/inducedfit/fields.py` | smooth field、同じ離散energyの直接計算、FFT、JVP |
 | `src/zdock/inducedfit/modes.py` | apo ANM、内部座標への投影、基底正規化、同じpriorからのK |
 | `src/zdock/inducedfit/response.py` | 変位制約付き二次応答、予測利得、valid mask |
@@ -231,6 +250,11 @@ zero-paddingとvalid translation maskを使い、周期境界の回り込みを�
 5. 同じ写像の距離から `Edef(a)=γ/2 Σij[dij(a)−dij(0)]² + η/2 ||a||²` とし、
    `K=∇²Edef(0)` を計算する。ばねedge・cutoff・重みを固定記録する。
 
+実装では、Jacobianの小さい特異値を単純に逆数化すると過大角度を生んだため、
+`σ/(σ²+λfit²)` のTikhonov filterを明示的に用いる。初期既定は `λfit=1e-3 σmax`。
+これは基底構築の角度正則化であり、非線形priorのηとは別物。fit残差、角度係数、CA metric、
+有限変位を併記し、既定値が最適だとは主張しない。
+
 初期ANM cutoffは12 Å、γの単位は `ε/Å²`。ηはゼロモード対策を含む明示的priorで、初期値は
 正の剛性固有値中央値の `10^-4` 倍を目安に設定・記録する。数値安定化だけの名目で応答側にのみ追加しない。
 基底変換後に元ANM固有値をそのままKとして使わない。`Edef'(0)=0` を検証する。
@@ -257,6 +281,11 @@ min_a  g^T a + 1/2 a^T K a      subject to ||a|| ≤ δ
 
 RMSD上限と最大原子変位上限は別物。初期の最大重原子変位上限は3 Åとし、linear mapの保守的boundと
 実座標変位の双方を確認する。非線形写像で超えた場合はstepを縮める。
+実装済み `PreparedResponseReceptor.bounded_radius()` は `max_i ||B_i||₂` から、
+`δeff=min(δ, dmax/max_i||B_i||₂)` を求める。同じδeffを選択前応答と比較armの精密化へ渡す。
+これはlinear変位の保証なので、非線形写像後のCA RMSDと最大原子変位も確認する。
+初期の実構造断片検証はdmax=0.5 Åで行った。何も指定しない既存prototype APIは振幅上限のみなので、
+実データrunnerへ進む際はこれらの制約を設定の必須項目にする。
 深い重なりから生じる偽の利得は、入力だけで計算するclash gate、変位上限、非線形再評価で検出する。
 gate閾値はtrain/validationで固定し、落とした候補数も記録する。
 
@@ -272,6 +301,8 @@ gate閾値はtrain/validationで固定し、落とした候補数も記録する
 主因果比較では、rigid選択／response選択後の両方を **同じ `a=0` から** 同じ非線形solverへ渡す。
 responseの `a*` をwarm startに使う条件は別armにする。変形・剛体自由度と反復予算を一致させる。
 初期solverはline search付きL-BFGSを候補とし、SO(3)の局所更新、trust region、geometry受理を明示実装する。
+現プロトタイプでは、制約・失敗状態を直接検証するため、projected gradient＋backtrackingを先に実装した。
+同じモデルのR1/R2で同じsolverを使う。L-BFGSへの変更は速度・収束を測る別比較とする。
 初期上限は候補ごと50 iteration、energy／gradient評価回数上限も250で制限し、実際の呼出数を記録する。
 収束判定・失敗時fallbackはvalidation前に固定する。
 
@@ -572,7 +603,7 @@ uv run python scripts/compare_registered_runs.py \
 これにより、NNを必須にせず、NN訓練で成熟した計算技術を物理主体の誘導適合へ使う。
 FFTを維持する条件は、基底と剛性を一回の全探索中に固定し、更新を探索間に限定することである。
 
-直近はP0のデータ・入力・baseline契約、次にP1の直接energy／FFT／JVPの一致から着手する。
+P0–P3の数値接続まで進んだが、直近の次工程は力場由来の入力・chemistryと、実データのbaseline契約である。
 適応基底、implicit calibration、H3は、固定基底の機構検証を通った後に追加する。
 特に大変形、溶媒、側鎖再配置、単量体自由エネルギーの近似は限界として残る。
 

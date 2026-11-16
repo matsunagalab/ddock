@@ -1,4 +1,4 @@
-"""Small, correctness-first FFT response search with supplied Cartesian modes.
+"""Small, correctness-first FFT response search with supplied mode tangents.
 
 The receptor and its directional derivative spectra are built once per pass.
 Each ligand rotation uses one set of ligand spectra for both rigid energy and
@@ -6,8 +6,9 @@ all mode gradients.  Full linear correlations avoid periodic wrap-around;
 only translations retaining the ligand's complete support are selectable.
 
 This is a numerical prototype, not the production protein protocol: callers
-supply charges, a fixed grid, modes and a matching positive stiffness.  There
-is no ANM construction, internal-coordinate repair, or nonlinear refinement.
+supply charges, a fixed grid, modes and a matching positive stiffness. ANM,
+internal-coordinate maps and nonlinear refinement are separate modules; this
+function does not silently prepare or repair a protein.
 """
 
 from __future__ import annotations
@@ -40,6 +41,22 @@ class PreparedResponseReceptor:
     rigid_spectrum: torch.Tensor
     derivative_spectra: tuple[torch.Tensor, ...]
     response: QuadraticResponse
+    maximum_atom_motion_per_unit_amplitude: float
+
+    def bounded_radius(self, radius: float, max_atom_displacement: float | None = None) -> float:
+        """Conservative *linear* per-atom bound for the Euclidean mode ball.
+
+        Uses max_i ||B_i||_2, not the norm of each mode separately. Finite
+        nonlinear coordinates must still be checked after applying a step.
+        """
+        if not math.isfinite(radius) or radius < 0:
+            raise ValueError("radius must be finite and nonnegative")
+        if max_atom_displacement is None:
+            return radius
+        if not math.isfinite(max_atom_displacement) or max_atom_displacement < 0:
+            raise ValueError("max_atom_displacement must be finite and nonnegative")
+        coefficient = self.maximum_atom_motion_per_unit_amplitude
+        return radius if coefficient == 0 else min(radius, max_atom_displacement / coefficient)
 
 
 @dataclass(frozen=True)
@@ -92,8 +109,11 @@ def prepare_response_receptor(
                 receptor.xyz, receptor.radii, receptor.charges, direction, grid, parameters
             )
         derivatives.append(correlation_spectra(tangent.detach()).detach())
+    atom_coefficient = float(torch.linalg.matrix_norm(basis.permute(1, 2, 0), ord=2).max()) if m else 0.
+    if not math.isfinite(atom_coefficient):
+        raise FloatingPointError("per-atom response norm is not representable")
     return PreparedResponseReceptor(
-        grid, parameters, rigid_spectrum, tuple(derivatives), response
+        grid, parameters, rigid_spectrum, tuple(derivatives), response, atom_coefficient
     )
 
 
@@ -116,6 +136,7 @@ def search_response(
     min_peak_distance: float = 3.0,
     response_tile_size: int = 4096,
     selection: str = "response",
+    max_atom_displacement: float | None = None,
 ) -> list[ResponseCandidate]:
     """Select low-energy candidates; no coordinates are silently deformed.
 
@@ -124,6 +145,9 @@ def search_response(
     a caller preparing proteins must retain the inverse centering transform.
     ``selection='rigid'`` omits derivative correlations and response solves.
     Both arms use identical peak selection and non-wrapping validity rules.
+    When supplied, max_atom_displacement conservatively bounds the linear
+    prediction; callers must use prepared.bounded_radius() for the matching
+    refinement amplitude constraint and check the true nonlinear displacement.
     """
     if selection not in ("rigid", "response"):
         raise ValueError("selection must be 'rigid' or 'response'")
@@ -147,6 +171,7 @@ def search_response(
         raise ValueError("prepared receptor and ligand must share dtype and device")
 
     grid, parameters = prepared.grid, prepared.parameters
+    radius = prepared.bounded_radius(radius, max_atom_displacement)
     m = len(prepared.derivative_spectra)
     candidates: list[ResponseCandidate] = []
     for rotation_index, quaternion in enumerate(quaternions):

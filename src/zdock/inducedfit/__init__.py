@@ -1,6 +1,7 @@
 """Experimental smooth-field induced-fit backend.
 
-This package is separate from the published/legacy docking scorer.  Its first
-version is a numerical prototype with supplied charges and deformation modes;
-it is not yet a protein preparation or production flexible-docking pipeline.
+This package is separate from the published/legacy docking scorer. It supports
+diagnostic PDB geometry, internal-coordinate modes and smooth-field refinement.
+Force-field preparation and a production apo docking benchmark are not yet
+implemented; zero diagnostic charges are never called physical charges.
 """
