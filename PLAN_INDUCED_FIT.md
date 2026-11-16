@@ -67,6 +67,13 @@ core–shell cross項へ置き換えるだけでも5.1735 Åで、十分な修�
 これは下記§9の接触力による適応的な方向追加とは別で、既存8方向の部分空間を縮める実験である。
 新backendの実apo runner／replay接続と **303テスト** が通過した。精度の再評価は行っていない。
 
+次に3サブエージェントで予測精度改善を調査し、
+[接触物理・内部strain・原子別制約・接触応答方向の実装順序](docs/accuracy_improvement_v1.md)をまとめた（§9.21）。
+保存128回転の範囲にもDockQ0.367706の評価専用poseを構成できたが、clashを伴い、現scoreでは
+回転内Top4で落ちる。これはnativeを使う機構診断であって新しい予測成功ではない。
+apo剛体fit自体はDockQ0.910119なので、誘導適合の有効性は別のmoderate/difficult apo集合で測る。
+まず固定LJ型potentialの接触・格子・力と、分子内nonbondedを含むpriorの基準状態を検証する。
+
 Ramachandran／内部非結合相互作用の妥当性、実データ母集団の監査と正規評価、
 HDOCK比較、抗体closureは残っている。下記の将来CLI群は未実装で、現在使える診断CLIは
 `verify_induced_fit.py`、`verify_internal_modes.py`、`verify_internal_fit.py` と上記pair runner。

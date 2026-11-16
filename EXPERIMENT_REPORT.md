@@ -8050,3 +8050,143 @@ cacheを削減したが変形利得の損失が大きく、production rankは選
 まずより多いモードで特異値の減衰を測り、相手の接触力に対する応答損失を固定したnative-free条件で確認する。
 uniformな場normだけで小rankを決めず、構築費用を含める。局所運動／抗体loopへの新基底追加は別のモデル実験とし、
 今回の同等計算backendと混同しない。性能再計測時はNumPy／SciPyを含むthreadpoolと実行順序を制御する。
+
+### 9.21 予測精度改善の並列調査と次実験の設計（2026-11-16）
+
+**問いと出発点。** ユーザーの依頼により3つの独立調査を並列に開始した。
+接触物理score、内部strain／誘導応答、探索と評価設計を分担し、rootが案の依存関係と優先順位を統合する。
+対象は `de42131`。§9.18–9.20の既知development apo失敗を出発点とする。新しいモデルの精度改善を
+確認した段階ではない。物理モデリングとFFT探索の両立、HDOCK手法の再実装を避けること、
+将来の抗体loop拡張を方針とする。GitHub実装と原著／公式資料を照合し、独創性を断定しない。
+
+調査ではproduction code／係数／チェックポイントを変えず、nativeで係数やrankをfitしない。
+既存CSV／reportの再集計は新しい性能試験ではない。学習loss・train・checkpoint選択は該当しない。
+nativeを利用する追加診断を行う場合は推論から分離した評価processで実施し、入力manifestへ渡さない。
+
+**追加診断の事前方針。** 既存128回転にどれほどの角度量子化があるかを、既知開発系で確認する。
+apo各単量体を対応するnativeへ独立にCA fitし、その剛体相対poseと保存quaternionの最近接角を測る。
+単量体fit残差、必要並進、回転量子化の残差を分ける。最近接角の姿勢がDockQ最大とは限らないため、
+これは探索の厳密な上界や成功率ではなく到達性のprobeである。得た値で回転seedや係数を選択しない。
+使用構造・対応・command・hashと全結果は以下へ追記する。
+
+到達性probeで保存回転内にacceptableな構造が観測された場合に限り、同じ全H／grid／場で
+supportとvalid translationを検査し、その回転1個だけの現rigid score Top4との比較を追加する。
+これにより格子外・回転内peak除外・全回転間の順位除外を区別する。nativeから作るposeを採点する
+評価専用の診断であり、予測器へnativeを渡す変更ではない。全128回転の再計測はしない。
+
+**調査成果物。** [統合計画](docs/accuracy_improvement_v1.md) に優先順位と反証条件をまとめた。
+分担メモは [接触物理](docs/research/accuracy_contact_physics.md)、
+[内部応答](docs/research/accuracy_internal_response.md)、
+[探索・評価](docs/research/accuracy_sampling_evaluation.md)。
+LightDock、ATTRACT、OpenMM、HADDOCK3、ProDy、KGS、Vina、AGBNP、DockQ、公式apo／抗体benchmarkの
+関連箇所と原著を重点的に確認した。世界中のrepoの網羅性や、未実装案の独創性を保証する調査ではない。
+外部code取込・依存追加・外部docking engineによる比較は行わず、各メモに直接読んだURLとlicenseを記録した。
+
+**実測と再読：物理モデルの具体的な修正候補。**
+
+- 現chemistryは同じOpenMM systemからqのみ保存し、sigma／epsilonを捨てていた。
+  使用中ff14SB XML（SHA `d9f9779c09d67cd5f8bc657692f174ffab14c469dfd06d560ac1899fa7e976b8`）を
+  Python標準XML parserで数えると、(sigma,epsilon)組は14、うち非零LJは13。
+  13は全XMLの上限で、今回pairの実出現型数はまだ抽出していない。
+  提案したC2 coreは `u=(r/sigma)^2`、u_c=.81より内側のみ元LJを二次Taylor延長するもの。
+  scalar算術で原点energy321.292033 ε、境界h=6.636119、h'=-77.033124、h''=768.965351を確認した。
+  元の井戸を保持する数式の候補であり、grid／force実装や精度の検証ではない。
+  CPU標準Python、seed/loss/checkpointなし、失敗／skip0。再現commandは接触物理メモ§6。
+- 保存済みff14SB/OBC2/ACE診断30件を再読した。全30件成功という元の分母を維持し、最終15件の
+  receptor strain全成分表を内部応答メモへ保存。既知のR2 selection1/2/4のtotalは
+  128.388769／132.664339／84.098496 kJ/mol。そのvdWは81.497822／120.764533／50.917803、
+  Coulomb54.011579／13.087842／38.113627、bonded−3.548477／−4.117739／−3.797081だった。
+  torsion項だけの不足と決めつけず、分子内nonbondedを優先して検査する根拠となった。
+  H-only準備、未最小化apo、固定protonationという元診断の制限は残る。新しい力場計算はしていない。
+- 保存2-mode／8-mode diagnosticsの比較で、最大torsion row normは0.375451→3.836889 rad/Å、
+  最大原子の方向作用素normは3.971432→19.755382。追加6方向のANM→torsion fit残差は0.295–0.449で、
+  既存2方向の0.127–0.141より大きい。同じ原子上限1.5 Åを代入すると共通球半径は
+  0.377697→0.075929 Åとなる。8-mode smoke本体は上限1 Åなので半径0.050619 Åだった点を区別する。
+  modeを増やすほど一律の球が過度に保守的になり得るが、精度低下の原因と確定したわけではない。
+
+**実測：保存回転とnative相対配置の幾何診断。**
+`scripts/diagnose_inducedfit_pose_coverage.py` を評価専用に追加した。
+1A2P B／1A19 Aの既存apo入力と、評価専用1BRS A/Dを用いた。
+対応CAはreceptor108／ligand86。独立Kabsch fitのCA RMSDは0.485697／0.438757 Å。
+配列対応とmismatch条件は既存公式DockQ adapterを使い、内部形状をnativeへ置換していない。
+保存128回転（identity＋seed0の127回転）の最近接角はindex41の30.5154895°、
+現局所回転上限は0.15 rad=8.594367°だった。
+この回転での対応CA最小二乗並進[9.797334,1.001535,21.359511] Åを2 Å格子へ丸めると
+[10,2,22] Å、丸め誤差1.203425 Å、対応ligand CA RMSDは5.201585→5.338981 Å。
+最近接角と最小CA残差は同じindex41だが、一般に一致するとは限らない。
+
+| 評価専用pose | DockQ | iRMSD Å | LRMSD Å | fnat | DockQ clashes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| apo独立fit・連続並進 | 0.910119 | 0.507134 | 0.498443 | 0.836364 | 5 |
+| apo独立fit・格子丸め並進 | 0.849820 | 0.696078 | 1.176763 | 0.745455 | 3 |
+| 128回転最近接角・格子並進 | 0.367706 | 3.133156 | 5.344706 | 0.200000 | 3 |
+| 128回転最小CA残差・格子並進 | 0.367706 | 3.133156 | 5.344706 | 0.200000 | 3 |
+
+最後の2行は同一poseで、独立した成功2件ではない。native sanityはDockQ0.999999999999687。
+DockQ2.1.3、各child `--n_cpu 1`／timeout60秒／mapping RL:AD／allowed mismatches1。
+macOS27.0.1 arm64／Python3.12.11／NumPy1.26.4の隔離評価envで1.02884秒。
+native sanity＋4 probeすべて完了、scorer failure／skip／timeout0。
+最近接角probeのnative contactは11/55、nonnative contact31/42。acceptable判定でも物理的に
+正しい接触とは限らない。正確apo fitもclashを持つため、このoracleへ反発係数を合わせない。
+
+**実測：どこで候補が落ちるか。** index41だけを本番と同じ全H・83³格子・場・4peaks／3 Å NMSで再計算。
+probe [10,2,22]はfull-support／valid-translation条件を満たしたが、rigid scoreは+1150.368826661 ε。
+同じ場でligand座標を直接動かした採点との差は−1.82e−12 ε。
+この比較も静電potentialの畳み込みはFFTを使うので、独立全原子pair energyの検証ではない。
+valid並進188,384点中175,900点がprobeより低energyだった。
+本番Top4は [−14,−22,10]:−65.124452、[16,4,−26]:−62.987892、
+[−14,−20,14]:−62.450299、[−10,−26,2]:−58.884709 ε。
+元R0 global Top5 cutoffは−84.101241 ε。probeは回転内Top4ですでに除外される。
+このscore診断は6.52141秒で成功し、Torch2.13.0／CPU float64／PyTorch1thread、BLAS thread数未確認。
+nativeを読み直してはいないが、入力probeの由来はnative-informedである。
+
+成立する主張は「元の離散探索領域にDockQ acceptableの評価専用poseが存在するが、
+元score／peak pickerでは選ばれない」。物理的な正解を不当に拒否したこと、blind探索成功、
+DockQ最大値の上界のいずれも示していない。回転数増加だけを第一対策としない根拠にとどめる。
+
+```bash
+data/inducedfit/dockq_env/bin/python scripts/diagnose_inducedfit_pose_coverage.py \
+  --run-report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --native data/inducedfit/evaluator_only/1BRS.pdb --native-chains AD \
+  --allowed-mismatches 1 --dockq data/inducedfit/dockq_env/bin/DockQ \
+  --out data/inducedfit/evaluator_only/pose_coverage_v1
+.venv/bin/python scripts/diagnose_inducedfit_pose_coverage.py \
+  --run-report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --score-only-coverage data/inducedfit/evaluator_only/pose_coverage_v1/report.json \
+  --out data/inducedfit/evaluator_only/pose_coverage_score_v1
+```
+
+manifest SHA=`969c76da6acb3e911b11e2d623b858c3096893f628f1012c71328dc47a36ff04`、
+run report SHA=`e7d1c14e55e8b2c992a62b6df3489b9934dfc17467414f322ce68f39453dd16e`、
+native SHA=`0076aae54252706a8c8c02f7b1e71ce2394b0e928b413590b4ac12aade9e8f6c`。
+元構造・全回転・化学条件・実行source hashは各reportと担当メモに保存。生PDB／JSON／logsはignored dataのみ。
+geometry実行後にscore-only経路を加え、その後frame合成のhelper化とinvalid quaternion拒否を追加した。
+正常入力に対する式は不変、当時のhashは保持した。元の予測結果／scoreの係数は変更していない。
+
+**独立reviewとtest。** 別agentが座標変換と本番quaternionを独立確認した。
+float64／NumPy seed20261116、保存128回転で `quaternion_row` と `geom.rotate` の最大差4.44e−16。
+合成Kabsch回復2.66e−15、frame合成8.88e−16。q41 ligand719重原子のPDBとの差は最大0.000795687 Åで丸め内。
+DockQが選ぶreceptor864／ligand719原子のidentity・順序は推論と一致し、receptor altlocは全A。
+再現commandと条件は接触物理メモの独立review節に保存する。
+native不要の回転／非可換frame合成／proper rotation／退化入力拒否の8回帰testを追加し、
+誘導適合全対象＋既存FFT回帰2件は **311 passed、4.79秒**。
+
+```bash
+.venv/bin/python -m pytest tests/test_inducedfit_*.py \
+  tests/test_search.py::test_sc_fft_matches_direct_xcorr \
+  tests/test_search.py::test_sc_fft_matches_docking_score_elec_synthetic -q
+```
+
+**結論・限界・次実験。** 優先順位を、(1)固定LJ型potentialの接触・力・格子検証、
+(2)分子内nonbondedを含む単位／基準状態の整合したprior、(3)候補pool内の原子別変位制約、
+(4)接触残差力から局所torsion方向を作りFFTへ戻す方式、とする。
+全回転Top4の保存と段階別候補保持率も並行して整備し、score・探索・変形を切り分ける。
+Top候補だけ相互作用HVPで応答方向を直す案は、R2v・同予算の一階最適化・同方向radial対照との
+機構比較を設計してから試す。ANMや柔軟精密化そのものを新規技術とは扱わない。
+
+今回の物理改善案は未実装で、予測精度の改善やHDOCK優位性は未確認。
+現開発系のapo剛体fitは高精度であり、誘導適合の有効性は独立moderate/difficult apoパネルで必要である。
+公式抗体benchmarkはbound/unbound事前重ね合わせがあるため、使用時は両partnerへ独立SO(3) scrambleを施す。
+抗体用にはdisulfide・複数鎖・χ・有限loop closureの改修が別途必要。
+今はnative-freeな小fixtureの物理gateを第一実装とし、合格後に固定budgetの開発試験、
+さらに失敗系も分母に含む未使用apoパネルへ進む。詳細な停止条件と比較設計は統合計画へ記録した。
