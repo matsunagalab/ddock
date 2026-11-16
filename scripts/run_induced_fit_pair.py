@@ -4,6 +4,7 @@
 Output energies are effective smooth-field units, NOT Amber kcal/mol.
 R0: rigid selection + rigid refinement; R1: rigid selection + flexible
 refinement; R2: response selection + the same flexible refinement.
+R2v: nonlinear verification of an oversampled response pool before TopK.
 Native structures are neither accepted nor opened by this process.
 """
 from __future__ import annotations
@@ -29,7 +30,34 @@ from zdock.inducedfit.modes import build_torsion_modes
 from zdock.inducedfit.pipeline import centered_protein, export_heavy_pair, load_pair_manifest, pair_grid, rotation_sample
 from zdock.inducedfit.relax import relax_pose
 from zdock.inducedfit.search import prepare_response_receptor, search_response
+from zdock.inducedfit.verified_response import NonlinearResponseVerifier
 from zdock.geom import rotate
+
+
+def verification_record(verified, pool_rank):
+    original = verified.original_candidate
+    return {
+        'pool_rank': pool_rank, 'rotation_index': verified.rotation_index,
+        'translation': verified.translation.tolist(),
+        'original_score': original.score, 'original_predicted_gain': original.predicted_gain,
+        'original_amplitudes': original.amplitudes.tolist(),
+        'score': verified.score, 'rigid_energy': verified.rigid_energy,
+        'verified_gain': verified.verified_gain, 'predicted_gain': verified.predicted_gain,
+        'amplitudes': verified.amplitudes.tolist(), 'strain': verified.strain,
+        'accepted_scale': verified.accepted_scale, 'fallback': verified.fallback,
+        'rigid_energy_error': verified.rigid_energy_error, 'trials': list(verified.trials),
+    }
+
+
+def verify_and_rank_candidates(pool, quaternions, verifier, top_k, record):
+    """Verify the entire pool before truncation; no labels or warm starts."""
+    verified = []
+    for pool_rank, candidate in enumerate(pool, 1):
+        result = verifier.verify(candidate, quaternions[candidate.rotation_index])
+        verified.append(result)
+        record(verification_record(result, pool_rank))
+    # Stable ties retain the original, deterministic search order.
+    return sorted(verified, key=lambda candidate: candidate.score)[:top_k]
 
 
 def run(args, report, save):
@@ -84,7 +112,7 @@ def run(args, report, save):
     report['search_seconds_by_selection'] = {}
     candidates_by_selection = {}
     for arm in args.arms:
-        selection = 'response' if arm == 'R2' else 'rigid'
+        selection = 'response' if arm in ('R2', 'R2v') else 'rigid'
         report['stage'] = f'{arm}_search'
         report['arms'][arm]['status'] = 'searching'
         save()
@@ -92,7 +120,8 @@ def run(args, report, save):
         try:
             if selection not in candidates_by_selection:
                 candidates_by_selection[selection] = search_response(
-                    cached, ligand, quaternions, radius=radius, top_k=args.top_k,
+                    cached, ligand, quaternions, radius=radius,
+                    top_k=(args.response_pool_size if selection == 'response' and 'R2v' in args.arms else args.top_k),
                     peaks_per_rotation=args.peaks_per_rotation, selection=selection,
                 )
                 report['search_seconds_by_selection'][selection] = time.monotonic() - started
@@ -100,11 +129,40 @@ def run(args, report, save):
             report['arms'][arm].update(status='search_failed', error_type=type(error).__name__, error=str(error))
             save()
             continue
-        candidates = candidates_by_selection[selection]
+        pool = candidates_by_selection[selection]
+        search_seconds_this_arm = time.monotonic() - started
+        candidates = pool[:args.top_k]
+        verification = None
+        if arm == 'R2v':
+            report['stage'] = 'R2v_nonlinear_verification'
+            verification = {'pool_count': len(pool), 'requested_pool_count': args.response_pool_size,
+                            'min_agreement': .75, 'max_trials': 6, 'proposals': [],
+                            'refinement_initial_amplitudes': 'zero; verified deformation used only for selection'}
+            report['arms'][arm]['verification'] = verification
+            save()
+            verification_start = time.monotonic()
+            def record_verification(row):
+                verification['proposals'].append(row)
+                save()
+            try:
+                verifier = NonlinearResponseVerifier(receptor, ligand, model, grid, parameters,
+                    radius=radius, max_atom_displacement=args.max_atom_displacement,
+                    min_agreement=.75, max_trials=6)
+                candidates = verify_and_rank_candidates(pool, quaternions, verifier, args.top_k, record_verification)
+            except Exception as error:
+                report['arms'][arm].update(status='verification_failed', error_type=type(error).__name__, error=str(error))
+                verification['seconds'] = time.monotonic() - verification_start
+                save()
+                continue
+            verification['seconds'] = time.monotonic() - verification_start
+            verification['fallback_count'] = sum(p['fallback'] for p in verification['proposals'])
+            del verifier
         result = {'status': 'refining', 'selection': selection, 'flexible': arm != 'R0', 'candidates': [],
-                  'search_seconds_this_arm': time.monotonic() - started,
+                  'search_seconds_this_arm': search_seconds_this_arm,
                   'candidate_count': len(candidates), 'requested_candidate_count': args.top_k,
                   'candidate_shortfall': max(0, args.top_k - len(candidates))}
+        if verification is not None:
+            result['verification'] = verification
         report['arms'][arm] = result
         if not candidates:
             result.update(status='no_candidates', exported_count=0, failure_count=0)
@@ -119,6 +177,9 @@ def run(args, report, save):
                    'selected_rigid_energy': candidate.rigid_energy,
                    'predicted_gain': candidate.predicted_gain, 'predicted_amplitudes': candidate.amplitudes.tolist()}
             result['candidates'].append(row)
+            if arm == 'R2v':
+                row['verification'] = verification_record(candidate, next(
+                    i for i, c in enumerate(pool, 1) if c is candidate.original_candidate))
             try:
                 initial_ligand = torch.stack(rotate(*ligand.xyz.unbind(-1),
                                                     quaternions[candidate.rotation_index]), dim=-1) + candidate.translation
@@ -127,6 +188,12 @@ def run(args, report, save):
                     receptor.xyz[proteins['receptor'].heavy_indices],
                     initial_ligand[proteins['ligand'].heavy_indices], centers['receptor'])
                 row['initial_files'] = {k: str(Path(v).relative_to(args.out)) for k, v in initial_paths.items()}
+                if arm == 'R2v':
+                    verified_paths = export_heavy_pair(args.out / arm / f'verified_{index:03d}',
+                        inputs['receptor'], inputs['ligand'],
+                        model.coordinates(candidate.amplitudes)[proteins['receptor'].heavy_indices],
+                        initial_ligand[proteins['ligand'].heavy_indices], centers['receptor'])
+                    row['verified_files'] = {k: str(Path(v).relative_to(args.out)) for k, v in verified_paths.items()}
                 refined = relax_pose(receptor, ligand, model, grid, parameters,
                                      quaternions[candidate.rotation_index], candidate.translation,
                                      radius=radius, flexible=arm != 'R0',
@@ -141,6 +208,8 @@ def run(args, report, save):
                 row.update(status=refined.status, energy=refined.energy, strain=refined.strain,
                            ca_rmsd=refined.ca_rmsd, maximum_atom_displacement=refined.maximum_atom_displacement,
                            amplitudes=refined.amplitudes.tolist(), accepted_steps=refined.accepted_steps,
+                           rotation_increment=refined.rotation_increment.tolist(),
+                           translation_increment=refined.translation_increment.tolist(),
                            energy_evaluations=refined.energy_evaluations, energy_history=refined.energy_history,
                            files={k: str(Path(v).relative_to(args.out)) for k, v in paths.items()})
             except Exception as error:
@@ -167,13 +236,15 @@ def main():
                     help='recompute field chunks in local reverse-mode gradients to reduce retained memory')
     ap.add_argument('--field-backend', choices=['dense', 'sparse'], default='dense',
                     help='sparse evaluates the same compact fields only on atom-local grid stencils')
-    ap.add_argument('--arms', choices=['R0', 'R1', 'R2'], nargs='+', default=['R1', 'R2'])
+    ap.add_argument('--arms', choices=['R0', 'R1', 'R2', 'R2v'], nargs='+', default=['R1', 'R2'])
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--ph', type=float, default=7.)
     ap.add_argument('--modes', type=int, default=2)
     ap.add_argument('--fit-damping', type=float, default=.001)
     ap.add_argument('--rotations', type=int, default=4)
     ap.add_argument('--top-k', type=int, default=1)
+    ap.add_argument('--response-pool-size', type=int, default=50,
+                    help='R2v verifies this many response proposals before TopK; R2 uses the same raw pool when both run')
     ap.add_argument('--peaks-per-rotation', type=int, default=4)
     ap.add_argument('--spacing', type=float, default=2.)
     ap.add_argument('--radius', type=float, default=.1)
@@ -189,6 +260,8 @@ def main():
         ap.error('counts must be positive')
     if len(set(args.arms)) != len(args.arms):
         ap.error('arms must be unique')
+    if args.response_pool_size < 1 or ('R2v' in args.arms and args.response_pool_size < args.top_k):
+        ap.error('response pool must be positive and at least top-k when using R2v')
     if not 0 <= args.seed < 2**32:
         ap.error('seed must be in [0, 2**32)')
     for name in ('ph', 'fit_damping', 'spacing', 'radius', 'max_atom_displacement', 'max_translation'):

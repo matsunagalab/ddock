@@ -7606,3 +7606,207 @@ NaN／未完了report拒否、既存FFT回帰を含む対象suiteは **189 passe
 次はnativeを推論へ入れず、(1)小振幅の予測／実利得に基づくtrust regionと相互作用HVP曲率診断、
 (2)格子位相／spacing収束と十分な回転密度、(3)より物理的な再順位付けと内部非結合コスト、を
 別protocolで検証する。改善の選択は開発集合で行い、未使用apo/flexible集合で後に確認する。
+
+
+### 9.19 応答候補の非線形検証と物理スコア診断（2026-11-16）
+
+**問い・事前設計。** §9.18で実測した応答利得の過大評価／有限変形の制約超過を、
+候補の最終TopK前に実座標と実energyを検査することで防げるか。最終energy順位の問題は
+独立に、格子位相・spacing感度と標準Amber/OBC2再採点で切り分ける。
+[固定v2 protocol](docs/apo_pilot_v2.md) に再実行前の規則を記録した。
+同じ既知development 1系を使うため、v1を見た開発変更でありholdout性能とは呼ばない。
+
+**実装と固定条件。** R2vは同じ128回転／4peaksの応答Top50を非線形検証し、
+実energyでTop5を選ぶ。振幅1から1/32へ半減、実CA／全原子変位／support、実gain<0、
+実gain/予測gain>=0.75を初めて満たす提案を受理する。受理なしはa=0の実rigid energy。
+全試行を保存し、NaNやrigid energy不一致はhard failure。R1/R2/R2vは全てa=0から
+同じ8iteration／64評価の局所精密化を行う。R2とR2vは同じraw poolを共有し、
+Top50検証の追加時間を隠さない。検証済み変形構造を別出力し、初期評価のa=0と区別する。
+その他はv1と同じ入力SHA、pH7、seed0、2modes、spacing2 Å、CPU float64/1thread、
+sparse field/checkpoint。学習loss・学習重み・checkpoint選択はなく、nativeは独立評価だけに使う。
+
+格子診断は凍結v1候補でh=2/1 Åとhalf-cell phaseを比較する。
+原子力場診断はff14SB＋OBC2/ACE、NoCutoff、dielectric1/78.5、kappa0で固定し、
+同座標の相互作用差とapoからの単量体内部energy差を別記録する。構造最適化や係数fitはしない。
+詳細結果は実行完了後に追記する。
+
+
+**実測：凍結候補の独立原子力場診断。** `audit_inducedfit_atomistic.py` はv1初期15＋最終15候補を
+30/30採点し、失敗・skip・OOMは0、55.85154秒／peakRSS572,440,576 bytesだった。
+OpenMM8.6.1 Reference、CPU float64、torch1thread。電荷／粒子パラメータは複合体と単量体で
+一致し、同座標差分で共有結合energyの残差は最大2.00e−11 kJ/mol、剛体ligand strainは
+最大4.66e−10 kJ/mol。入力の水素を同一seed／化学hashで復元し、receptorは保存振幅、
+v1 ligandは丸め済み重原子exportへのproper Kabsch fitで全水素ごと復元した。
+0.001 Å以内のexport一致を必須にし、丸め誤差を記録した。v2以降は保存した姿勢増分を
+直接使えるようにし、このfitを省く。v1では元全水素座標hashが保存されていないという限界を残す。
+
+採点の規則を固定して全物理計算を終えた後に、既存の独立DockQを結合した。
+原子力場相互作用差は同座標の `Ecomplex−ER−EL`、endpointはさらに両単量体strainを足した
+無重み和で、どちらもkJ/mol。smooth energyの無次元εと足し合わせていない。
+力場・OBC2/ACE・dielectric・kappa・順位規則をDockQで選んでいない。
+
+| arm | 元smooth Top1 DockQ | 原子力場interaction Top1のselection rank / DockQ | endpoint Top1のselection rank / DockQ |
+| --- | ---: | --- | --- |
+| R0 | 0.024711 | 4 / 0.199266 | 4 / 0.199266 |
+| R1 | 0.024723 | 4 / 0.201863 | 4 / 0.201863 |
+| R2 | 0.024723 | 4 / 0.048417 | 5 / 0.017554 |
+
+R0/R1の相対的によい候補は昇格したが、**全てDockQ0.23未満**で成功にはならない。
+R2ではinteractionとendpointで順位も違い、endpoint Top1は元smooth Top1より悪化した。
+事前にprimaryとしたinteraction差を維持し、精度に都合のよい定義へ切り替えない。
+最終interaction差は全候補で正（最小R2selection4=36.87424 kJ/mol）であり、
+低いものを結合自由エネルギーの成功予測と解釈しない。
+最終重原子最短距離は3.629–5.401 Å、事前定義のsevere heavy LJ clashは全て0だった。
+R1のbest5候補selection4では5.401 Åあり、少なくともこの候補は詰まりすぎではなく接触不足である。
+R2 selection1/2/4のreceptor内部strainは128.38877／132.66434／84.09850 kJ/mol。
+CA springだけでは原子力場による変形コストを十分に表さないという検討材料だが、
+実験apoを力場最小化していないこと、Hだけ準備したこと、陰溶媒／固定protonationの近似も残る。
+
+全30件・成分・両順位・DockQは [原子力場診断CSV](docs/apo_pilot_v1_atomistic.csv)。
+物理結果JSON=`data/inducedfit/apo_pilot_v1/atomistic_obc2_v1.json`、SHA256
+`74a43787d601a329a8993a4ef33052e85562972c0e50b27c42126fabbf0b0176`。
+物理計算中にreplayの検証コードが追加されたため、その実行時source hashは後の最終treeと
+一致しないが、当時のhashを保持した。力場条件や座標再構築式の変更ではない。
+
+**実装検証。** 新しい非線形応答検証は9testsでquarticな近似外れ、有限CA変位、support、
+fallback、NaN／rigid差分、dense/sparseの実energyを確認。初回fixtureの2failは試験用の
+cubic変形が想定した変位超過に達していなかったため、提案振幅に対して超過量を定義し直した。
+solverをtestに合わせて変更していない。runnerの5testsは全50件検査後のTopK、実energy順位、
+R2とのraw pool共有（arm順序両方）、a=0と同予算、例外を成功fallbackにしないことを確認。
+全対象suite216件（4.16秒）＋grid audit2件（0.02秒）、**計218 passed**。
+全legacy suiteやGPUでの検証ではない。
+その後、保存した非ゼロ姿勢増分による全水素replayを1件追加し、最終suiteは
+**219 passed in 3.99s**。格子auditのcacheは同一座標でも各rowのstrainを足す形へ強化した。
+今回再利用された2群のstrainは同一なので、60件の報告値は不変。実行時scriptを
+`data/inducedfit/grid_audit_v1/executed_script.py` に保持し登録hashとの一致を確認した。
+
+
+**実測：格子の収束・位相診断。** 凍結した15最終候補×4格子の60採点を全て完了、
+失敗・skip・OOMは0、66.13秒。v2本runとCPU処理が重なったため速度benchmarkには使わない。
+共通の入力／予測support由来106 Å立方体を使い、2 Åでは53³、1 Åでは106³の格子。
+全supportを含め、格子全体を各軸half-cellずらした。nativeやDockQは参照しない。
+全行は [格子診断CSV](docs/apo_pilot_v1_grid_audit.csv)、元JSONと事前登録は
+`data/inducedfit/grid_audit_v1/{registration,report}.json` に保存した。
+
+元2 Å格子と同位相での再構築energy差は最大0.0002815 ε
+（丸めたligand重原子へのfit誤差を含む）。2 Åでのphase差は最大2.4194 ε、
+2→1 Å同位相差は最大1.23668 ε、1 Åでのphase差は最大0.00703562 ε。
+**全armのTop1は4格子すべてで同じ**で、Top1–2の差は少なくとも9.6949 εだった。
+R0/R1の全順位は変わらず、R2の3/4位だけが交換（selection4と2、Spearman0.9）。
+したがって格子依存性は存在するが、この凍結候補の間の誤ったTop1を説明する主因にはならない。
+全探索のcandidate recall・微分／最適化trajectoryは検査しておらず、1 Åで完全収束したとも言えない。
+
+
+**追加の事前診断設計：接触距離。** 格子を細かくしても同じ誤Top1だったため、
+shape項自体をnativeなしの原子対接近曲線で検証する。現式は
+`3∫C_R C_L−∫S_R S_L`（C=core occupancy、S=expanded occupancy−C）。
+鋭い平面極限で厚さdのshellを考えると、非重複gap g>=0でshell-shell重なりは
+`max(0,d−|g−d|)` なので、接触g=0ではなく正のgap g=dで最大となる。
+これは解析的なモデル性質で、実proteinの距離誤差の定量的説明はまだ仮説である。
+
+比較候補を、同じ3チャネルFFTで表せるcore-shell cross項
+`3∫C_R C_L−∫(C_R S_L+S_R C_L)` に固定する。係数は実験結果やDockQでfitせず1。
+既存Gaussian/taper、surface幅0.5 Å、電荷0、典型C/O半径で接近曲線を連続円柱quadratureにより
+計算し、積分刻みを変えて数値感度を確かめる。rR+rLからの最小位置のずれを報告し、
+もし過大重なり／遠方極小なら候補を採用しない。現runへのscore差し替えはしない。
+これはprotein精度評価ではなく、FFT互換な物理scoreの単純系での反証試験である。
+
+
+**実測：登録v2再実験。** R1/R2/R2v各5候補を出力、全3arm完了、
+候補不足・例外・skip・OOMは0。444.37504秒、peakRSS1,855,537,152 bytes。
+共通前処理5.93369秒、rigid search31.19716秒、response search57.58943秒。
+CPU診断／testとの並行時間を含むため、v1とのwall差を制御された性能比較とはしない。
+R1/R2はv1と同じ候補・最終energy（差0）・PDB bytesで再現した。
+全15精密化は8accepted steps後 `max_iterations`、34–47energy評価で、収束宣言はしない。
+
+Top50の非線形検証は36.88061秒。全50件で実gain<0かつ実変位制約を満たす振幅が見つかり、
+fallback0、rigid energy再計算差の最大1.90e−12 ε。
+受理scaleは1倍1件、1/2倍18件、1/4倍27件、1/8倍4件。
+計134試行の内訳は受理50、agreement不足61、実幾何制約超過17、予測／実energy非改善6。
+全試行のstatusを保存した。受理された実gain／予測gainは0.75307–0.89596で規則を満たす。
+旧方式では未検査だった大きな利得を、そのまま選択scoreに使わない処理が実データでも働いた。
+
+R2v Top5のraw pool rankは3,8,11,5,1。検証済み実energyは
+−96.485589, −91.654331, −87.650524, −87.032367, −86.404985 ε、対応する実gainは
+−1.002239, −0.071007, −0.516536, −2.931126, −17.653038 ε。
+局所精密化は登録どおり全候補a=0開始なので、検証変形の保存構造と初期評価構造を混同しない。
+
+独立DockQ2.1.3で初期15＋最終15を全て採点、scorer失敗0。RL:AD／mismatch1／native sanityを
+v1と同じに固定した。結果は [全候補CSV](docs/apo_pilot_v2_results.csv)、
+[6条件集約CSV](docs/apo_pilot_v2_summary.csv)。
+
+| arm | 初期Top1 | 初期best5 | 最終Top1 | 最終best5 |
+| --- | ---: | ---: | ---: | ---: |
+| R1 | 0.024661 | 0.177609 | 0.024723 | 0.201863 |
+| R2 | 0.158914 | 0.158914 | 0.024723 | 0.157074 |
+| R2v | 0.024661 | 0.158914 | 0.024723 | 0.157074 |
+
+**精度改善は確認できなかった。** R2vはR1の4候補と旧R2selection1を選び、R1のbest5候補は依然
+落ちた。R2vの初期Top1はR2より悪化、最終Top1／best5はR2と同値で、全候補DockQ0.23未満。
+応答の数値的な過大評価・制約違反を除けても、元の物理scoreの順位と候補集合の問題は残る。
+推論report SHA256=`3bf79dac58df7129d9df4ba764655377d9bed19f8d61ab0b12b47bcad83089bd`、
+独立評価report SHA256=`91d456f0d856400964dc68ea353718fc58634cf64c8a646f7a3b0813e98c0c6a`。
+
+**再現。** v2の全runner引数は [登録protocol](docs/apo_pilot_v2.md) のコマンドを使う。
+入力source／manifestは§9.18の取得・準備手順と同じ。既存outputを上書きせず新しいoutを指定する。
+
+```bash
+.venv/bin/python scripts/audit_inducedfit_atomistic.py \
+  --report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --out data/inducedfit/apo_pilot_v1/atomistic_obc2_v1.json
+.venv/bin/python scripts/audit_inducedfit_grid.py \
+  --run-report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --out data/inducedfit/grid_audit_v1
+data/inducedfit/dockq_env/bin/python scripts/score_inducedfit_pilot.py \
+  --native data/inducedfit/evaluator_only/1BRS.pdb \
+  --run-report data/inducedfit/apo_pilot_v2/pilot_run/report.json \
+  --mapping RL:AD --allowed-mismatches 1 \
+  --out data/inducedfit/evaluator_only/apo_pilot_v2_dockq.json
+```
+
+
+**実測：連続原子対モデルの接触距離。** CPU float64／1thread、乱数なし、
+電荷0、固定半径・係数で4原子対×2モデル×2quadrature幅を評価した。
+既存 `_gaussian` とC2 taperをそのまま使用し、円柱座標 `2πρ dρ dz` の台形積分で
+受容体の完全supportを含めた。距離刻み0.25 Åの曲線から局所極小を全てbracketし、
+`scipy.optimize.minimize_scalar`（xatol1e−5 Å、maxiter100）で精密化。学習lossやfitなし。
+1.990秒／peakRSS296,534,016 bytesで全完了、失敗・skip・OOMは0。
+
+| 原子対 | 幾何半径和 Å | 現shell–shell極小 Å | core–shell案の極小 Å |
+| --- | ---: | ---: | ---: |
+| C–C | 3.40 | 6.580258 | 5.572428 |
+| C–O | 3.22 | 6.120413 | 5.173526 |
+| O–O | 3.04 | 5.667839 | 4.784100 |
+| H–O | 2.72 | 4.884810 | 4.113059 |
+
+表は積分幅0.025 Å。0.05→0.025 Åで極小距離の差は最大0.000162 Åで、
+2–3 Åの遠方ずれを積分誤差では説明できない。半径和でのenergyは候補案でも全て正、
+C–C3.53878、C–O2.67071、O–O2.01618、H–O0.91106 εだった。
+**cross項だけの変更は十分な修正にならず採用しない**。係数を動かして成功に見せない。
+これは無電荷の単原子対という単純化で、半径和を全元素対の実験平衡距離と同一視せず、
+多原子occupancyの飽和・溶媒・protein精度を直接検証したとは言わない。
+ただし現場の幅が接触距離から遠い極小を作ることを連続積分で測定できた。
+
+[接触距離CSV](docs/inducedfit_contact_v1.csv)、全曲線／実行時hash／数値条件は
+`data/inducedfit/contact_v1/{curves.csv,metadata.json}` に保存した。実行後にCSV出力だけをLFへ統一し、
+計算式や結果数値は変更していない。
+
+```bash
+.venv/bin/python scripts/diagnose_inducedfit_contact.py \
+  --out docs/inducedfit_contact_v1.csv \
+  --curves data/inducedfit/contact_v1/curves.csv \
+  --metadata data/inducedfit/contact_v1/metadata.json
+```
+
+**結論・限界・次実験。** 非線形検証を候補選択に組み込み、実apoでも未検査の応答利得を
+そのまま採点しないようにした。一方で予測精度は改善せず、HDOCK優位性も依然未実証。
+凍結候補の格子位相誤差だけでは誤Top1を説明できず、原子力場再採点・内部strain診断・
+連続接近曲線が、接触と変形コストの物理モデルを先に修正する必要を示した。
+同じ1系への開発反復であり独立validation/testの成功率ではない。
+
+次はnativeなしの二原子・平面で、(a)vdW境界を持つcompact C2球のsmooth unionと
+core–shell cross項、(b)固定Amber sigma/epsilonによる原子型別potential gridを別候補として検証する。
+(a)は3チャネル／JVP／FFTを保てるが幾何モデル、(b)は物理パラメータを固定できるが
+型チャネルが増える。半径／強度をDockQで合わせず、接近曲線・短距離反発・相互作用力・
+格子位相／spacing収束を先に合格条件にする。その後に内部非結合／torsion strainを加え、
+同一回転・候補予算で新しい開発protocolを登録する。精度確認は別の未使用apo集合で必要である。

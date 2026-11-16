@@ -68,6 +68,7 @@ grid size, not total FFT/gradient memory.
 | R0 | Rigid field score | Rigid pose |
 | R1 | Rigid field score | Pose and receptor torsions |
 | R2 | Constrained quadratic response score | Pose and receptor torsions |
+| R2v | Actual nonlinear energy after verifying a larger response pool | Pose and receptor torsions, from zero deformation |
 
 R1 and R2 use the same grid, rotations, candidate count, zero initial deformation,
 solver budgets and displacement limits. R0/R1 reuse identical rigid candidates.
@@ -75,6 +76,17 @@ Shared preparation and search times are reported separately: per-arm elapsed
 times alone are not independent end-to-end runtimes. The ligand stays internally
 rigid. Every refinement includes all hydrogens in the fields and displacement
 check; atom positions follow the topology-aware torsion map.
+
+Use `--arms R1 R2 R2v --response-pool-size 50` to test verified selection.
+R2v checks all response proposals before TopK, shrinking each amplitude from
+1 to 1/32 until actual energy decreases, actual/predicted gain is at least
+0.75, and true CA/all-atom displacement and field-support bounds pass. A proposal
+with no accepted scale falls back to its rigid energy. Nonfinite values and
+failure to reproduce the rigid energy fail the arm. R2 and R2v share the raw
+pool when both are requested, and the extra verification time is reported.
+This is not an equal-total-time comparison. Both still refine from zero
+amplitudes; `verified_*/` saves the deformation used only for candidate selection.
+The report retains every verification trial and final rigid pose increments.
 
 Add `--checkpoint-fields` to recompute field chunks during local reverse-mode
 gradients instead of retaining their large intermediate tensors. FFT search and
@@ -116,3 +128,27 @@ fields and checkpointing. All 30 initial/final models scored below DockQ 0.23.
 See the [per-candidate results](apo_pilot_v1_results.csv) and research log §9.18
 for negative results, ranking errors and the response-gain diagnostic. This is
 a completed execution test, not a successful docking benchmark.
+
+## Frozen-pose physical diagnostics
+
+These separate tools replay all original hydrogens and evaluate frozen poses
+without reading native coordinates or optimizing against a reference:
+
+```bash
+.venv/bin/python scripts/audit_inducedfit_grid.py \
+  --run-report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --out data/inducedfit/new_grid_audit
+.venv/bin/python scripts/audit_inducedfit_atomistic.py \
+  --report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --out data/inducedfit/new_atomistic_audit.json
+```
+
+The grid audit compares 2/1 Å spacing and zero/half-cell phase at the same
+frozen coordinates and common physical extent. The atomistic audit uses
+ff14SB + OBC2/ACE, reporting same-coordinate interaction energy and monomer
+strain separately in kJ/mol. Its primary interaction ranking and separate
+unweighted endpoint ranking are saved; neither is a binding free energy.
+These diagnostics do not modify the runner's final smooth-energy ranking.
+Replay verifies input hashes, chemistry, atom maps, amplitudes and heavy exports;
+older reports without final pose increments require a rigid fit to rounded
+heavy coordinates, whose error is retained.
