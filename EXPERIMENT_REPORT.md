@@ -6582,3 +6582,476 @@ for i in 0 1 2; do CUDA_VISIBLE_DEVICES=$i uv run python scripts/eval_search_tes
     --shard $i/3 --ckpt data/scaling/runs_ifonly/N220_seed0/round0_ckpt.pt \
     --out data/scaling/eval_search/if_s$i.json & done; wait
 ```
+
+## 9. 物理主体の flexible ddock に向けた外部実装調査と研究案（2026-11-16、未実験）
+
+### 9.1 問い・依頼条件・今回の実施範囲
+
+利用者の問いは「ddockがHDOCKに勝つための改善案」。追加条件は、他の公開protein–protein
+docking GitHub repoを調べること、HDOCKと同じ方法の再現を主案にしないこと、物理モデリングを
+優先し必要なら学習と相補的に組むこと、ddock固有の研究貢献を目指すこと、抗体CDRループへ
+拡張できること。最後に、holoよりflexibleなベンチマークを主戦場にする案が提起された。
+
+本節では**apo入力で界面変形を伴う系を主目標、holoを対照**とする研究方針を提案する。
+apoという入力区分と、大きな構造変化を伴うflexibleという難度区分は同じではない。
+cofolding由来の単体・ループ候補も利用可能とし、相互作用・変形コスト・局所状態の収支を
+明示して予測を検証できることを物理モデルの価値とする。絶対結合自由エネルギー予測を
+この段階で約束しない。
+
+実施したのは、HEAD `ec4584b` のコード・既報の読み取り、公開repoのREADME/主要コード、
+原論文・公式文書の調査、および以下の実験設計のみ。新しい学習・推論・ベンチマークは
+**実行していない**。このcheckoutには既報の `data/` と `external/` がなく、数値は既報の
+有効な記述の再確認であり生CSV/checkpointからの再計算ではない。新規の失敗run・OOM・skipは
+発生していない。調査時にbioRxiv全文・HDOCKサイトの一部取得に失敗し、公開repoと取得可能な
+原論文・公式文書で補った。ネット上の全repoを網羅したという主張はしない。
+
+### 9.2 現在の事実と解釈の修正
+
+§5.14.33の公式PINDER-S/holo、250件の既報値：
+
+| 条件 | Top-1 acceptable | Top-1 medium | Top-1 high |
+| --- | ---: | ---: | ---: |
+| QP・精密化なし | 76.80% | 72.40% | 38.00% |
+| QP・上位50件を精密化 | 84.00% | 82.40% | 73.60% |
+| 同50件のOracle（正解で選ぶ診断、配備不可） | 94.80% | 91.60% | 79.60% |
+| HDOCK（既報が引用したPINDER論文値） | 94.40% | 94.00% | 93.60% |
+
+- acceptableの順位選択余地は10.8 ppだが、OracleとHDOCKとの差は250件中**1件**。
+  「候補拡張が不要」と一般化する根拠にはならない。
+- mediumもOracle 91.6%がHDOCK 94.0%を下回るため、HDOCK超えを目標にすると
+  「純粋に順位づけだけ」の問題ではない。highは候補品質の改善が明らかに必要。
+- 最近接格子回転での39.6%を真の上限とした解釈は§5.14.31で撤回済み。
+- §5.14.34の同じ表の再学習、§5.14.35のbasin特徴追加は実施条件内でnull/負の結果。
+  「すべてのパラメータ学習が無効」「情報が完全に重複」とまでは証明していない。
+- sym(12)の+7.24 ppは固定validation 152件の結果であり、end-to-end改善は未確認。
+- apo 93件の26.88%等は古い `trained_N220` の結果。最新QP＋50件精密化のapo値ではない。
+
+実装で確認した制約：`score.py` のPSCは二値占有・nearest経路を含み、`trilinear`にしても
+衝突項の座標勾配は得られない。`refine_poses.py` はnearest採点の6自由度パターン探索。
+SASA由来のsurface/core分類も現在は入力構造で固定され、内部変形時には更新が必要。
+`search.py` は各回転の最高並進1個を保持するため、離れた第2ピークも落とす。
+これは独立した候補保持の検討点であり、以下の新規物理仮説とは別に対照化する。
+
+### 9.3 他repoと先行研究から何を借り、どこを研究対象にするか
+
+以下は閲覧した公開実装・文献。インストールや性能再現は行っていない。
+
+| 外部実装 | 確認した内容 | 本提案での位置づけ |
+| --- | --- | --- |
+| [LightDock](https://github.com/lightdock/lightdock)、[ANMコード](https://github.com/lightdock/lightdock/blob/master/lightdock/structure/nm.py) | CAのANM、全原子へのモード拡張・振幅調整 | 少数変形モードの参考。モードを足すだけでは新規ではない |
+| [ATTRACT](https://github.com/sjdv1982/attract)、[iATTRACT論文](https://doi.org/10.1002/prot.24728) | repo/ソース木、柔軟な界面と剛体の同時最小化という原論文の方法 | 物理的柔軟精密化の比較対照 |
+| [HADDOCK3](https://github.com/haddocking/haddock3) | flexref/OpenMM関連実装。OpenMMの標準設定は明示溶媒、implicitも選べる | 柔軟精密化の参考。モジュールを無変更でbinding free energy scorerとは呼べない |
+| [Rosetta/SnugDock](https://github.com/RosettaCommons/rosetta/blob/main/source/src/protocols/antibody/snugdock/SnugDock.cc) | Ab–Ag/VH–VL、CDR-H2/H3 KIC、側鎖packing等 | 抗体で必須の比較対照。剛体とループの共同最適化は既存 |
+| [Rosetta HBondEnergy](https://github.com/RosettaCommons/rosetta/blob/main/source/src/core/scoring/hbonds/HBondEnergy.cc)、[埋没極性基の公式説明](https://docs.rosettacommons.org/docs/latest/rosetta_basics/scoring/BuriedUnsatPenalty) | 方向性・微分、未充足/過充足の多体性 | 下記Cの物理的根拠。既存項を追加するだけは独自性にしない |
+| [OpenMM](https://github.com/openmm/openmm)、[GB実装](https://github.com/openmm/openmm/blob/master/wrappers/python/openmm/app/internal/customgbforces.py) | LJ/静電/二面角、GBn2/OBC系の溶媒項 | 力・エネルギーの参照計算。近似力場であり正解構造の保証はない |
+| [ABlooper](https://github.com/oxpig/ABlooper/blob/master/ABlooper/ABlooper.py)、[修復コード](https://github.com/oxpig/ABlooper/blob/master/ABlooper/openmm_refine.py) | 個別loop予測 `all_decoys`、OpenMMによる幾何修復 | 学習は閉じたループ初期候補の提案に使う。モデル間の分散は熱分布ではない |
+| [MaSIF](https://github.com/LPDI-EPFL/masif)、[dMaSIF](https://github.com/FreyrS/dMaSIF/blob/master/model.py) | 表面文脈のdescriptor・相補性 | 候補提案/独立情報の補助。物理主体という条件から第一主案にはしない |
+| [DiffDock-PP](https://github.com/ketatam/DiffDock-PP/blob/main/src/model/losses.py)、[GeoDock](https://github.com/Graylab/GeoDock/blob/main/geodock/utils/loss.py) | SE(3) score matching、構造/距離の教師 | 神経補正器の比較候補。通常のDiffDockの小分子版と混同しない |
+| [VoroIF-GNN-v2](https://github.com/kliment-olechnovic/voroif-gnn-v2-app) | 接触と接触間隣接のグラフ、局所CAD品質、重み提供 | 物理精密化後の独立reranker対照 |
+| [DeepRank-GNN-esm](https://github.com/haddocking/deeprank-gnn-esm/blob/main/src/deeprank_gnn/predict.py)、[GNN-DOVE](https://github.com/kiharalab/GNN_DOVE)、[DeepRank2](https://github.com/DeepRank/deeprank2) | 残基/原子グラフ、ESM、特徴生成 | 学習補助の実装参考。公開重みのPINDER漏洩を未確認 |
+| [LambdaDockScore](https://github.com/Graylab/LambdaDockScore/blob/main/src/Ranking_Net.py) | 品質差と順位割引を使うpairwise loss | 補助損失の候補。コードは予測順位、[論文](https://arxiv.org/html/2610.00191v1)は正解順位を記述し不一致がある |
+| [PIsToN](https://github.com/stebliankin/piston) | 界面画像とTransformer、MaSIF/FireDock依存 | 表面情報の比較案。導入優先度は低い |
+| [FRODOCK](https://github.com/chaconlab/FRODOCK) | README/user guide、球面調和・複数解 | 本体ソースはこのrepoで確認できず。HDOCK類似のポテンシャル追加を主案にしない |
+
+HDOCK比較条件はweb serverのtemplate hybridと混同しない。
+[PINDERの実行コード](https://github.com/pinder-org/pinder/blob/main/src/pinder-methods/pinder/methods/run/hdock/predict.py)
+はHDockLiteを呼ぶ実装であり、ここから「HDOCKの高成績はtemplate利用のおかげ」とは言えない。
+
+先行性の確認で特に重要なのは [May & Zachariasのnormal-mode docking](https://pubmed.ncbi.nlm.nih.gov/17729269/)、
+[FiberDock](https://pmc.ncbi.nlm.nih.gov/articles/PMC4290165/)、[EigenHex](https://pubmed.ncbi.nlm.nih.gov/22610423/)、
+[SnugDock](https://doi.org/10.1371/journal.pcbi.1000644)、[FMFTのensemble/partition議論](https://pmc.ncbi.nlm.nih.gov/articles/PMC4968711/)。
+従ってGaussian化、勾配最小化、normal mode、ensemble、ループ共同精密化の各要素を
+「世界初」とはしない。以下は**ddockに即した新しい組合せと反証可能な問い**である。
+
+### 9.4 共通の土台：同じ滑らかな物理場によるFFTと連続精密化
+
+現在の二値PSCを、滑らかな密度から作る排除体積・表面・電荷場へ置き換える。
+例として分子内の占有を `o(x)=1-exp(-sum_i g_i(x))` と飽和させ、分子間の占有重なりを
+反発項にする。分子内が非線形でも、固定された両分子場の相関はFFTで計算できる。
+Gaussianは数値表現であって物理の正しさそのものではない。引力/反発/溶媒項の収支が別途必要。
+
+同じ帯域制限モデルを格子上ではFFT、格子外では連続評価して、力・回転トルク・内部座標の
+微分を得る。粗い平滑化から細かい場へのcontinuationは候補だが、異なる平滑化のスコアを
+直接順位比較せず、最終場で採点し直す。FFT/直接評価、有限差分/自動微分の一致、格子原点・
+全体回転・spacingへの依存、zero paddingを検証する。多体GB/水素結合充足の局所補正まで
+単純なFFTで厳密に計算できるとは言わない。
+
+**結論・限界・次段階：** これは下記A〜Dの共通基盤。単独の新規性主張には弱いが、現行の
+座標勾配欠落を解消する必要条件である。最初に同一候補で旧score＋pattern search、
+新score＋pattern search、新score＋勾配精密化を比較し、物理項と最適化器の効果を分離する。
+
+### 9.5 案A：変形後の安定化を「候補切り捨て前」に予測する応答FFT
+
+**仮説。** 剛体状態では衝突するが、小さな物理的変形で安定化する配置を、剛体の順位で
+落としている。全並進点で変形の応答を先読みすれば、同じ最終候補予算でもapoのrecallが上がる。
+
+剛体姿勢qと少数の内部変形uに対し、同じ単位の物理エネルギーで
+
+`E(q,u) ≈ E0(q) + g(q)^T u + 1/2 u^T K u`
+
+と近似する。Kは単体の正定値の変形剛性、gは分子間エネルギーの変形微分。
+u=0は選んだ単体変形priorの極小とする（ANMでは構成上満たせる）。そうでなければ
+単体の非零勾配も線形項に含める必要があり、分子間力だけで変形を予測しない。
+無制約の局所近似なら `u*=-K^-1 g`、`Eeff=E0-1/2 g^T K^-1 g`。
+分子場の各モード微分をFFT相関に載せれば、gを全並進点について求められる。
+柔軟側（抗体/CDR）を固定側にすると、微分場のFFTを回転ループ外で再利用できる。
+モード数Mに応じた逆FFTが増えるため、追加計算は無料ではない。対角Kなら逐次集計できる。
+
+既存のANM docking/EigenHex等との差として検証するのは、**上位候補を選んだ後の変形ではなく、
+全並進点に解析的な緩和予測を加えてから候補を選ぶ**点。限定検索で一致した方式を確認
+できなかったが、新規性確定の証拠ではない。
+
+最大の失敗要因は、強い衝突による大きなgが負の補正で報酬化されること。剛体ゼロモード除去、
+モード正規化、Kの下限、変位trust region、深い衝突への適用制限、変形後の元の非線形
+エネルギーによる確認を必須にする。固定Kのlog-detは姿勢非依存であり、この式だけで
+結合エントロピーを取り入れたとは言わない。
+
+**最小実験案。** M=0/4/8、変位上限0.5/1.0 Åをvalidationだけで選ぶ。剛体選択→柔軟精密化、
+単なるsoft-core選択→同じ精密化、応答補正選択→同じ精密化を比較。最終K=50を揃え、
+元スコア候補と補正候補の混合率も固定する。予測/実測緩和利得、recall、Oracle@50、Top-1、
+clash/変形量/時間を測る。現行スコアとは符号が逆で、ここは小さいEが良いという定義。
+
+**結論・限界・次段階：** 独自性とapoへの適合性が最も高い主研究候補。調和近似が効く
+小変形から始める。holoの高成績を直接改善する保証はなく、大きいCDR-H3変形には案Bが必要。
+
+### 9.6 案B：CDRの構造分布を含むensemble FFTと閉鎖制約付き精密化
+
+**仮説。** 1個の抗体構造での最良接触ではなく、単体で実現しやすいループ状態の範囲で
+安定する結合様式を選ぶと、無理なCDR変形による偽陽性を減らせる。
+
+閉じたループ状態mに対する単体分布p0(m)を正規化し、固定姿勢qで
+
+`Feff(q) = -tau log sum_m p0(m) exp[-DeltaE_inter(q,m)/tau]`
+
+を有効スコアとする。p0に単体変形コストを入れた場合、同じコストをDeltaE側へ二重に入れない。
+校正されたエネルギーと物理的p0がなければ、これは分布を考慮したスコア近似であって絶対ΔGではない。
+ABlooper等のモデル間分散をp0という熱平衡確率に読み替えない。
+
+FFTに載る加法部分を固定framework＋可動loopに分けて再利用する。局所段階では抗体–抗原の
+R,tとCDR-H3のφ,ψ、界面χを同じエネルギーで動かす。閉鎖条件は両端の位置・向き、
+結合幾何とキラリティを含む。KICによる初期候補生成と、分岐内の連続微分は分け、
+離散的な閉鎖解選択まで自動微分可能とは主張しない。
+
+**最小実験案。** 初期H3候補数8/16、剛体のみ／ensemble最小値／正規化した分布集約／
+分布集約＋H3精密化。同じ候補からSnugDockも対照にする。DockQとframework整列後のH3 RMSD、
+閉鎖誤差、strain、時間を測る。候補複製で不当に成績が変わらないかも確認する。
+
+**結論・限界・次段階：** 抗体への最も自然な発展。ensemble docking自体は既存で、独自性候補は
+分布の正規化・framework再利用・制約付き微分精密化の一体化と計算効率。最初はH3のみ、
+frameworkと抗原の内部構造を固定し、VH–VLや他CDRを一度に解放しない。
+
+### 9.7 案C：水との競合を含む極性基の充足を、微分可能な割当問題として解く
+
+**仮説。** 原子対の引力総和では、極性基が水から離れるコスト、結合方向、同じ基への
+過剰な水素結合を区別しにくい。抗体ループを動かす力にも、この収支が重要かもしれない。
+
+donor/acceptor間に方向・距離依存の結合コストを置き、各官能基の化学的容量を制約する。
+水と結合したままの状態も選択肢に置き、埋没による水へのアクセスの変化を連続的に表す。
+その割当を滑らかな制約付き最適化で解き、得られる界面スコアと座標微分を用いる研究案。
+一律に「各原子1本」とはせず化学型ごとの容量が必要。エントロピー正則化した割当は
+厳密な水の分配関数ではない。まず未充足罰則の連続近似と比較する。
+
+Rosettaの未充足/過充足項・水素結合ネットワークは先行例。新たに問うのは、**相手分子と
+溶媒への充足を同じ連続最適化で競合させ、その力で姿勢とループを更新できるか**である。
+GBや既存の脱溶媒和との二重計上を避ける。配置依存多体項なので初版は上位候補だけに適用。
+
+**最小実験案。** 同一Top50で、方向性HBのみ、HB＋連続未充足罰則、容量/溶媒競合ありを比較。
+まず固定poseの順位づけ、次に同じ目的関数で精密化し、効果を分ける。学習する場合も
+水との交換コスト等の少数係数だけを物理事前値付近で較正する。
+
+**結論・限界・次段階：** A/Bよりモデル仮定が多いが、holo/apo両方の順位づけと抗体の
+局所精密化に効く可能性がある。中性/荷電・埋没度別の小さな物理検算から始める。
+
+### 9.8 案D：学習は「不足する物理計算の差分」に使う
+
+**仮説。** 高価な溶媒・側鎖計算を全探索に直接組み込まず、そのエネルギー差・力の差だけを
+小モデルで近似すれば、物理主体を保って高速化できる。
+
+`E = E_fast + deltaE_theta` とし、deltaEの教師は例えば拘束付きOpenMM/GB計算との差分とする。
+energy/forceの差分は同一配置xで評価する。参照計算を先に緩和する場合は、別の有効
+エネルギーとその微分を定義する必要があり、緩和後energyと緩和前forceを混ぜない。
+複合体内部の総Eではなく、同じ原子・プロトン化・座標の分離状態との差と、単体strainを
+分ける。GBでは環境ごとのBorn半径再評価が必要。scalar energyを学び力をその勾配とすれば
+保守力を保ちやすい。遠距離で補正が消える、回転/並進不変、排除体積を壊さない条件を課す。
+教師の近似物理自体が誤っていれば改善しないので、実構造での独立評価も必要。
+
+**最小実験案。** fastのみ／参照物理を直接使用／学習差分の3条件。同じtrain decoy上で
+energy-difference MSE＋force MSEを、trainで固定した単位尺度で正規化して学習。
+外部GNNを最終順位の補助にする案や、cofolding/ABlooperを候補生成に使う案は別armとして比較。
+
+**結論・限界・次段階：** 相補的利用の候補で、一般的delta learning自体は既存概念。
+まず参照物理がddock候補の選択/精密化を改善することを確認し、それから圧縮を試す。
+
+### 9.9 共通の評価・漏洩管理・実行状態
+
+- **データ/split（計画）:** PINDER公式train内でfit/validationをinterface関連性を考慮して
+  分離し、まず各64複合体のpilotを入力情報に基づく層別＋固定seedで抽出する。positiveが
+  ある系だけに母数を限定しない。既存validationとTESTの難度差も併記する。
+- **主評価（計画）:** [PINDER-XL](https://github.com/pinder-org/pinder)のapoペア342件を候補とし、
+  既に反復参照したPINDER-Sのapo93件と残りを区別。残りも未使用か監査してから最終holdoutを
+  固定する。DB5.5は本研究で既に学習・設計に使った履歴があるので、無条件に新規testとはしない。
+  apo全体と事前定義した界面変形の小/中/大を全て報告。正解由来の変形量は評価層別だけに使い、
+  探索・モード選択・初期ループ生成に渡さない。抗体は抗原類似性と抗体/CDR類似性双方を監査。
+- **baseline:** 同一入力のHDockLite、現行ddock、滑らかなcoreのrigid版、soft-coreのみ、
+  rigid候補後の通常flexible refinement。抗体ではSnugDockを追加。cofolding初期候補を使う
+  条件は単体構造のみの条件と混ぜず、全手法に同じ初期情報を与える。
+- **指標:** 公式PINDER/DockQのTop-1/Top-5 acceptable・medium・high、Oracle@50、
+  失敗/欠損を含む全母数、衝突、strain、実変位、時間、peak VRAM。柔軟性で改善したかは
+  変形難度別のpaired差を測る。複合体単位のbootstrap/paired検定を用い、poseを独立標本にしない。
+  抗体はH3 RMSDと閉鎖/結合幾何も併記し、既知epitopeとblind dockingを分ける。
+- **パラメータ/seed（計画）:** 固定候補K=50、seed=0/1/2。AのM・trust region、Bのensemble数等は
+  上記の小さい候補集合からvalidationで選ぶ。最終testによるcheckpoint/方式選択はしない。
+  物理のみの初回は学習lossなし。較正する場合は少数係数のprior付き順位lossとし、全設定を保存。
+- **hardware/予算:** 今回GPU計算なし。実験GPU型番・VRAM・ソフト版は未指定で、実行時に
+  固定記録する。費用の数値予測は未測定。各armは同一候補数比較と同一時間比較の両方が必要。
+- **commands/実装:** 今回は `git status --short`, `git log -5 --oneline`, `rg`, `sed` で既報と
+  `score.py`, `search.py`, `refine_poses.py`, `fit_subspace.py` 等を読み、GitHub read-only取得と
+  web検索で上記URLを確認した。A〜Dの実装・実行コマンドはまだ存在しない。
+  実行済みであるかのようなCLIや結果は記さない。大きい生成物をcommitしない。
+
+**総合結論・限界・次段階：** 主研究候補はA（変形応答を候補選択前へ）とB（CDR構造分布と
+閉鎖制約）。共通の滑らかな物理coreを先に検証し、apoの同じ候補予算でAを反証する。
+Cは順位づけの物理的増分、Dは参照物理が効いた後の高速化として段階投入する。
+HDOCK超えも新規性も未実証。物理モデルの価値を示すには、単なる全体成功率に加えて
+「変形できるから救えた例」と「無理な変形を罰して除けた例」を、選別なしの成績とともに示す。
+
+### 9.10 変形の具体的な表現と計算手順（2026-11-16、設計補足・未実験）
+
+利用者の質問「変形はどうやって考慮するの？」への補足。案Aの最小構成は、apo構造から
+動きうる方向を決め、相手分子がその方向に及ぼす力で変形量を決めるものである。
+
+1. **変形方向。** 最初は片側だけを柔軟にし、apoのCA近傍をばねで結んだANMから
+   剛体の6ゼロモードを除く低周波モード4〜8個を得る。`x(a)=x0+B a` と表現し、
+   Bの列を動き方、aを各方向の振幅とする。[LightDockの実装](https://github.com/lightdock/lightdock/blob/master/lightdock/structure/nm.py)
+   はCAのANMを全原子へ拡張している。全体低周波モードで局所ループ変形を全て表せるとは
+   限らない。Cartesianモードの有限変位では結合幾何が崩れうるため、小変形の候補予測に
+   限定し、実構造では内部座標による精密化または幾何修復を行う。
+2. **変形コスト。** `E_total(q,a)=E_inter(q,a)+1/2 sum_m kappa_m a_m^2`。
+   g_mは相互作用エネルギーのa_m微分で、モード方向の力は-g_m。
+   KとBの正規化・単位を揃える。ANMのばね尺度は経験的なので、固有値をそのまま
+   校正済みの物理自由エネルギーと扱わない。共通のばね尺度を単体揺らぎ/物理計算で
+   較正する案と、train/validationで決める有効スコアとして扱う案を分ける。
+3. **全探索時の予測。** a=0近傍の線形相互作用＋調和変形コストでは
+   `a_m*=-g_m/kappa_m`。柔軟側の密度微分場と相手場の相関からg_m(q)を全並進点で得る。
+   各配置で長いMDや反復最小化をするのではなく、まず応答を近似して候補選択する。
+   変位制限を課すと無制約の解析式はそのまま使えないため、小次元の制約付き二次問題
+   または明示した近似で扱う。振幅を切った後に無制約の最小エネルギーだけを加点しない。
+4. **上位候補での確認。** 実際に座標を動かし、回転・並進・内部自由度を更新して
+   元の非線形エネルギーで確認する。予測利得と実利得、修復前後の幾何を記録する。
+   相手に合わせるための大きい変形を許しすぎない。正解holo構造を変形方向に使わない。
+5. **抗体。** H3ではframeworkへの両端閉鎖を満たす主鎖二面角空間を用いる。
+   局所応答の基底は閉鎖制約の接空間に置き、有限変位後の閉鎖も確認する。
+   大きい形の違いには複数の閉じた初期loopを用意し、各近傍で応答を扱う。
+   [KIC](https://doi.org/10.1038/nmeth0809-551)は閉じた候補生成の参考であり、
+   離散的な閉鎖解の分岐を跨ぐ微分を保証するものではない。
+
+データ・split・seed・パラメータ候補・loss・hardware・baselineは§9.5/9.9の計画を継承。
+本追記では数値実験を行っておらず、数値結果/失敗run/新規skip/OOMはない。確認コマンドは
+`sed -n '6666,6745p' EXPERIMENT_REPORT.md` とGitHub read-onlyによるLightDock `nm.py`取得。
+**結論・限界・次段階：** まず小変形の片側ANMで、予測した緩和が実エネルギーの緩和を
+再現するかを検査する。局所ループや大変形への一般化は別段階で、未実証である。
+
+### 9.11 主方針の選択：誘導適合を考慮する案を優先（2026-11-16）
+
+利用者が「誘導適合を考慮する案のほうがいいね」と選好を明示した。
+これを受け、案Aを主軸とする。単体から準備するのは変形方向と剛性であり、
+実際の変形量は相手の配置に応じた相互作用から決める。候補選択前の応答予測と、
+上位候補での実変形・非線形精密化を接続する。案Bの事前ensembleは、大きいCDR変形で
+局所応答だけでは不足すると確認された場合の補助手段として残す。
+
+当面の問いは「剛体では取り逃がす正しいapo配置を、変形コストを含む応答予測で救えるか」。
+最初の比較は、同じ滑らかな物理coreでの剛体法、候補選択後のみの柔軟精密化、
+候補選択前から誘導適合を考慮する方法とする。単なるsoft-core化も対照に含める。
+データ/split・seed・パラメータ候補・loss・hardware・評価は§9.5/9.9/9.10を継承する。
+本節は方針決定の記録のみで、新しい実装・学習・数値実験・失敗run・skip・OOMはない。
+
+**結論・限界・次段階：** 誘導適合を主研究仮説に選んだ。性能改善や新規性を確定した
+わけではない。まず座標微分可能な物理coreと小変形応答の整合性を検証し、
+その後apoベンチマーク、さらに閉鎖制約付きCDRループへ段階的に展開する。
+
+### 9.12 実装・評価計画の具体化とソース再監査（2026-11-16、計画のみ）
+
+利用者の依頼「実装と評価まで計画して、markdownにplanをまとめてください」を受け、
+[PLAN_INDUCED_FIT.md](PLAN_INDUCED_FIT.md) を新規作成した。コードの実装や実験開始の依頼とは
+区別し、今回は設計とソース監査のみを行った。段階はP0（入出力／baseline）から
+P1（smooth core）、P2（内部座標と変形prior）、P3（応答FFT）、P4（開発比較）、
+P5（固定holdout）、P6（適応基底／抗体）とした。
+
+**問い・根拠。** 同じ物理モデル、同じ候補数・精密化予算の下で、選択前の応答予測が
+選択後だけの柔軟化より正しいapo配置を保持するか。変形後energyまで同じモデルで確認し、
+soft clash、warm start、候補多様性の変更を対照で分ける。
+
+**今回のソース監査で確認した事実・訂正。**
+
+- §9.2の「各回転の最高並進1個」は既定値の説明。`docking_search` は既に
+  `trans_per_rotation>1` を受け取れる。ただし単純top-kで空間的NMSではない。
+- `PreparedProtein` は `native_lig/q_star/t_star` を持つ。apoで `check_geometry=False` に
+  してもreference-free型にはならないため、新backendの推論型からこれらを除く計画とした。
+- `prep_cache.py` のkeyはsystem IDのhashで、入力座標・物理core・modeの内容hashではない。
+  version不一致等のcache miss時の再生成も含め、新cacheを設計する。
+- 既存apo runnerは任意manifestを受け取れず、受容体固定exportである。
+  最新checkpointの全係数復元、両鎖変形出力、公式scorerの登録母数への再集計がP0で必要。
+- 現行grid padding／局所精密化の補間を新coreへそのまま流用しない。
+  格子点でのFFT対直接和と、非整数位置での場再構築微分を分けて検証する。
+
+**実装・parameter・loss。** 新規 `src/zdock/inducedfit/` backend。滑らかな占有／表面／
+電荷の3チャネル、effective energy unit ε、同じ非線形priorからの剛性Kを使う。
+M=4/8、trust radius=0.5/1.0 Å、K候補数=50、seed=0（主）と1/2（頑健性）、
+grid spacing初期1.2 Å、Hopf nside=3。詳細なcutoff、単位、geometry制約、数値合格基準は
+plan §4–6に記載。最初はNN訓練なし。少数core係数を較正する場合はtrain decoyで
+prior付きpairwise logistic loss、validationのみで設定選択、testでは固定する。
+
+**データ・split・漏洩。** PINDER trainの両鎖apoからfit64／validation64を目標とするが、
+件数の存在は未確認。不足なら実数縮小、testを流用しない。PINDER-XLから既使用集合と
+重複を除いたholdoutを履歴監査して固定する。「342−93=249」は候補数に留める。
+推論manifestとreference評価manifestを分離する。主flexible層は独立単量体整列後の
+native-interface対応CAのpooled変位D≥1 Åと事前定義し、公式難度分類とは区別する。
+正解界面・変形量をモードや入力処理に渡さない。全apoも必ず報告する。
+
+**評価。** 主機構比較はrigid候補＋flex精密化のR1対response候補＋同一精密化のR2。
+両方a=0から開始し、warm startを別にする。同一候補数と同一walltimeを別表で示す。
+同一apo入力のHDockLiteを新たに実行し、主flexible集合のTop-1 acceptable差と
+target／cluster単位paired bootstrap 95% CIで判定する。失敗は0として全登録IDを分母に残す。
+Oracleだけの改善と最終順位の改善を分け、geometry、strain、実変位、時間も記録する。
+
+**hardware・commands・結果。** ローカルarm64で資料／ソースを読んだのみ。
+CUDA24–48 GBは候補資源で必要量・速度は未測定。先にサイズ別16系でprofilingする計画。
+使用した確認操作は `git status --short`, `rg`, `sed`, `tail`, `cat AGENTS.md`,
+`wc -l`, `git diff --check`、公開一次資料と公式API資料の読取り。
+plan内の新CLIは実装予定と明記した。新規数値結果、失敗run、skip、OOM、checkpoint選択はない。
+
+**結論・限界・次実験。** 実装と評価の段階・データ契約を文書化した。
+最初の着手点はP0とP1。現在のapo baselineが最新設定で再現できること、微分可能coreが
+同一energyとして動くことを先に確認し、未実証のHDOCK超えを結論にしない。
+
+### 9.13 NN訓練の計算技術をFFT誘導適合へ使う設計（2026-11-16、未実験）
+
+追加の問いは「最新のNN訓練の計算技術を物理的誘導適合へ使えるか」、条件は
+「FFTと相性よく」。plan §2と§9へ反映した。
+
+**仮説と計算。** 単体変形方向ごとのfield JVPを事前計算し、そのFFTを回転ループ外で
+cacheすれば、相手の各回転について全並進のモード勾配gを相関で計算できる。
+3チャネル／Mモードなら基本形は各回転3 ligand FFT＋M+1 IFFTと、格子点ごとの制約応答solver。
+solver費用も測り、FFT回数だけで高速化を主張しない。
+
+次段階では、少数の多様な候補の接触力を単量体剛性で前処理し、応答snapshotから追加方向を得る。
+基底を更新するのは探索間だけとし、各pass内では固定してFFT再利用を保つ。
+固定ANM8対ANM4＋適応4対ANM4＋random4を同じ最終次元・計算予算で比較する計画。
+高自由度化後は `J K^-1/2` の低ランク化で微分チャネルを圧縮する案も残す。
+制約付きの場合は縮約後の変位metricと剛性を維持する。応答行列全体を作らない。
+
+一次資料は [PyTorch JVP/HVP](https://docs.pytorch.org/tutorials/intermediate/jacobians_hessians.html)、
+[GaLore (2024)](https://proceedings.mlr.press/v235/zhao24s.html)、
+[PINNのNysNewton-CG (2024)](https://arxiv.org/abs/2402.01868)、
+[implicit differentiation (2022)](https://proceedings.neurips.cc/paper_files/paper/2022/hash/228b9279ecf9bbafe582406850c57115-Abstract.html)、
+[selective checkpointing](https://pytorch.org/blog/activation-checkpointing-techniques/)、
+[KeOps](https://jmlr.org/papers/v22/20-275.html)。いずれもdocking性能の実証資料ではなく、
+計算方法の根拠である。GaLoreの直接移植や世界初とは呼ばず、古典的な応答理論／縮約モデルと
+現代の自動微分基盤の接続として検証する。
+
+**データ・loss・seed・hardware・commands。** §9.12の登録・分離を継承。
+JVP導入と適応基底はNN訓練なし。将来のimplicit calibrationは収束した局所解に限定し、
+hard top-k／closure分岐全体を微分しない。seed0/1/2、GPU型番と時間は実行時記録。
+今回の操作は一次資料調査とMarkdown編集のみで、新規の実装・数値結果・失敗run・skip・OOMはない。
+
+**結論・限界・次実験。** 最優先はJVPとFFT相関の接続。相手に応じた少数基底への更新と
+応答チャネル圧縮は、FFTを保った独自性候補だが有効性は未検証。まず固定基底で応答予測と
+実緩和の一致を測り、その後に基底更新の増分価値を検証する。
+
+### 9.14 誘導適合FFTの初期数値プロトタイプ（2026-11-16、実装・合成系検証）
+
+利用者が終了メッセージを訂正して継続を指示したことを受け、planの初期数値基盤を実装した。
+これはP0/P1/P3の一部であり、protein前処理、P2の内部座標、非線形精密化、apo実データ評価の
+完了ではない。既存scorer/search/backendは変更せず、新しいpackageへ分離した。
+
+**問い・仮説。** 微分可能な同じ物理場に対して、固定側JVPのFFTから得る配置別の変形勾配が
+実座標を動かした直接計算と一致するか。変位制約下の緩和利得を正しく候補選択へ接続できるか。
+HDOCKへの優位性やprotein構造精度を検証する実験ではない。
+
+**実装。**
+
+- `src/zdock/inducedfit/types.py`：正解座標を持たない入力型、atom key、固定GridSpec。
+  入力tensorはcloneし、形状・finite・一意性を検証。frozen型でもtensor自体はmutableなのでread-only契約。
+- `prepare.py`：供給tensor bytes／atom ID／設定のSHA256、strict manifest allowlist、atomic JSON metadata。
+  元PDBの読込・hashやprotonationはまだなく、tensor cache本体でもない。
+- `fields.py`：unit-peak Gaussian＋C2 switchの占有／表面場、原子ごとに積分正規化した電荷場、
+  遮蔽・正則化静電potential、全チャネルJVP、非周期linear convolution／correlation。
+  独立した空間畳み込みを直接oracleにする。atom×全gridの中間配列を避けてchunk化。
+- `response.py`：SPD Kの固有分解を一度cacheし、変位球の制約付き解を64回二分法で求める。
+  採点は得た解の `g·a + 0.5 aᵀKa`。M=0、δ=0、極端値と不正入力も扱う。solverを微分する機能はない。
+- `search.py`：固定側とモード微分のスペクトルを回転ループ外でcacheし、ligandスペクトルを共有。
+  signed translation、完全support mask、同じNMS、valid cellだけのtiled response solveを実装。
+  supplied Cartesian basisとKを使うprototypeで、ANMや構造修復を暗黙に行わない。
+- `scripts/verify_induced_fit.py`：合成系の直接energy、有限差分、実変位後energyを照合し、
+  seed別状態・入力・全候補・ソースhash・環境をJSON保存。全例外もseed行に残す。
+
+**データ・split・漏洩。** PINDER、DB5.5、native複合体、外部学習checkpointは使用しない。
+合成3原子receptor／2原子ligandをseed0/1/2で0.03 Å標準偏差のノイズにより変える。
+train/validation/test splitや学習・checkpoint選択はない。suppliedのCartesian伸縮方向2本を
+Gram行列 `BᵀB/N=I` に正規化し、同じ基底とKで全配置を扱った。
+
+**parameter・loss・hardware。** 格子17×15×19、spacing1 Å、origin(-8,-7,-9) Å。
+原子半径0.6 Å、表面拡張0.3 Å、電荷Gaussian σ=0.45 Å、screening switch2–3 Å、
+κ=0.1 Å⁻¹、softening1 Å、repulsion weight3、charge weight0.2。
+電荷はR=(0.5,-0.3,0.2)、L=(-0.3,0.2)の合成値で、Amber付与値ではない。
+K=[[4,0.3],[0.3,7]]、2回転、回転あたり2ピーク、Top3、NMS3 Å、FD幅1e-4 Å。
+δ=0.1を初回、その後0.5と0.01を診断。単位はeffective ε、学習lossはない。
+macOS27.0.1 arm64、Python3.12.11、PyTorch2.13.0、CPU float64、診断CLIは1thread。
+CUDA/MPSはこの実行環境で利用不可。異なる処理の並列実行とJVP初回importを含むため、
+保存したwalltimeを速度benchmarkやGPU見積りには使わない。
+
+**測定結果。** 各δで3seed×Top3=9候補を確認。以下は最終のfinite検査・source hash補強後のartifactによる。
+
+| 変位上限δ | 数値検証成功seed | FFT対直接energy 最大絶対誤差 | FFT由来利得対FD由来利得 最大絶対誤差 | 予測利得対実変位後利得 最大絶対差 | 実energy低下／非低下 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0.1 | 3/3 | 2.22045e-16 | 4.77687e-11 | 1.70211e-4 | 9/0 |
+| 0.5 | 3/3 | 2.22045e-16 | 4.77687e-11 | 1.70211e-4 | 9/0 |
+| 0.01 | 3/3 | 2.22045e-16 | 1.96210e-11 | 3.12962e-5 | 9/0 |
+
+δ=0.1と0.5は**同じ解**だった。最大振幅normは0.0246743で、どちらの上限もactiveではない。
+したがってこれは0.5 Å変形を再現できたという結果ではない。追加のδ=0.01では9/9候補が
+上限制約を満たす境界解となった。測った実energyは一度提案変位を適用した値で、
+非線形最小化の収束結果ではない。toyの9/9低下をprotein成功率として解釈しない。
+
+**テスト・失敗・修正履歴。**
+
+- 最終：新規73件＋既存FFT回帰2件、**75 passed in 1.25s**。直接空間oracle、全signed lag、
+  JVP有限差分、charge保存、chunk不変性、非対角KKT／独立SciPy SLSQP、rigid極限、
+  support、cache invalidation、reference混入、tile不変性、スペクトル再利用を検査。
+- fields初回は4 passed／7 failed。5件はGridSpec constructor検証とのAPI不一致
+  (`validate()`の冗長呼出)、2件はPyTorch2.13がJVP初回import時に発する内部
+  `torch.jit.script` deprecationと既存warnings-as-errorsの衝突。APIを修正し、
+  テストでは当該メッセージのみ限定除外した。他のwarnings policyは変更していない。
+- ad-hocな数値集計でtranslationをfloat32として作り、誤差8.66e-9となった回がある。
+  float64へ直して再測定。テスト本体と保存済み最終CLIは初めからfloat64を明示している。
+- C2 switchを数学的に等価な因数分解形へ変更し、float32でのcutoff近傍の桁落ちを抑えた。
+- reviewで非有限scoreを候補枯渇と混同する可能性を見つけ、valid cellのfinite検査と明示例外を追加。
+  診断値のfinite検査、呼出元`geom.py`のsource hashも追加した。
+- 統合テストは69件成功後、非有限値検査・既存回帰追加で74件、制約active条件追加で75件。
+  上記のテスト/API問題以外にCLIの失敗seed、skip、OOMはない。
+
+**再現コマンド・artifact。** 全source hashと入力値は各JSONに保存。生成JSONはignoredなdata/以下に置き、commitしない。
+
+```bash
+.venv/bin/python -m pytest tests/test_inducedfit_data.py tests/test_inducedfit_fields.py \
+  tests/test_inducedfit_response.py tests/test_inducedfit_search.py \
+  tests/test_search.py::test_sc_fft_matches_direct_xcorr \
+  tests/test_search.py::test_sc_fft_matches_docking_score_elec_synthetic -q
+
+.venv/bin/python scripts/verify_induced_fit.py \
+  --out data/inducedfit/verification/synthetic_v1_checked.json --seeds 0 1 2 --threads 1 --radius 0.1
+.venv/bin/python scripts/verify_induced_fit.py \
+  --out data/inducedfit/verification/synthetic_radius05.json --seeds 0 1 2 --threads 1 --radius 0.5
+.venv/bin/python scripts/verify_induced_fit.py \
+  --out data/inducedfit/verification/synthetic_radius001.json --seeds 0 1 2 --threads 1 --radius 0.01
+```
+
+有限値・source hash補強前の初回 `synthetic_v1.json` も保持した。最終表の0.1は
+`synthetic_v1_checked.json`を用いており、修正前artifactを黙って置き換えていない。
+
+**結論・限界・次実験。** JVPをFFT相関に接続して全並進のモード力を計算し、制約付き応答で
+候補を選ぶ数値基盤は、小さな合成系で独立計算と整合した。正しいprotein配置を救う仮説は未検証。
+現実装のlinear correlationは入力場の各軸を2n−1へ拡張するため、planのメモリ概算には
+入力場Vではなく実FFT格子Vを使う必要がある。省メモリ化とCUDA性能は未測定。
+次は、apoのみから作るモードと結合幾何を保つ内部座標写像、同じ非線形priorからのKを接続し、
+実タンパク質入力・正規baseline再現を整えてから、選択前誘導適合のR2−R1を比較する。
