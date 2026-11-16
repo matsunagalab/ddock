@@ -8190,3 +8190,403 @@ Top候補だけ相互作用HVPで応答方向を直す案は、R2v・同予算�
 抗体用にはdisulfide・複数鎖・χ・有限loop closureの改修が別途必要。
 今はnative-freeな小fixtureの物理gateを第一実装とし、合格後に固定budgetの開発試験、
 さらに失敗系も分母に含む未使用apoパネルへ進む。詳細な停止条件と比較設計は統合計画へ記録した。
+
+### 9.22 改善案1–4の物理実装と実apo pilot（2026-11-16）
+
+**問い・登録。** ユーザーが1–4の実施を指示したため、型別物理場、原子力場prior、原子別制約、
+接触力からの追加方向を並行実装する。開始HEADは9b78062。
+[固定定義と評価条件](docs/physics_inducedfit_v1.md) を数値実験前に保存した。
+推論ではnative／DockQを使わず、既存1A2P B／1A19 Aをdevelopmentと明記する。
+学習loss・checkpoint選択なし。physical scoreはkJ/molへ統一し、旧effective ε項は加えない。
+screened cross-partner pair potential＋monomer OBC2 strainという明示したhybrid近似であり、
+全Amber complex energyや結合自由エネルギーとは呼ばない。
+
+typed potential、physical prior、原子別制約／適応方向を3agentが実装し、rootがrunnerと評価を接続する。
+旧runner／既定を維持し、新経路を実験用CLIへ隔離する。数値検証・全失敗・実行条件は以下へ追記する。
+
+**型別場の実装と、接触格子gateの不合格。** ff14SBの14型中、非zero LJ13型の91組を
+解析解と照合した。全91組の連続potentialは合格。C2 core、force/JVP差分、同一格子FFT和、
+zero-LJ、有限overlap、supportも小fixtureで検証した。これはPPI予測精度の結果ではない。
+各spacingで91組×8phase=728条件、native不使用、seedなし、係数fitなし。
+
+| interpolation | h Å | 距離誤差≤.1 Åの条件数 | 最大距離誤差 Å | 深さgate合格数 |
+| --- | ---: | ---: | ---: | ---: |
+| positive mass | 1 | 0/728 | ≥.800 | 728/728 |
+| positive mass | .5 | 0/728 | .500 | 728/728 |
+| positive mass | .25 | 700/728 | .170 | 728/728 |
+| cardinal coefficients | 1 | 241/728 | .680 | 7/728 |
+| cardinal coefficients | .5 | 259/728 | .295 | 103/728 |
+| cardinal coefficients | .25 | 696/728 | .150 | 696/728 |
+
+初回mass scanはanalytic minimum±.8 Å、step.005 Å。h1の395条件でscan境界へ到達し、
+最大誤差.8は上界でない。補正係数を使うcardinal版は格子点値を再現するが、最大で本来の
+井戸深さεの40.663／13.760／2.386倍**余分に**深い井戸を作り、depth gate（extra≤.05ε）に
+不合格。周期wrapではなく未解像の反発を補間したovershootで、既定にしない。
+同じwide radial scan（0からmin(11,r_min+3) Å、step≤.01 Å）をmassへ適用した再試行は、
+距離gateの不合格を再現し、余分な井戸深さは全条件0だった。
+
+追加のh2 mass scanは半幅4 Å、step.01 Å。距離gate0/728、最大観測shift3.67 Å、
+深さgate728/728、analytic minimumでの最大力20.1213 kJ/mol/Å。
+境界minimum5条件は全てr=0（小さいH型）であり、正の補間重みも接触形状を保証しない。
+h≤.5の行がないのにfine gate=trueとなる集計bugは、元reportを保存し別correction JSONで
+N/Aへ訂正した。新checkerは該当条件がない場合nullを返す。
+
+**解釈と事前amendment。** coarse FFTを物理energyの確定値として扱わず、候補生成に限定する。
+全5armの連続精密化の並進範囲を.5→4 Å（2cell）へ変更した。これはnative-free補間誤差を
+修正できる余地の確保で、誤差上界やrecallの保証でない。この時点で新実apo推論／DockQ未実行。
+物理定数は不変。全回転のraw peakを保存し、候補脱落を後から診断可能にする。
+
+生結果は `data/inducedfit/typed_physics_v1`、`typed_physics_cardinal_v1`、
+`typed_physics_mass_v2`、`typed_physics_mass_h2_v1`。集計CSVのみdocsへ保存。
+macOS27.0.1 arm64、Python3.12.11、Torch2.13.0、float64 CPU、Torch1thread、BLAS未実測。
+ff14SB XML SHA=d9f9779c09d67cd5f8bc657692f174ffab14c469dfd06d560ac1899fa7e976b8。
+source SHA、全条件、commandは各report内。初回2.79秒／cardinal28.20秒、OOM・skipなし。
+
+```bash
+.venv/bin/python scripts/verify_inducedfit_typed.py --out data/inducedfit/typed_physics_v1 --summary docs/typed_physics_v1.csv
+.venv/bin/python scripts/verify_inducedfit_typed.py --out data/inducedfit/typed_physics_cardinal_v1 --summary docs/typed_physics_cardinal_v1.csv --interpolation cardinal
+.venv/bin/python scripts/verify_inducedfit_typed.py --out data/inducedfit/typed_physics_mass_v2 --summary docs/typed_physics_mass_v2.csv --interpolation mass
+.venv/bin/python scripts/verify_inducedfit_typed.py --out data/inducedfit/typed_physics_mass_h2_v1 --summary docs/typed_physics_mass_h2_v1.csv --interpolation mass --spacings 2 --minimum-scan-half-width 4 --radial-step .01
+```
+
+**物理priorの最小化：失敗も保持。** 原子力場＋anchorを実phi/psiで最小化する。
+初回diagonal前処理は1000iterations／1068 objective evaluations（OpenMM1071）、395.24秒、
+peakRSS363,069,440 B。energy−14468.499230→−14540.750979 kJ/mol、max torque45.433657
+kJ/mol/radでgate .001に不合格。最大重原子変位.181499 Å、CA RMSD .048492 Åは許容内。
+`TOTAL NO. OF ITERATIONS REACHED LIMIT`を `physical_prior_v1/report.json` に保存した。
+初回prior source SHA=082500d26eaa1f6a1791eb4a653d57f2a0cee20b7802a7b873cb2cbe17ff5ef9。
+
+同じ物理・予算・gateでG=10 JᵀJ+Iの全anchor metric前処理へ変更した。
+211torsionsの一時Jacobian8,608,800 Bを記録。再試行は60iterations／168objective evaluations
+（OpenMM171）、63.9632秒、peakRSS369,590,272 B、energy−14541.451657819216、
+max torque .0412648109、最大重原子変位.192081 Å、CA RMSD .048805 Å。
+energy改善が約1e−10 kJ/molに達してline searchがABNORMAL終了し、厳密gateには再び不合格。
+`physical_prior_v1_metric/report.json`へ保存した。全metricで条件数は改善したが、成功とはしない。
+両runは同じapo-only receptor、seed0、anchor10、maxiter1000／eval5000、stationarity.001、
+maxheavy1、HVPstep.0001、8modes、CPU float64／OpenMM Reference／Torch1thread。
+
+```bash
+.venv/bin/python scripts/verify_inducedfit_physical_prior.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --out data/inducedfit/physical_prior_v1 --modes 8 --anchor-k 10 --max-iterations 1000 --max-evaluations 5000 --stationarity-tolerance .001 --max-heavy-displacement 1 --fd-step .0001 --seed 0 --threads 1 --preconditioner diagonal
+.venv/bin/python scripts/verify_inducedfit_physical_prior.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --out data/inducedfit/physical_prior_v1_metric --modes 8 --anchor-k 10 --max-iterations 1000 --max-evaluations 5000 --stationarity-tolerance .001 --max-heavy-displacement 1 --fd-step .0001 --seed 0 --threads 1 --preconditioner anchor_metric
+```
+
+次の数値修正として、同metric上のmatrix-free Newton-CG torque polishingを実apo推論前に
+登録した。true HVPのstep1e−4、energy丸め許容1e−7 kJ/mol＋torque低下を明記し、
+元stationarity／変位gateと総eval5000は維持する。物理energy・forcesは引き算／clipしない。
+
+**基準状態の成立。** `physical_prior_v1_metric_polish` は同じ入力・物理条件＋`--polish`で
+成功した。Newton outer1／CG20、負曲率なし、最大torque .04126481→.0003535036901で
+.001 gateを通過。最終energy−14541.451657815096、Newtonでの変化+4.1200e−9 kJ/molは
+事前登録roundoff1e−7以内。energyが厳密単調に減ったとはしない。最大重原子変位.192081626 Å、
+全原子.195153415 Å、CA RMSD .048804749 Å。
+stationarityは全211 backbone torsionsに関する条件で、χ／結合長／結合角を含む全Cartesian
+局所最小ではない。preparation213 force evaluations／79.2009秒、全検証264／104.2873秒、
+peakRSS675,151,872 B。8mode Kの全固有値18866.4186〜75333.1043 kJ/mol/Å²で正、
+h/h2差4.115e−7、非対称誤差4.165e−8、CA metric誤差8.175e−15。
+.01 Å probeの実strain2.573055とquadratic2.526961、gradient FD相対誤差6.489e−7。
+baseline projected gradient最大9.245e−6。大きいstiffnessのため変形が小さくなる可能性は
+あるが、結果に合わせてanchorを調整していない。
+
+```bash
+.venv/bin/python scripts/verify_inducedfit_physical_prior.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --out data/inducedfit/physical_prior_v1_metric_polish --modes 8 --anchor-k 10 --max-iterations 1000 --max-evaluations 5000 --stationarity-tolerance .001 --max-heavy-displacement 1 --fd-step .0001 --seed 0 --threads 1 --preconditioner anchor_metric --polish
+```
+
+**実装検証の途中履歴。** 型別場30 tests→cardinal含む32→追加gateで37→checkpointで
+初回38pass／3fail→41pass。失敗3件はTorch2.13の既知JIT非推奨warning2件と、メモリ検査が
+保存input座標を許可していなかった1件。該当warningのみfilterし、pair中間配列を保存しない
+検査は維持。direct reverse ADのchunk再計算はenergy・両分子gradient・HVP同値を検証し、
+forward JVPではcheckpointを迂回する。物理値・格子の変更はない。
+priorは10→12→15tests、constraint/adaptiveは初回15pass／5fail→21pass。
+後者の4件は同じ既知warning、1件はSLSQP status8と2.14e−9の微小制約誤差で、独立KKT／
+feasibility／ball対照gainの証明を満たすstatus8のみ警告つき採用とした。iteration limit等は
+成功扱いしない。統合fixtureは9→10→12→13pass（失敗なし）。
+全誘導適合＋既存FFT2回帰は401 passed／5.68秒。
+
+**統合smokeの登録と開始。** source固定後、同一apo基準をhash＋forces再検証で再利用して
+4回転、Top1、pool8、精密化2steps／最大24evaluationsを全5armへ実行する。
+二段FFTは実際に新しい8mode場を再構築するため、等wall-time比較ではない。
+shared preparation/searchと各armの費用を分けて記録する。source hashは実行前後に照合する。
+
+```bash
+.venv/bin/python scripts/run_physics_induced_fit_pair.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --prepared-prior data/inducedfit/physical_prior_v1_metric_polish/report.json --out data/inducedfit/physics_inducedfit_smoke_v1 --rotations 4 --top-k 1 --pool-size 8 --iterations 2 --max-evaluations 24
+```
+
+**同じ固定モデルの硬さの分解（native-free）。** smoke計算中に別agentがanchorの寄与を
+解析した。θ0、8方向、物理定数は変更せず、anchor torqueをh/h2で差分し、
+K_ff=K_total−K_anchorを診断した。traceはtotal291462.65、anchor220291.07、ff71171.58
+kJ/mol/Å²、anchor比75.5812%。total Kの固有mode昇順にanchor寄与は
+90.76%、92.07%、90.14%、78.19%、78.04%、75.40%、65.54%、70.36%。
+最軟mode18866.42=anchor17122.53+ff1743.88。anchor Hessianの写像二階微分項は
+anchor KのFrobenius norm比13.36%で、単なるGauss–Newton kJᵀJでは説明できない。
+anchor差分h/h2誤差4.114e−7、非対称4.405e−8、独立energy二階差分との差6.504e−8。
+core sourceは不変、2.4695秒、anchor torque32回とcache restoreのOpenMM1回。
+
+「ff14SB/OBC2単独がこれほど硬い」とは結論しない。現θ0はfull potentialの定常点なので、
+anchorをKから引くだけでは別の物理priorとして利用できない。弱いanchorを検討する場合は、
+新しいapo共通基準の準備・stationarity／曲率／変位gateから独立に評価する。
+今回の比較はanchor10のまま維持する。生reportとregistrationはignored dataへ保存。
+
+```bash
+.venv/bin/python scripts/analyze_inducedfit_prior_stiffness.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --prior-report data/inducedfit/physical_prior_v1_metric_polish/report.json --out data/inducedfit/physical_prior_v1_stiffness_decomposition
+```
+
+**初回smoke完走、数値conditioningの修正。** 全5armがTop1をexportし、576.275453秒、
+peakRSS6,982,762,496 B、prior force評価1051回。shared preparation/search76.665秒。
+79³格子、14channels、8mode cache保持3,925,698,336 B（4GB gate内。総RSS上界ではない）。
+contact追加方向は4本成立、404HVP、CG119／93／102／78反復、真の残差
+6.789e−6／9.995e−6／2.759e−6／7.472e−6、H直交誤差最大1.45e−17、mask外torsion0。
+接触torsion数38／34／32／32。追加方向構築＋physical K313.816秒。
+random対照も4本、HVP8回、方向構築＋K19.266秒。二段FFTは両方実行済み。
+
+| arm | arm秒 | 最終hybrid energy kJ/mol | strain kJ/mol | CA RMSD Å | 最大原子変位 Å |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| rigid | 8.257 | −95.994812 | 0 | 0 | 0 |
+| ball8 | 17.642 | −46.044819 | .812226 | .006422 | .060247 |
+| atom8 | 12.105 | −46.044819 | .812226 | .006422 | .060247 |
+| contact8 | 379.038 | −43.290776 | .337474 | .003460 | .037703 |
+| random8 | 81.232 | −46.197606 | .691416 | .005826 | .048458 |
+
+全て2step予算で終了し、最小化収束とはしない。candidate欠落／exception0、source hash一致。
+ball／atomで同じ姿勢・energyになった事実も保持。smokeのDockQはまだ未評価。
+剛体とball／atomは同じinitial energy−42.067731から出発したが、剛体並進norm1.742 Åに対し
+flexible約.133 Åで止まった。振幅の固定前処理−.1gとK≈2e4〜7e4が共有line searchを
+律速している仮説を検証した。初回の27 source filesはsmoke出力下source_snapshotへ保存。
+
+実Kと独立translationを持つ二次oracleを構成し、coupling0／.3／.5、同じ2iteration／24evalを
+比較した。旧前処理のcondition7533〜10046、受理step1/2048、並進.001119 Åで24eval中1step。
+振幅だけ−K⁻¹gへ変えるとcondition1〜3、step1、並進2.291〜2.296 Å、3〜4evalとなった。
+別の十分な反復予算では全3ケースで解析解に収束。これは物理energyを変えない数値診断で、
+PPI精度評価でない。productionの連続charge＋stiff prior fixtureでも同じ不具合を再現し、
+Cholesky K前処理の回帰testを加えて14 tests passed／.69秒。
+
+```bash
+.venv/bin/python scripts/verify_refinement_preconditioner.py --prior-report data/inducedfit/physical_prior_v1_metric_polish/report.json --out data/inducedfit/refinement_preconditioner_oracle_v1
+```
+
+以後はrigid weights .01／1を保ち、振幅のみfixed KのCholesky solveで前処理する。
+投影後g·Δ<0、同一Armijoと実変位gateを維持。旧方式はCLI `fixed`で再現可能。
+また404HVPの費用に対し、同じinput anchor metric Gを局所maskへ制限した制約付きPCGを
+事前登録した。H直交制約rank、真の物理残差tol1e−5、最大128iter、曲率gateは変更しない。
+Gのridgeは数値前処理専用でenergyへ足さず、random対照の分布とseedも変更しない。
+これらは新DockQ未参照の数値修正で、改善されたaccuracyに合わせた選択ではない。
+
+独立CLI reviewでは、array export失敗後にenergyが残って順位へ混入する可能性を修正した。
+export完了flag・finite energy・非exceptionを要求し、失敗filesはpartial_filesへ退避する。
+verification失敗のpose/index、requested TopKのmissing／not-attempted分母を保持する。
+故障注入4testsとpipeline13testsは17passed／.85秒、初回失敗なし。
+shared preparation失敗も各armをnot_attemptedとして集計するよう後続修正した。
+
+**PCG修正の検証。** 局所Gの制約付きinverse作用は
+G_l⁻¹r−Y(RY)⁻¹R G_l⁻¹r、Y=G_l⁻¹Rᵀ。Rは物理H直交制約の既存SVD rankで固定し、
+前処理後に制約を落とさない。停止条件は再帰残差≤1e−5かつ再計算した物理残差≤5e−5、
+曲率Rayleigh>1e−10で初回CGから不変。dense nullspace oracleと同じ物理解／mask／直交を
+確認し、G=Hの小系でPCG1反復。前処理残差だけを小さくしても不正な収束を認めず、
+負曲率は拒否。random対照はmetric指定前後でbitwise一致した。
+担当adaptive／CLI／pipeline suiteは38passed／.89秒。
+途中の全suite414pass／1failはCLI fixtureの新引数不足、追加outerfailureテストの
+36pass／2failは架空source pathのfixtureがsnapshot作成に失敗したもの。実在path／追加引数へ
+修正し、最終全誘導適合＋FFT2回帰は **417passed／4.59秒**。
+
+数値修正後の同条件再試行 `physics_inducedfit_smoke_v2` を開始。native/DockQ未参照。
+実行毎に全27 source snapshotsとSHAを保存し、HVP25回ごとのprogressも記録する。
+
+```bash
+.venv/bin/python scripts/run_physics_induced_fit_pair.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --prepared-prior data/inducedfit/physical_prior_v1_metric_polish/report.json --out data/inducedfit/physics_inducedfit_smoke_v2 --rotations 4 --top-k 1 --pool-size 8 --iterations 2 --max-evaluations 24
+```
+
+**再smokeの実測。** 全5arm Top1をexportし322.246608秒で完了、source hash一致、欠落／例外0。
+peakRSS7,019,528,192 B、prior force383回、shared preparation/search73.910秒。
+contact PCGは16／13／14／14iter、真の残差4.984e−6／3.131e−6／4.198e−6／1.746e−6、
+HVP69回（初回404）。方向＋K構築64.674秒、contact全体127.647秒（初回379.038）。
+randomはHVP8／方向＋K19.283秒で維持。1回ずつの測定なので一般的なspeedup率とはしない。
+
+| arm | arm秒 | 最終hybrid energy kJ/mol | strain kJ/mol | CA RMSD Å | 最大原子変位 Å |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| rigid | 8.220 | −95.994812 | 0 | 0 | 0 |
+| ball8 | 13.529 | −95.995065 | .0000386 | .0000566 | .000210 |
+| atom8 | 13.765 | −95.995065 | .0000386 | .0000566 | .000210 |
+| contact8 | 127.647 | −95.963986 | .0003733 | .0001568 | .001298 |
+| random8 | 83.862 | −95.993601 | .0000451 | .0000559 | .000188 |
+
+全て2iteration／15energy evaluationsで終了。数値前処理による剛体移動の抑制は解消したが、
+内部変形は依然小さい。単なるenergy低下を予測精度改善と呼ばない。rigid energyは初回と一致。
+初回を現在のCLIで再現する場合は `--adaptive-preconditioner none --refinement-preconditioner fixed`
+を追加する（当時のsource snapshotsと元commandはsmoke_v1に保存）。前polishのprior失敗を
+現在の検証CLIで再現する場合は `--no-polish` を明示する。元run履歴は書き換えていない。
+
+**固定128回転pilot開始。** 同じsourceのまま、128rotation／4peaks per rotation／Top5／
+pool50／8steps／64evaluations、seed0、Torch1thread、全5armで開始した。物理定数・基準状態・
+mode数・実変位gateは登録値。新しいnative／DockQ情報はこの時点で一切参照していない。
+推論終了後に公式DockQを隔離envで実行し、OBC2 endpointの同座標診断も別に行う。
+後者は全25候補のsecondary diagnosticで、hybrid scoreの順位を変更しない。
+
+```bash
+.venv/bin/python scripts/run_physics_induced_fit_pair.py --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --prepared-prior data/inducedfit/physical_prior_v1_metric_polish/report.json --out data/inducedfit/physics_inducedfit_pilot_v1 --rotations 128 --top-k 5 --pool-size 50 --iterations 8 --max-evaluations 64 --seed 0 --threads 1 --adaptive-preconditioner anchor --refinement-preconditioner physical
+```
+
+**前処理の独立native-free監査。** 別agentが完了したsmoke_v1/v2の保存arraysと全raw peaksを
+比較した。ball8／atom8／random8の保存mode arraysはbitwise一致。contact8はCA部分空間の
+最大principal angle .007001686°、CA tangent相対Frobenius差5.7530e−5、全原子5.9297e−5、
+torsion1.7670e−4。CA Procrustes対応後のK相対差3.8759e−5、最大相対quadratic strain差
+9.8984e−5（.00990%）。厳密同一ではなく、有限CG許容差に伴う小差が残った。
+first／contact／randomの各rigid,response全16peakのkey集合と順序、全armのpool8と選択Top1は一致。
+contact response coarse score最大差6.44774e−6 kJ/mol、他branchは差0。
+共通apo・原子パラメータ・grid・quaternion・物理計算source hashも一致した。
+有限振幅の非線形energy同値性はこの監査では未測定。監査数学oracle3testsは3passed、初回失敗なし。
+
+```bash
+.venv/bin/python scripts/audit_physical_preconditioners.py --before data/inducedfit/physics_inducedfit_smoke_v1 --after data/inducedfit/physics_inducedfit_smoke_v2 --out data/inducedfit/physics_preconditioner_audit_v1/report.json
+.venv/bin/python -m pytest tests/test_physical_preconditioner_audit.py -q
+```
+
+**評価専用pool診断の事前登録。** 128回転runのrandom対照が進行中、かつ新DockQ未参照の時点で、
+5arm各pool50のunion pose keyを同じ共通apo／zero deformationでexportし、推論終了後に
+公式DockQで評価する追加診断を登録した。目的は候補保持と選択の切り分けであり、
+oracle best-in-poolを予測精度とは呼ばない。nativeは隔離評価プロセスだけで読み、pool／Top5／
+順位／物理定数を変更しない。全unique poseを1回ずつ採点し、armごとのpool membershipと
+元Top5 selectionを保持、欠落／scorer failureも分母に残す。primary Top5結果と別artifactへ保存する。
+
+**128回転pilot完了。** 全5arm×Top5=25構造をexportし、2387.262108秒（39.79分）、
+peakRSS6,737,051,648 B。欠落・exception・OOM・skip0、開始終了の全source hash一致。
+prior force評価2108回。共通準備＋初回探索520.545826秒、各arm費用は下表。
+既に検証したapo基準を再利用したため、この39.79分には別runの基準準備79.20秒を含まない。
+Torch1thread／CPU float64、OpenMM Reference、macOS27.0.1 arm64／Python3.12.11／Torch2.13.0。
+NumPy/SciPyのBLAS thread数は独立に制御していない。学習・checkpoint選択なし。
+
+| arm | arm秒 | 最終Top1 DockQ | 最終Top5最良DockQ | 最終CA RMSD最大 Å |
+| --- | ---: | ---: | ---: | ---: |
+| rigid | 206.436 | .049557407 | .049557407 | 0 |
+| ball8 | 189.419 | .049557492 | .049557492 | .000145557 |
+| atom8 | 191.451 | .049557492 | .049557492 | .000145557 |
+| contact8 | 649.918 | .049557260 | .049557260 | .000236959 |
+| random8 | 626.528 | .049557391 | .049557391 | .000172320 |
+
+初期Top1=.022684131、初期Top5最良=.035106038は全arm同じ。
+最終Top1は全armでselection rank3（iRMSD約12.897 Å、LRMSD約25.648 Å、fnat2/55）。
+全25候補でDockQ acceptable .23未満。既存R1のTop1 .024723よりTop1は上がったが、
+既存R1 best5 .201863／R2 best5 .157074より大幅に低く、精度改善は示せなかった。
+準備・potential・grid・refinementが変わるので旧runとの単一要素ablationではない。
+この既使用development1系に対する結果で、独立benchmark成功率やHDOCK優位性は未評価。
+
+**公式DockQ評価。** 推論終了後、隔離envのDockQ2.1.3／NumPy1.26.4／Biopython1.88を使用。
+native sanity=.999999999999687、50/50のinitial/final採点成功、失敗・timeout0。
+mapping RL:AD、allowed mismatches1、各child n_cpu1／timeout60秒。
+従来通りCys40/Ala40 mismatchとbarstar欠損対応を公式matching-residue規則で扱う。
+推論report SHA=c98b0a64f790138a936edc9d5771dd89fbd6aafead2c2cb2dd3bc4dec05b0edf、
+評価report SHA=ce1ae274c6a3b7c596e7dbc9bd38c3b8f5416db43fd18000b50bb5e370c4bd8e。
+全25候補のinitial/final DockQ・物理値・終了理由は
+[小さい結果CSV](docs/physics_inducedfit_pilot_v1.csv) に保存した。
+
+```bash
+data/inducedfit/dockq_env/bin/python scripts/score_inducedfit_pilot.py --run-report data/inducedfit/physics_inducedfit_pilot_v1/report.json --native data/inducedfit/evaluator_only/1BRS.pdb --mapping RL:AD --allowed-mismatches 1 --timeout 60 --dockq data/inducedfit/dockq_env/bin/DockQ --out data/inducedfit/evaluator_only/physics_inducedfit_pilot_v1_dockq.json
+```
+
+**機構の切り分け。** raw response512件のうち固定8modeに対してcontactは2件、randomは1件が
+入れ替わったが、全てpool50の外。5armのpool50は同一集合（順序は一部異なる）で、
+検証後Top5の集合・順序、最終energy順位[selection rank3,4,5,1,2]も全arm同じだった。
+柔軟4armの200/200候補はscale1で採用、fallback／shrink／活性制約0。
+ball最大提案CA norm .001895537 Åは保守球半径.07812638 Åの2.426%で、
+独立な非制約解−K⁻¹gとの差は最大1.96e−18 Å。
+ball／atomの50候補の振幅・検証energy、Top5の両分子全座標はbitwise一致。
+contact／randomの最大提案CA normは.00362330／.00166421 Å。
+検証strain最大はball/atom .0520408、contact .160095、random .0344412 kJ/mol。
+最終strain最大は順に.000315519／.000704751／.000433818。
+最大実原子変位もball/atom .00115991、contact .00303078、random .00109189 Åに留まった。
+
+全25精密化が64energy evaluation上限で終了、受理6〜7steps、8steps完遂なし。
+contact最終energyには同じ初期poseのrigid比で最大+2.10198 kJ/mol悪化する候補もある。
+変形が小さい理由をanchorだけに帰さず、強いprior、剛体と共有するline search、評価予算の
+打切りを分離して検証する必要がある。今回、原子別制約の利点は非活性のため評価できなかった。
+contact HVP75回／CG20,15,14,14反復、方向＋K68.670秒。random HVP8回／方向＋K19.088秒。
+この機構監査はnative/DockQを読まず実施した。
+
+```bash
+.venv/bin/python scripts/summarize_physical_mechanisms.py --run data/inducedfit/physics_inducedfit_pilot_v1 --out data/inducedfit/physics_mechanism_audit_v1/report.json
+```
+
+**OBC2同座標監査。** 25/25成功、欠落／失敗／warning0、47.4892秒。
+common apoのheavy/full整合、θ0再構築、力場parameter一致を確認。
+receptor baseline energy照合差0、hybrid strain=FF strain+anchor変化の再構築誤差最大2.302e−12。
+OBC2 endpoint（anchor除外）は全候補で+23.0995〜+71.7780 kJ/mol、全体中央値+45.6535。
+各arm中央値rigid45.6547、ball/atom45.6500、contact55.9562、random45.6480。
+重原子severe LJ clashは全25で0、Hを含むsevere pairは0〜2、全原子でもclash-freeは9/25。
+最小重原子間距離2.662745 Å、FF-only receptor strain −.008484〜+.028474 kJ/mol、
+rigid ligand strain絶対値≤1.478e−10。
+interaction成分の中央値はvdW−157.86、Coulomb−948.92、GBSA+1089.58 kJ/mol。
+各成分の中央値は異なる候補から得られるので、その合計を代表候補のenergyとはしない。
+hybrid scoreが表現していない溶媒和応答の不利と整合する診断だが、OBC2が正解であることや
+結合自由エネルギーを示したわけではない。native不使用、再順位付け・構造最適化なし。
+
+```bash
+.venv/bin/python scripts/audit_physics_inducedfit_obc2.py --run-report data/inducedfit/physics_inducedfit_pilot_v1/report.json --out data/inducedfit/physics_inducedfit_pilot_v1_obc2_audit
+```
+
+**pool coverageと選択の評価専用診断。** 250 membershipsを重複排除すると50構造。
+選択済み25 initial complexのSHAはprimary出力と全て一致。export .6243秒、失敗0。
+最初のDockQ起動はvenv interpreterのsymlinkをresolveしてbase Pythonで実行してしまい、
+`No module named DockQ`で失敗した。元`coverage_scores.json`と元argvを保持。
+exporterのargv生成だけをsymlinkを保つabsolute pathへ修正し、回帰testを追加した。
+構造・core・scorerは変更せず、`coverage_scores_retry1.json`へ再試行した。
+再試行は50/50採点成功、11.563秒、欠落／失敗0。
+
+全arm共通のpool最良はpool_0001（q40,t=[12,−2,24]、pool rank1）でDockQ .1878544865、
+iRMSD4.85236 Å、LRMSD8.91223 Å、fnat0。selected Top5には入っていない。
+選択された初期Top5最良はpool_0006（q106,t=[−2,−16,22]、selection rank3）で.0351060383、
+pool最良との差.1527484482。pool50内にDockQ≥.23は0。
+「より高いDockQの候補を選べなかった」と「poolにacceptable候補がない」が同時に成立する。
+pool最良もnative contact0であり、正しい物理接触を不当に排除したと断定しない。
+これはzero-deformation poolの事後oracleで、予測成功、全512peaks／全離散空間、
+またはrefinement後精度の上界ではない。primary予測は変更していない。
+[pool集計CSV](docs/physics_inducedfit_pool_coverage_v1.csv)を保存した。
+
+```bash
+.venv/bin/python scripts/export_physics_pool_coverage.py --run-report data/inducedfit/physics_inducedfit_pilot_v1/report.json --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json --out data/inducedfit/physics_inducedfit_pool_coverage_v1
+# この出力の DockQ argv JSON に評価専用native pathを代入して隔離envで実行。
+# 完了したscore JSONとmappingから集計するコマンドは同出力のdiagnostic_summary.jsonに記録。
+```
+
+**最終検証。** helper追加時434passed／5.27秒、coverage interpreter修正と集計追加後は
+全関連 **439passed／5.39秒**。追加coverage testsは14passed、機構監査5passed、
+前処理監査3passed。上記env起動失敗と以前の数値不合格は保持した。
+
+```bash
+.venv/bin/python -m pytest tests/test_inducedfit_*.py tests/test_physical_preconditioner_audit.py tests/test_physical_mechanism_summary.py tests/test_search.py::test_sc_fft_matches_direct_xcorr tests/test_search.py::test_sc_fft_matches_docking_score_elec_synthetic -q
+```
+
+**結論・限界・次実験。** 1–4の実装・回帰検証・実apo比較は完了したが、精度改善は未達。
+粗格子potentialの接触距離誤差、continuous scoreのpool内選択、溶媒和応答の省略、
+anchorに支配されたstiffness、最適化の評価上限が残る問題である。
+次は(1)CPU参照との同値性を保つCUDA移植と段階別profiling、(2)coarse候補を捨てる前の短い
+剛体補正と溶媒和項を独立に比較、(3)anchor依存性と側鎖χ緩和をnative-freeな物理gateで
+検証してから未使用moderate/difficult apo panelを固定、の順が妥当。
+このdevelopment1系のDockQを見ながら係数を合わせて一般化性能と呼ばない。
+抗体loop向けのχ、disulfide、複数鎖、有限loop closureは今回未実装。
+
+### 9.23 Linux/NVIDIA GPUへの引継ぎ計画（2026-11-16、未実行）
+
+ユーザーからGPU高速化の質問と別マシン用メモ・commit/pushの指示があった。
+現コードはtyped field／coordinates／adaptive／原子別solverにCPU float64制約があり、
+OpenMMはReference固定、force受渡しはCPU NumPyである。Linuxへ移すだけではCUDA実行にならない。
+uv.lockはLinux Torch2.6.0+cu124／macOS2.13.0を選ぶため、別環境でのAPI・数値互換も未検証。
+
+FFT／JVP／direct pairのGPU化、回転・候補のbatch化、不要なCPU同期の削減、
+OpenMM ContextのCUDA選択を段階的に実装する案を登録する。
+最初は同一potential／seed0／CPU float64対CUDA doubleでenergy・force・JVP・HVPを比較し、
+既存stationarity・FD・constraint gatesを維持。HVPは力の差分なのでmixed/singleへすぐ落とさない。
+coarse提案だけのfloat32化も、候補保持と最終double検証の別ablationとする。
+同じ4回転smoke→128回転の設定で時間・VRAM・CPU同期を測り、推測の速度倍率は記載しない。
+CPUで保持するFFT spectra約3.926 GBはGPU必要VRAMの下限的な内訳であり、workspace込みVRAMは未測定。
+GPUが予測精度の問題を自動的に解決するとは考えない。
+
+公式仕様は [OpenMM CUDA properties](https://docs.openmm.org/latest/userguide/library/04_platform_specifics.html)
+と [PyTorch rfftn](https://docs.pytorch.org/docs/2.15/generated/torch.fft.rfftn.html) を確認した。
+OpenMMのCUDA double/mixed/DeterministicForcesは利用可能な設定だが、このrepoでのCUDA実行は未実装・未計測。
+詳細な再開手順・非Git artifactの扱いは [引継ぎメモ](docs/HANDOFF_2026-11-16.md) にまとめる。
+
+**引継ぎartifact。** 16実験directory、入力apo、評価専用nativeとDockQ raw出力、失敗記録を
+`data/inducedfit/handoff/ddock-physics-20261116.tar.gz`へ収録した。
+19,329,433 bytes、SHA256=`9f4289a74b69b194acea3b61c79f05337ba8aecbb8cb6150a49ec5b7bb51fb74`。
+payload905 files（59,006,152 bytes）＋manifest1の906 members。
+内部manifestは`data/inducedfit/handoff/ddock-physics-20261116.manifest.json`。
+全member集合・regular相対path・fileサイズ・SHA256を検証、env／cacheを除外した。
+Gitには含めず、コード・文書・小さいCSVのみcommit対象とする。別マシンへの実転送は未実施。

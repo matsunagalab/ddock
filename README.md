@@ -100,6 +100,18 @@ charges with explicit hydrogens. See the [pair runner guide](docs/inducedfit_pai
 This effective energy is not a full Amber force field; apo docking accuracy and
 an advantage over HDOCK have not been demonstrated.
 
+The separate experimental [physical runner](docs/physics_inducedfit_v1.md)
+implements ff14SB type-specific LJ/charge FFT proposals, a stationary
+ff14SB/OBC2 intramolecular strain prior, atomwise deformation constraints,
+and contact-force directions fed back into a second FFT search. Its coarse
+grid is a proposal approximation; continuous pair energies determine final
+ranking. The declared cross-partner/monomer hybrid is not a binding free energy.
+Run `scripts/run_physics_induced_fit_pair.py --help` for the five comparison
+arms and resource limits. This path does not replace the existing defaults.
+The first five-arm apo pilot completed, but accuracy did not improve; its full
+results and limitations are recorded in the experiment report. For continuing
+development on Linux/NVIDIA, start with the [handoff notes](docs/HANDOFF_2026-11-16.md).
+
 ## Quick start — re-scoring poses
 
 ```python

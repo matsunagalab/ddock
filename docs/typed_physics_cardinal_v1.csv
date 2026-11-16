@@ -1,0 +1,4 @@
+spacing_angstrom,n,distance_gate_pass_count,boundary_minimum_count,maximum_absolute_minimum_distance_error_angstrom,depth_gate_pass_count,maximum_extra_well_depth_fraction,maximum_absolute_force_at_analytic_minimum
+1.0,728,241,0,0.6799999999999999,7,40.662923710296475,12.72528164830375
+0.5,728,259,0,0.29499999999999993,103,13.760489571156821,2.67623499929056
+0.25,728,696,0,0.1499999999999999,696,2.386076041549863,1.6392776033602785
