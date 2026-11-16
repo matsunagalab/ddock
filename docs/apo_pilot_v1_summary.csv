@@ -1,0 +1,4 @@
+system_id,arm,initial_top1_DockQ,initial_best5_DockQ,final_top1_DockQ,final_best5_DockQ,final_top1_iRMSD_angstrom,final_top1_LRMSD_angstrom,final_top1_fnat,final_top1_selection_rank,final_best5_selection_rank,final_scored_candidates,final_failed_or_missing_candidates,final_top1_acceptable_or_better_by_dockq,dockq_version,mapping
+historical_1BRS_apo_protein_only_v1,R0,0.024660656468929076,0.17760929579769683,0.024710601777075417,0.19926569926315765,14.90669286553862,32.477057532793395,0,1,4,5,0,False,2.1.3,RL:AD
+historical_1BRS_apo_protein_only_v1,R1,0.024660656468929076,0.17760929579769683,0.024722882957005032,0.20186275411782306,14.897231122500164,32.47050036410509,0,1,4,5,0,False,2.1.3,RL:AD
+historical_1BRS_apo_protein_only_v1,R2,0.15891350569091123,0.15891350569091123,0.024722882957005032,0.1570739419607139,14.897231122500164,32.47050036410509,0,3,1,5,0,False,2.1.3,RL:AD

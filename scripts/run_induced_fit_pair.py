@@ -29,6 +29,7 @@ from zdock.inducedfit.modes import build_torsion_modes
 from zdock.inducedfit.pipeline import centered_protein, export_heavy_pair, load_pair_manifest, pair_grid, rotation_sample
 from zdock.inducedfit.relax import relax_pose
 from zdock.inducedfit.search import prepare_response_receptor, search_response
+from zdock.geom import rotate
 
 
 def run(args, report, save):
@@ -56,7 +57,7 @@ def run(args, report, save):
                                 n_modes=args.modes, fit_relative_damping=args.fit_damping)
     report['mode_diagnostics'] = model.diagnostics
     parameters = FieldParameters(surface_width=.5, repulsion_weight=3., charge_weight=1.,
-                                 atom_chunk_size=32, point_chunk_size=2048)
+                                 atom_chunk_size=32, point_chunk_size=2048, backend=args.field_backend)
     grid = pair_grid(receptor, ligand, parameters, spacing=args.spacing,
                      max_atom_displacement=args.max_atom_displacement,
                      max_translation=args.max_translation)
@@ -119,6 +120,13 @@ def run(args, report, save):
                    'predicted_gain': candidate.predicted_gain, 'predicted_amplitudes': candidate.amplitudes.tolist()}
             result['candidates'].append(row)
             try:
+                initial_ligand = torch.stack(rotate(*ligand.xyz.unbind(-1),
+                                                    quaternions[candidate.rotation_index]), dim=-1) + candidate.translation
+                initial_paths = export_heavy_pair(args.out / arm / f'selected_{index:03d}',
+                    inputs['receptor'], inputs['ligand'],
+                    receptor.xyz[proteins['receptor'].heavy_indices],
+                    initial_ligand[proteins['ligand'].heavy_indices], centers['receptor'])
+                row['initial_files'] = {k: str(Path(v).relative_to(args.out)) for k, v in initial_paths.items()}
                 refined = relax_pose(receptor, ligand, model, grid, parameters,
                                      quaternions[candidate.rotation_index], candidate.translation,
                                      radius=radius, flexible=arm != 'R0',
@@ -157,6 +165,8 @@ def main():
     ap.add_argument('--prepare-only', action='store_true')
     ap.add_argument('--checkpoint-fields', action='store_true',
                     help='recompute field chunks in local reverse-mode gradients to reduce retained memory')
+    ap.add_argument('--field-backend', choices=['dense', 'sparse'], default='dense',
+                    help='sparse evaluates the same compact fields only on atom-local grid stencils')
     ap.add_argument('--arms', choices=['R0', 'R1', 'R2'], nargs='+', default=['R1', 'R2'])
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--ph', type=float, default=7.)

@@ -7441,3 +7441,168 @@ harnessに専用process groupの終了処理と内側120秒timeoutを追加し�
 3反復だけで一般的な高速化／スケーリングを主張せず、GPUや実タンパク質では未検証。
 実apoの末端／欠損化学policy、内部非結合力場、grid収束を先に整え、同一入力・予算の
 HDOCK比較と抗体loop closureへの展開に進む。
+
+### 9.18 実apo barnase/barstarの固定条件pilot（2026-11-16）
+
+**問い・仮説。** 実apoの2タンパク質で、全水素電荷→入力由来の内部座標応答→FFT選択→
+非線形精密化→独立DockQ評価まで実行できるか。R1とR2の違いは候補選択前の応答補正だけとし、
+最終energyの改善と構造精度の改善を分けて測る。1系の開発pilotであり、HDOCKへの優位性や
+大変形集合での成功率を検定しない。以前の無処理入力失敗・PINDER 0/5適格の結果は§9.16に残す。
+
+**データと入力化学policy。** 歴史的benchmark 1BRSに対する別結晶apo、1A2P B／1A19 Aを固定した。
+これは既知の開発対象で、未使用holdoutではない。1BNFは一次資料でT70C/S92C disulfide mutantと
+確認したため代替に採用しなかった。最終対象をドッキング精度で選んでいない。
+1A2PのZnは一次資料で結晶対称分子間接触に関与すると記載されているため、
+**明示的なprotein-onlyモデル**としてZn1個・水140個と関連LINKを除き、元recordと近傍距離を保存した。
+ZnB112 occupancy0.35、Glu60 OE1/OE2まで2.25117/2.32388 Å。除去は無影響という意味ではなく、
+金属存在下の化学モデルから変わる近似である。[1A2P一次情報](https://www.rcsb.org/structure/1A2P)。
+全選択重原子ATOM lineをそのまま保存し、欠損重原子の座標は作成しない。
+
+1A2P Bは108残基／864重原子。未解像Ala1/Gln2を補わず、Val3を荷電モデルN末端として扱う。
+Val3 N、Arg59 CG/CD/NE/CZ/NH1/NH2、Ser67 CB/OGの9個のzero-occupancy座標をそのまま保持する。
+これらを高信頼の観測座標とは呼ばない。1A19 Aは89残基／719重原子、free barstar C82A mutantで、
+未解像expression Met0を補わずLys1をモデル末端とする。[1A19一次情報](https://www.rcsb.org/structure/1A19)。
+共通pH7を使い、結晶化pHの7.5／6.5とは区別する。
+
+`scripts/prepare_historical_apo_pilot.py` で元PDBを保存し、処理policy・除去record・原子対応を
+`data/inducedfit/apo_pilot_v1/input_policy.json` に記録した。
+導出apoのSHA256はR=`20e4bdaadc1ab001ba1b2bc55a17408412b9edc6e3f51847e40deb6f9f3bf02b`、
+L=`2580ba081a5f257fb6b0605036489c8de050d972ba41c24ce58cbe3cfd30d316`。
+nativeパスを含まないinference manifest SHA256は
+`969c76da6acb3e911b11e2d623b858c3096893f628f1012c71328dc47a36ff04`。
+ff14SB前処理は両者とも成功し、R1700／L1433全原子、正味電荷+2e／−6e、重原子座標変更0。
+
+**実タンパク質を回すための計算変更。** `sparse_fields.py` と `--field-backend sparse` を追加。
+有限supportのGaussian/C2 taperの外では値と必要な微分が0になることを利用し、
+各原子の `ceil(max support/h)+1` 半幅の局所stencilだけを評価して全格子へscatterする。
+Gaussian、電荷の粒子別離散正規化とその微分、energy、非周期FFTの全格子は同じ。
+原子がcell境界を跨ぐとwork listは変わるが、余白により除去される寄与は厳密に0。
+stencil半幅の離散選択だけをdetachし、物理kernel中の半径・電荷微分は保つ。
+GPU scatterの再現性／速度は未検証。通常dense backendも残す。
+
+新規12件＋既存fields/checkpoint計32 testsで、denseとの場・energy・XYZ/radii/charges gradient、
+receptor JVP、cell境界、grid端、電荷積分微分、checkpoint parityを確認した。
+初回1 failはsupport.maxからfloatへの変換のrequires_grad警告で、work-list半幅のみdetachして修正。
+全経路の合成dispatch試験でもR0/R1/R2の最終energy差は0、全arm完了、1.02125秒だった。
+これは小系での接続確認で、旧実装との制御された速度benchmarkではない。
+
+**事前固定protocolと漏洩対策。** [pilot protocol](docs/apo_pilot_v1.md) とそのSHA256を
+`protocol_registration.json` に探索前に固定した。R0/R1/R2各128回転（identity＋seed0の127quaternion）、
+各回転4 peaks、Top5、peak距離3 Å。受容体側2 modes、ANM cutoff12 Å／γ1、fit damping0.001、
+relative spring regularization1e−4。requested radius0.5 Å、最大全原子変位1.5 Åから
+**有効半径0.3776974847 Å**を全armで共有。局所並進0.5 Å／回転0.15 rad、最大8iteration／64評価、
+R1/R2はa=0から開始。全粒子を独立な入力重原子centroidで中心化し、nativeへのfitは行わない。
+spacing2 Å、固定83³ molecular grid、165³ correlation grid、surface幅0.5 Å、repulsion3／charge1、
+chargeσ0.6 Å、screeningκ0.1 Å⁻¹／cutoff20 Å。sparse fieldとlocal checkpointを使用する。
+CPU float64／1 thread、PyTorch2.13.0、OpenMM8.6.1 Reference／pH7／seed0、macOS arm64。
+学習loss・重み学習・checkpoint選択・nativeによるハイパーパラメータ選択はない。
+
+前処理＋mode preflightは4.54973秒／peakRSS538,165,248 bytes、2 modesをrank reductionなしで構築。
+CA metric誤差4.44e−16、spring K eigenvalues39.68096／49.32816、有効CA fit residual0.14076／0.12736。
+このpreflightはnativeを開かずに行い、予測を見てmode数や方向を選び直していない。
+
+**独立評価の準備。** evaluator専用directoryと隔離環境に公式DockQ2.1.3を用意し、
+native 1BRS A/Dを保持。推論processへnativeファイルは渡さない。
+native対native sanityはDockQ0.999999999999687、fnat1で通過。
+入力とnativeの配列対応だけから `--mapping RL:AD --allowed_mismatches 1` を固定した。
+barstarのC40→A40置換とnative Dの未解像Glu64/Asn65を記録し、DockQのmatching-residue規則を使用する。
+評価専用の単量体fit診断ではinterface CA RMSDがR0.68750 Å（22残基）、L0.42473 Å（18対応残基）、
+規定した合成指標D=0.5840705 Åで小変形層に入る。この情報は推論基底・探索範囲へ流用しない。
+全5候補の選択時／精密化後PDBを保存し、選択rankと最終energy rankを区別する。
+
+**実測：実行・失敗分母。** 固定runは409.239456秒、process peakRSS1,894,203,392 bytesで完了。
+共通前処理6.19563秒、rigid探索32.49919秒、response探索58.21263秒。
+R0/R1は同じrigid候補を再利用しており、これを独立したend-to-end時間差とは扱わない。
+全3armが各5候補を出力、候補不足・例外・skip・OOMは0。全15候補で8 stepを受理したが、
+すべて `max_iterations` 終了であり収束したとは言えない。各候補のenergy評価は34–47回。
+R1の最終CA変位は0.03473–0.11437 Å、R2は0.06835–0.37546 Å。
+実CA／全原子変位制約を満たし、最大全原子変位はR1 0.43615 Å／R2 1.40461 Åだった。
+
+**実測：公式DockQ。** DockQ2.1.3／numpy1.26.4／biopython1.88で、初期15＋最終15構造を
+すべて採点できた。scorer失敗・missing modelは0。Top1は初期にselection rank、
+最終にenergy rankで定め、DockQで並べ替えない。best-of-5は保存5候補内の事後oracle値である。
+
+| arm | 初期Top1 | 初期best5 | 最終Top1 | 最終best5 | 最終Top1 iRMSD / LRMSD Å | 最終Top1 fnat |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| R0：剛体 | 0.024661 | 0.177609 | 0.024711 | 0.199266 | 14.90669 / 32.47706 | 0 |
+| R1：探索後のみ柔軟化 | 0.024661 | 0.177609 | 0.024723 | 0.201863 | 14.89723 / 32.47050 | 0 |
+| R2：応答選択＋柔軟化 | 0.158914 | 0.158914 | 0.024723 | 0.157074 | 14.89723 / 32.47050 | 0 |
+
+全30構造がDockQ0.23未満で、各方式ともこの1系でacceptableに届かなかった。
+**誘導適合の優位性は確認できず、R2の最終best5はR1より低いというnull／悪化結果**である。
+R2は剛体候補5件のうち2件を保持して3件を置き換え、選択時Top1のDockQを改善したが、
+最終energy順位ではR1と同じ不正解姿勢がTop1へ戻った。
+R1の相対的に精度が高い候補（selection4、final2、DockQ0.201863）はR2の集合に残らなかった。
+
+最終Top1 energyはR0 −109.076839、R1/R2 −109.471489。
+R1のbest5精度候補のenergyは−99.120522、R2のbest5精度候補（selection1、final2）は−98.476726で、
+より低いenergyの不正解姿勢に負けた。これは現energyと構造精度の順位不一致を示す。
+全15候補の精密化前後、rank、DockQ/iRMSD/LRMSD/fnat、statusとPDB hashを
+[個別CSV](docs/apo_pilot_v1_results.csv)、[3条件集約CSV](docs/apo_pilot_v1_summary.csv)へ保存した。
+完全な評価provenanceは `data/inducedfit/evaluator_only/apo_pilot_v1_dockq.json`。
+
+**事後診断：応答利得の近似誤差。** 予測を凍結した後、nativeを使わず同じapo・コードhash・
+場・姿勢を復元し、R2全5候補の提案振幅a*を1/4、1/2、1倍にした実energyを評価した。
+候補の選び直しやハイパーパラメータ更新には使わない。
+`scripts/diagnose_inducedfit_response.py` は9.76509秒で完了し、a=0のenergy再現差は最大1.36e−12。
+ここで比較するgainは**剛体姿勢を固定した変形のみ**で、局所poseも動かす最終refinement gainとは異なる。
+
+| R2 selection rank | 全振幅の予測gain | 全振幅の実gain | 実CA変位制約 |
+| ---: | ---: | ---: | --- |
+| 1 | −45.208407 | −23.641240 | 可 |
+| 2 | −36.883636 | −17.598084 | 超過：0.385774 Å |
+| 3 | −2.768016 | +0.627044 | 可（energy悪化） |
+| 4 | −34.886998 | −14.888984 | 可 |
+| 5 | −10.978555 | −3.900013 | 超過：0.387022 Å |
+
+実CA上限は0.377697 Å。全原子上限1.5 Åは全条件で満たし、15条件のfield supportもすべて有効。
+1/4・1/2振幅では全候補で幾何制約内かつ実gain<0。
+全振幅の「実strain−二次strain」は0.058–0.358程度だったのに対し、gain誤差は3.395–21.567である。
+したがって、この誤差分解では大半が相互作用場と非線形座標写像の未考慮曲率に属する。
+これは微分testの不一致ではなく有限振幅の近似誤差であり、物理的な溶媒・内部非結合モデルの正しさを
+示すものでもない。診断JSONは `data/inducedfit/apo_pilot_v1/response_diagnostic_v1.json`。
+
+**再現コマンド。** 入力・native・環境・生成PDB・詳細ログはignored dataに置く。
+既存outputを上書きしないので再実行時には新しいoutを使う。
+
+```bash
+uv sync --extra chemistry
+mkdir -p data/inducedfit/inputs
+curl -fL https://files.rcsb.org/download/1A2P.pdb -o data/inducedfit/inputs/1A2P.pdb
+curl -fL https://files.rcsb.org/download/1A19.pdb -o data/inducedfit/inputs/1A19.pdb
+.venv/bin/python scripts/prepare_historical_apo_pilot.py --out data/inducedfit/apo_pilot_v1
+.venv/bin/python scripts/run_induced_fit_pair.py \
+  --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json \
+  --out data/inducedfit/apo_pilot_v1/pilot_run \
+  --arms R0 R1 R2 --field-backend sparse --checkpoint-fields \
+  --rotations 128 --top-k 5 --peaks-per-rotation 4 --modes 2 \
+  --radius 0.5 --max-atom-displacement 1.5 --max-translation 0.5 \
+  --iterations 8 --max-evaluations 64 --spacing 2 \
+  --max-grid-points 750000 --seed 0 --threads 1
+# Native取得は以下の独立評価段階だけで行う。
+uv venv data/inducedfit/dockq_env --python 3.12
+uv pip install --python data/inducedfit/dockq_env/bin/python DockQ==2.1.3 numpy==1.26.4 biopython==1.88
+mkdir -p data/inducedfit/evaluator_only
+curl -fL https://files.rcsb.org/download/1BRS.pdb -o data/inducedfit/evaluator_only/1BRS.pdb
+data/inducedfit/dockq_env/bin/python scripts/score_inducedfit_pilot.py \
+  --native data/inducedfit/evaluator_only/1BRS.pdb \
+  --run-report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --mapping RL:AD --allowed-mismatches 1 \
+  --out data/inducedfit/evaluator_only/apo_pilot_v1_dockq.json
+.venv/bin/python scripts/diagnose_inducedfit_response.py \
+  --report data/inducedfit/apo_pilot_v1/pilot_run/report.json \
+  --out data/inducedfit/apo_pilot_v1/response_diagnostic_v1.json
+```
+
+**検証。** sparse、chemistry、内部座標、refinement、入力・export、scorerのrank／欠損分母／chain方向／
+NaN／未完了report拒否、既存FFT回帰を含む対象suiteは **189 passed in 4.48s**。
+実験中のエラーは新sparse単体test初回の上記1件のみで、実apo run／30モデル評価／15応答診断に
+失敗・OOM・skipはない。全legacy suiteや別protein・GPUでの評価は行っていない。
+
+**結論・限界・次実験。** 実apoの全経路pilotは完了したが、構造予測は不成功だった。
+相対的に良い候補が残っても現在のenergy順位が選ばず、応答補正も有限振幅利得を過大評価した。
+少数回転、chargeσより粗い格子、モデル末端／Zn除去／zero-occupancy、原子内非結合力場の不足、
+8iteration終了が残るため、1系の結果を一般的な物理法やHDOCK比較へ拡張しない。
+次はnativeを推論へ入れず、(1)小振幅の予測／実利得に基づくtrust regionと相互作用HVP曲率診断、
+(2)格子位相／spacing収束と十分な回転密度、(3)より物理的な再順位付けと内部非結合コスト、を
+別protocolで検証する。改善の選択は開発集合で行い、未使用apo/flexible集合で後に確認する。

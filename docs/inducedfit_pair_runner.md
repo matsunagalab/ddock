@@ -56,6 +56,13 @@ failures, intermediate energies and resource usage are saved in `report.json`.
 Partial reports are saved before expensive stages. An interrupted process may
 leave `status=running`; this must be counted as interrupted, not completed.
 
+For protein-sized inputs, `--field-backend sparse` evaluates the same compact
+fields on atom-local stencils and scatters them onto the full grid. It retains
+the same field formula, charge normalization and FFT correlation; dense/sparse
+values, gradients and cell-boundary behavior are tested. The default `dense`
+backend remains an independent reference. `--max-grid-points` limits molecular
+grid size, not total FFT/gradient memory.
+
 | Arm | Candidate selection | Local refinement |
 | --- | --- | --- |
 | R0 | Rigid field score | Rigid pose |
@@ -102,3 +109,10 @@ with native-vs-native sanity checks, and report preparation/search/export/scorer
 failures separately. Keep every registered system in the denominator. The
 existing holo PINDER scoring wrapper is not an apo evaluation adapter. This
 runner's energy differences are not DockQ differences or evidence against HDOCK.
+
+The first [registered real apo pilot](apo_pilot_v1.md) completed on one
+barnase/barstar pair using explicitly declared protein-only chemistry, sparse
+fields and checkpointing. All 30 initial/final models scored below DockQ 0.23.
+See the [per-candidate results](apo_pilot_v1_results.csv) and research log §9.18
+for negative results, ranking errors and the response-gain diagnostic. This is
+a completed execution test, not a successful docking benchmark.

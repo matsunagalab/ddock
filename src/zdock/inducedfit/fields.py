@@ -35,8 +35,11 @@ class FieldParameters:
     reference_length: float = 1.0
     atom_chunk_size: int = 32
     point_chunk_size: int = 2048
+    backend: str = "dense"
 
     def validate(self) -> None:
+        if self.backend not in ("dense", "sparse"):
+            raise ValueError("field backend must be dense or sparse")
         values = (
             self.surface_width, self.charge_sigma, self.screening_softening,
             self.reference_volume, self.reference_length,
@@ -167,12 +170,16 @@ def build_fields(xyz: torch.Tensor, radii: torch.Tensor, charges: torch.Tensor,
     supported by the checkpoint path.  No-grad calls bypass checkpointing.
     See https://docs.pytorch.org/docs/stable/checkpoint.html .
     """
+    params = params or FieldParameters()
+    if params.backend == "sparse":
+        from .sparse_fields import build_sparse_fields
+        return build_sparse_fields(xyz, radii, charges, grid, params,
+                                   checkpoint_chunks=checkpoint_chunks)
     if not isinstance(checkpoint_chunks, bool):
         raise TypeError("checkpoint_chunks must be a bool")
     if checkpoint_chunks and any(torch.autograd.forward_ad.unpack_dual(tensor).tangent is not None
                                  for tensor in (xyz, radii, charges)):
         raise ValueError("checkpoint_chunks is reverse-mode only; use False for forward AD/JVP")
-    params = params or FieldParameters()
     _validate_atoms(xyz, radii, charges, grid, params)
     points = grid.points(device=xyz.device, dtype=xyz.dtype)
     h3 = grid.voxel_volume
