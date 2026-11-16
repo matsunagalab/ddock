@@ -82,7 +82,12 @@ def run(args, report, save):
     report['stage'] = 'modes'
     save()
     model = build_torsion_modes(HydrogenatedKinematics.from_prepared(proteins['receptor']),
-                                n_modes=args.modes, fit_relative_damping=args.fit_damping)
+                                n_modes=args.modes, fit_relative_damping=args.fit_damping,
+                                jacobian_backend=getattr(args, 'jacobian_backend', 'dense'),
+                                jvp_chunk_size=getattr(args, 'jvp_chunk_size', 8),
+                                anm_backend=getattr(args, 'anm_backend', 'dense'),
+                                anm_seed=getattr(args, 'anm_seed', 0),
+                                anm_tolerance=getattr(args, 'anm_tolerance', 1e-9))
     report['mode_diagnostics'] = model.diagnostics
     parameters = FieldParameters(surface_width=.5, repulsion_weight=3., charge_weight=1.,
                                  atom_chunk_size=32, point_chunk_size=2048, backend=args.field_backend)
@@ -241,6 +246,13 @@ def main():
     ap.add_argument('--ph', type=float, default=7.)
     ap.add_argument('--modes', type=int, default=2)
     ap.add_argument('--fit-damping', type=float, default=.001)
+    ap.add_argument('--jacobian-backend', choices=['dense', 'chunked'], default='dense',
+                    help='chunked retains only the CA Jacobian and adopted full-atom directions')
+    ap.add_argument('--jvp-chunk-size', type=int, default=8)
+    ap.add_argument('--anm-backend', choices=['dense', 'iterative'], default='dense',
+                    help='iterative extracts only required low modes without a dense Hessian; CPU float64')
+    ap.add_argument('--anm-seed', type=int, default=0)
+    ap.add_argument('--anm-tolerance', type=float, default=1e-9)
     ap.add_argument('--rotations', type=int, default=4)
     ap.add_argument('--top-k', type=int, default=1)
     ap.add_argument('--response-pool-size', type=int, default=50,
@@ -256,7 +268,7 @@ def main():
     ap.add_argument('--threads', type=int, default=1)
     args = ap.parse_args()
     if min(args.modes, args.rotations, args.top_k, args.peaks_per_rotation, args.iterations,
-           args.max_evaluations, args.max_grid_points, args.threads) < 1:
+           args.max_evaluations, args.max_grid_points, args.threads, args.jvp_chunk_size) < 1:
         ap.error('counts must be positive')
     if len(set(args.arms)) != len(args.arms):
         ap.error('arms must be unique')
@@ -264,6 +276,8 @@ def main():
         ap.error('response pool must be positive and at least top-k when using R2v')
     if not 0 <= args.seed < 2**32:
         ap.error('seed must be in [0, 2**32)')
+    if args.anm_seed < 0 or not math.isfinite(args.anm_tolerance) or not 0 < args.anm_tolerance < 1:
+        ap.error('ANM seed must be nonnegative and tolerance finite in (0, 1)')
     for name in ('ph', 'fit_damping', 'spacing', 'radius', 'max_atom_displacement', 'max_translation'):
         if not math.isfinite(getattr(args, name)):
             ap.error(f'{name} must be finite')

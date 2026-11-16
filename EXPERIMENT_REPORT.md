@@ -7810,3 +7810,243 @@ core–shell cross項、(b)固定Amber sigma/epsilonによる原子型別potenti
 型チャネルが増える。半径／強度をDockQで合わせず、接近曲線・短距離反発・相互作用力・
 格子位相／spacing収束を先に合格条件にする。その後に内部非結合／torsion strainを加え、
 同一回転・候補予算で新しい開発protocolを登録する。精度確認は別の未使用apo集合で必要である。
+
+
+### 9.20 既存ANMの省メモリ化と応答場の低ランク圧縮（2026-11-16）
+
+**問い・仮説。** ANMは§9.15以降すでに変形方向の生成に用いている。今回は新しい採用ではなく、
+全Hessian／全原子Jacobianを作る現在の計算を、同じ物理モデルを保って省メモリ化できるかを問う。
+別の近似実験として、柔らかさで重み付けした場の微分 `D K^(-1/2)` を確率的低ランク近似し、
+必要なFFTの本数を減らしても配置に対する応答を十分保持できるかを調べる。
+§9.19で見つかった接触距離の問題や全原子strainの不足を、この計算変更だけで解決したとは扱わない。
+
+**事前登録と漏洩対策。** [固定条件](docs/anm_memory_v1.md) を数値比較／性能計測前に保存した。
+同じdevelopment apo manifestの受容体1A2P B、108 CA／1700全原子／211torsionsを使用。
+全原子は同じff14SB、pH7、seed0で準備し、nativeとDockQを実行processへ渡さない。
+物理パラメータ、ANM cutoff12 Å、gamma1、fit damping0.001、spring regularization1e−4を維持。
+学習loss・checkpoint選択・native精度でのrank選択はない。
+
+**実装。** 同等計算として、(1)CA Jacobianだけを8方向ずつJVPで作り、採用モードの全原子JVPだけを
+評価するchunked backend、(2)近傍edgeのHvとLanczosにより必要な最低正固有値だけ求めるiterative ANMを
+追加する。dense既定を保持し、ANM iterativeはCPU float64を明示、未収束・未解決零モード・
+予算不足でdenseへ黙ってfallbackしない。追加floppy modeを検査し、固有ベクトルの符号ではなく
+部分空間・ばねK・同じ外力への非線形変位で比較する。数値的にゼロ判定できない例は失敗として残す。
+
+近似側は、random Gaussian sketchとstreamed second passで `A=D K^(-1/2)` を縮約する。
+source8モード→rank4/2、oversampling2、seed0を固定。CA metricを再白色化し、Kと振幅制約を
+同じ変換で写す。元の非線形priorを合成して使い、元のetaを再設定しない。
+構築時sketch workspaceと最終FFT cacheを別に計上し、低rank化による誤差と省メモリを区別する。
+
+**評価計画。** モード前処理は8モード、CPU1thread・float64、独立processの3反復で
+ordered variantsを交互に実行。初期化込みpeakRSS、mode段階時間、準備時間、全失敗を報告する。
+ANM単体の拡張性はseed101、3.8 Å格子＋各軸±0.15 Å乱数の合成216／1000 CAでも同じ3反復で確認する。
+これはタンパク質精度benchmarkではない。各child上限180秒。実apo場の近似比較はseed17の16回転、
+各4peaks、Top10、v2と同じ2 Å格子・相互作用場、full8から定めた共通の変位半径で実施する。
+選択候補の和集合で剛体energy、勾配投影、二次gain、候補重複、実変形検証を調べる。
+データ・配列・生logはignored dataに保存し、結果は以下へ追記する。
+
+
+**実測：同じモデルを使う前処理。** 3独立process反復の中央値は次のとおり。
+macOS arm64／Python3.12.11／PyTorch2.13.0／CPU float64・1thread。
+各組の順序を反復ごとにずらし、計測中は他agentの重い計算を止めた。
+RSSはPython／Torch／化学準備を含むprocess最大値で、行列単体のbyte数ではない。
+
+| 入力 | backend | mode構築 秒 | peakRSS MB（10^6 bytes） |
+| --- | --- | ---: | ---: |
+| 実apo 108 CA／1700原子、8modes | dense ANM＋全原子J | 4.04751 | 674.693 |
+| 同上 | dense ANM＋chunked CA-JVP | 4.97300 | 578.519 |
+| 同上 | iterative ANM＋chunked CA-JVP | 4.95257 | 630.768 |
+| 合成216 CA、ANMのみ | dense | 0.02247 | 253.018 |
+| 同上 | iterative | 0.17195 | 241.943 |
+| 合成1000 CA、ANMのみ | dense | 1.30099 | 723.190 |
+| 同上 | iterative | 2.59012 | 312.689 |
+
+実apoではchunked単独でpeakRSS14.25%減／mode時間22.87%増。
+iterative併用では6.51%減／22.36%増で、この小系ではchunked単独より節約が小さかった。
+合成1000 CAでは56.76%減、時間約1.99倍。合成216 CAでも省メモリは小さく、計算は遅くなった。
+**今回の実測では高速化は示せず、省メモリと速度のトレードオフ**だった。
+実apoのRSS範囲はdense653.3–675.5 MB、chunked503.0–582.4 MB、iterative622.8–649.0 MB。
+3反復・1機種なので一般的な削減率やサイズ全域の優劣は主張しない。全ドッキング時間／RSSの比較でもない。
+全21childが完了し、timeout／OOM／skip／worker失敗は0。
+[実apo9試行CSV](docs/anm_memory_v1_apo.csv)、[216 CA 6試行](docs/anm_memory_v1_216.csv)、
+[1000 CA 6試行](docs/anm_memory_v1_1000.csv) に全数を保存した。
+
+実apoのdense対新backendで、部分空間相対残差は最大1.78e−14、K相対誤差4.41e−15。
+固定seed29の4全原子外力・振幅上限0.05 Åによる応答を非線形座標へ戻し、
+原子変位差最大1.26e−13 Å、strain差1.14e−12 ε、二次gain差7.99e−14 ε。
+合成216／1000 CAの固有値相対誤差は最大1.29e−14、部分空間相対残差5.63e−14。
+固有ベクトルの符号や縮退空間の回転を誤差とせず、CA内積で対応付けた不変量を比較した。
+これらはこの固定入力の数値同等性であり、DockQの改善ではない。
+
+**実装中の失敗と制約。** iterative単体初回は21pass／1fail。二つの四面体を使う
+`reject_disconnected=False` 試験で単一開始Lanczosが追加零固有値の重複度を取りこぼし、
+edge-countによるrank下限検査でhard errorになった。見つかった零空間を逐次deflateして
+seed固定の新しい開始ベクトルで再探索する処理を追加し、22/22単体testが通過した。
+chunked integration初回のfloat32 iterative試験1件は、float64 CPU限定という契約の取り違え。
+暗黙castは追加せず、明示的な拒否をtestするように修正した。chunked自体はfloat32/64対応。
+
+反復法の残差と直交性は返された固有対の検証であり、全縮退空間の取りこぼしがないという
+厳密な証明にはならない。全zero／positive数は反復探索からの推定であることをdiagnosticsへ明記した。
+この注記は上記測定後に追加したが、数値algorithm／出力vectorsは変えていない。
+測定時のsource hashは各worker reportへ保存した。新しいgraph族ではdense部分空間比較が必要。
+
+**性能条件と集計判定の訂正。** 上記「CPU1thread」は実装では `torch.set_num_threads(1)` の指定であり、
+SciPy／NumPyのBLAS thread数は独立に制御・記録していなかった。登録上の単一thread条件が全backendで
+成立したとは確認できない。時間とRSSはこの実行条件での測定値として残し、厳密な全library単一thread
+比較とは主張しない。将来の性能比較ではthreadpool情報と環境制御を記録する。
+またreviewで、計算済みのquadratic gain差が合否gateに入っていないこと、source一致が反復内のみで
+入力hash／全反復共通sourceをgateしないことが見つかった。保存済み21試行では各dataset内の
+入力hash／sourceは一致し、gain差も上述の微小値だった。集計gateを補強し、保存値で再検証する。
+これはworkerの数値計算や測定済み時間を変更するものではない。
+
+前処理計測の再現command（生成先は新しいdirectoryにする）：
+
+```bash
+.venv/bin/python scripts/benchmark_inducedfit_modes.py \
+  --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json \
+  --out data/inducedfit/anm_memory_v1/real_apo \
+  --modes 8 --repeats 3 --timeout 180 --summary docs/anm_memory_v1_apo.csv
+.venv/bin/python scripts/benchmark_inducedfit_modes.py \
+  --synthetic-nodes 216 --out data/inducedfit/anm_memory_v1/synthetic_216 \
+  --modes 8 --repeats 3 --timeout 180 --summary docs/anm_memory_v1_216.csv
+.venv/bin/python scripts/benchmark_inducedfit_modes.py \
+  --synthetic-nodes 1000 --out data/inducedfit/anm_memory_v1/synthetic_1000 \
+  --modes 8 --repeats 3 --timeout 180 --summary docs/anm_memory_v1_1000.csv
+```
+
+**追加integration確認の設計。** 圧縮を既定にはせず、pair runnerへ同等計算backendの明示flagを
+追加した。legacy reportはdense、新reportは保存済みbackend設定でreplayする。
+この接続を実apo、8modes、R2vのみ、4回転、pool4、Top1、精密化2step／20評価、seed0、
+CPU1thread、sparse場／checkpoint付きで確認する。要求CA半径0.2 Å／最大原子変位1 Å、
+最大並進0.5 Å、spacing2 Å。これはsoftware smokeで、精度評価や収束判定のexperimentではない。
+全Hを再生成して保存amplitude／剛体増分から最終座標をreplayし、heavy PDB丸め誤差0.001 Å以内、
+保存strain一致、同じ場のtotal energyを確認する。nativeは使わず新しいrankや係数の選択もしない。
+
+**実測：応答場の圧縮。** 同じapo receptor／ligand、83³分子格子、165³相関格子で、
+full8から決めた共通CA振幅半径は0.07592867594 Åだった。旧2モードpilotと半径が異なるため、
+旧pilotとの精度／時間比較には使わない。圧縮側だけ半径を広げず、source8、rank4/2、
+oversampling2、seed0を固定した。相手のnativeやDockQは一切読まない。
+
+初回 `compression_audit_v1` は3探索完了後、union評価前のmetadata比較で失敗した。
+Python tupleとJSON listを直接比較したため、同じgridを異なるものと誤判定した。
+JSON表現へ正規化する修正と回帰testを加え、元の失敗reportを保持し、同条件を
+`compression_audit_v1_retry` へ再実行した。係数・rank・seed・回転・候補予算は変更していない。
+初回と再実行の各variantの候補JSONは完全一致した。全6探索は成功、unionは1失敗／1成功、
+timeout／OOM／search skipは0。初回union失敗は9.108秒、peakRSS655.131 MB、評価姿勢数0。
+
+| 試行 | 方向数 | 準備込み探索 秒 | peakRSS MB | 保持FFT総量 MB |
+| --- | ---: | ---: | ---: | ---: |
+| 初回 | 8 | 24.380 | 2974.532 | 976.180 |
+| 初回 | 4 | 29.412 | 2508.784 | 542.322 |
+| 初回 | 2 | 30.029 | 1815.101 | 325.393 |
+| 再実行 | 8 | 31.630 | 2788.278 | 976.180 |
+| 再実行 | 4 | 34.489 | 2424.750 | 542.322 |
+| 再実行 | 2 | 29.198 | 1932.542 | 325.393 |
+
+MBは10^6 bytes。独立processだが各variantの順序は固定で、これは性能反復実験として設計した
+2反復ではない。PyTorch1threadで、SciPy／BLAS thread数未確認の制限も同じ。
+再実行のpeakRSSは4方向で13.04%、2方向で30.69%減った。一方、構築に8–10秒かかり、
+準備込み時間の短縮は初回／再実行で一貫しない。圧縮後の微分FFT cache自体は半分／4分の1、
+剛体cache込み総量は44.44%／66.67%減。構築用sketchの理論保持量82.337／54.892 MBは
+QR・JVP・FFT・allocatorを含むpeakRSSではない。構築JVPはそれぞれ14／12回。
+
+候補和集合12姿勢×3variant=36検査すべてが完了した。union単独は44.756秒、peakRSS1088.881 MB。
+各variantの独立composite JVPで勾配投影を確認し、最大差4.28e−14、剛体FFT対直接energy差3.04e−12。
+小さな数値誤差である一方、許される変形の部分空間を縮める損失は大きかった。
+
+| 比較（union12姿勢） | full8 | rank4 | rank2 |
+| --- | ---: | ---: | ---: |
+| full8とのTop10共通候補 | 10 | 9 | 8 |
+| 二次gain損失率の姿勢平均 | 0% | 28.934% | 54.450% |
+| 二次gain損失率の最大 | 0% | 70.842% | 94.861% |
+| 元振幅空間での勾配欠落相対normの平均 | 0 | 0.60741 | 0.84129 |
+| 非線形検証後の平均gain ε | −2.68714 | −1.86662 | −0.974229 |
+| 非線形検証 accepted／fallback | 12／0 | 12／0 | 12／0 |
+
+gain損失率は `(gain_reduced − gain_full) / abs(gain_full)`。非線形検証の採用scale
+1／0.5／0.25の件数はfull8=5／5／2、rank4=5／4／3、rank2=4／4／4。
+全件acceptedは応答を保持したという意味ではなく、縮小後に実energy低下と変位制約を満たしたという意味。
+`D K^(-1/2)` のsketch再構成残差／元Frobenius normはrank4=0.55582、rank2=0.75651。
+これは選んだright subspaceのfield残差の上界であり、実pose誤差やDockQの上界ではない。
+この8方向では十分に低rankとみなせる結果ではなく、圧縮をpair runnerの既定へ導入しない。
+
+[全6探索CSV](docs/anm_compression_v1_search.csv) と
+[失敗段階＋全36検査CSV](docs/anm_compression_v1_union.csv) に保存。
+個別source／入力hash、固有値、transform、全verification trial、途中logは各ignored出力directoryにある。
+再現commandは以下。同じcommandの `--out` を `_retry` へ変えて修正後の再実行を行った。
+
+```bash
+.venv/bin/python scripts/audit_inducedfit_compression.py \
+  --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json \
+  --out data/inducedfit/compression_audit_v1
+```
+
+**実測：runner／replay接続。** 上記登録のsmokeは30.061秒で完了し、4提案の非線形検証、
+1候補の精密化・重原子exportが成功した。effective CA半径0.05061911729 Å。
+精密化は2accepted steps／11energy evaluationsで `max_iterations` に達し、収束とは扱わない。
+energyは剛体開始−70.15243656から−72.61364230 ε、strain0.06958429607 ε、
+CA変位0.038024 Å、最大原子変位0.153346 Åだった。nativeを使わないsoftware接続確認である。
+
+replayの手動確認初回は、結果JSONを組み立てる際にreport keyを `config` と誤記して
+`KeyError` になった（正しくは `configuration`）。runner／replay本体の不具合ではない。
+初回失敗の事後記録を `runner_smoke/replay_check_initial_failure.json` に残し、キーを修正して再実行。
+再構築energy差0、strain一致、重原子exportとの最大距離は受容体0.000844678 Å／ligand0.000788804 Åで、
+両方ともPDB丸めの確認閾値0.001 Å以内だった。`replay_check.json` に設定・hash・誤差を保存。
+
+```bash
+.venv/bin/python scripts/run_induced_fit_pair.py \
+  --manifest data/inducedfit/apo_pilot_v1/inference_manifest.json \
+  --out data/inducedfit/anm_memory_v1/runner_smoke \
+  --arms R2v --rotations 4 --top-k 1 --response-pool-size 4 --modes 8 \
+  --jacobian-backend chunked --jvp-chunk-size 8 \
+  --anm-backend iterative --anm-seed 0 --anm-tolerance 1e-9 \
+  --field-backend sparse --checkpoint-fields --radius .2 \
+  --max-atom-displacement 1 --max-translation .5 --iterations 2 \
+  --max-evaluations 20 --spacing 2 --max-grid-points 750000 --seed 0 --threads 1
+.venv/bin/python - <<'PY'
+import torch
+from zdock.inducedfit.replay import load_replay
+from zdock.inducedfit.fields import build_fields, physical_energy
+torch.set_num_threads(1)
+c = load_replay('data/inducedfit/anm_memory_v1/runner_smoke/report.json')
+p = c.final_pose('R2v', c.report['arms']['R2v']['candidates'][0])
+with torch.no_grad():
+    r = build_fields(p.receptor_xyz, c.receptor.radii, c.receptor.charges, c.grid, c.parameters)
+    l = build_fields(p.ligand_xyz, c.ligand.radii, c.ligand.charges, c.grid, c.parameters)
+    energy = float(physical_energy(r, l, c.grid, c.parameters)) + p.strain
+assert abs(energy - p.stored_energy) < 1e-8
+print(energy - p.stored_energy, p.heavy_export_errors)
+PY
+```
+
+**最終検証。** 誘導適合の全対象testと既存FFT回帰2件は **303 passed、6.31秒**。
+gain gate、入力／全反復source一致、欠損NPZなどの比較例外、失敗workerを再集計で成功扱いしないことも
+回帰testに含めた。補強したcheckerで保存済み3 dataset／21試行を再判定し、3 datasetともpassed。
+新しい計算や計測は起動せず、元のworker report／NPZ／時間を保持した。新checker SHAと元artifact SHAは
+`data/inducedfit/anm_memory_v1_rechecked/*/comparison.json` に別記録。
+
+```bash
+.venv/bin/python -m pytest tests/test_inducedfit_*.py \
+  tests/test_search.py::test_sc_fft_matches_direct_xcorr \
+  tests/test_search.py::test_sc_fft_matches_docking_score_elec_synthetic -q
+.venv/bin/python scripts/benchmark_inducedfit_modes.py \
+  --reaggregate data/inducedfit/anm_memory_v1/real_apo \
+  --out data/inducedfit/anm_memory_v1_rechecked/real_apo
+.venv/bin/python scripts/benchmark_inducedfit_modes.py \
+  --reaggregate data/inducedfit/anm_memory_v1/synthetic_216 \
+  --out data/inducedfit/anm_memory_v1_rechecked/synthetic_216
+.venv/bin/python scripts/benchmark_inducedfit_modes.py \
+  --reaggregate data/inducedfit/anm_memory_v1/synthetic_1000 \
+  --out data/inducedfit/anm_memory_v1_rechecked/synthetic_1000
+```
+
+**結論・限界・次実験。** 既存ANMの物理モデルを変えずに全原子Jacobian／密Hessianの保持を避ける
+backendを実装し、固定実apoと合成系で数値同等性とメモリ削減を確認した。時間は増え、BLAS thread条件も
+未確認なので高速化とは呼ばず、dense既定と省メモリopt-inを維持する。FFT応答場の確率的圧縮は
+cacheを削減したが変形利得の損失が大きく、production rankは選ばない。1開発系・少数回転・共通の小半径であり、
+未使用apo／抗体／HDOCKとの予測精度比較はしていない。零モード多重度の完全性も反復残差だけでは保証しない。
+
+次の優先課題は§9.19の物理scoreの接触距離と内部strainである。計算上の圧縮をさらに試すなら、
+まずより多いモードで特異値の減衰を測り、相手の接触力に対する応答損失を固定したnative-free条件で確認する。
+uniformな場normだけで小rankを決めず、構築費用を含める。局所運動／抗体loopへの新基底追加は別のモデル実験とし、
+今回の同等計算backendと混同しない。性能再計測時はNumPy／SciPyを含むthreadpoolと実行順序を制御する。

@@ -152,3 +152,44 @@ These diagnostics do not modify the runner's final smooth-energy ranking.
 Replay verifies input hashes, chemistry, atom maps, amplitudes and heavy exports;
 older reports without final pose increments require a rigid fit to rounded
 heavy coordinates, whose error is retained.
+
+## Optional ANM memory backends
+
+ANM already supplies the torsion directions. These options change how those
+directions are computed while retaining the network, torsion map and prior:
+
+```bash
+# Add to the pair-runner command; both defaults remain dense.
+--jacobian-backend chunked --jvp-chunk-size 8 \
+--anm-backend iterative --anm-seed 0 --anm-tolerance 1e-9
+```
+
+The chunked path retains the CA Jacobian and evaluates full-atom JVPs only for
+the adopted directions. The iterative path computes Hessian-vector products
+from network edges and extracts low modes without allocating a dense Hessian.
+It currently requires CPU float64 and fails explicitly on unresolved null
+directions, ambiguous eigenvalues or nonconvergence. Solver-inferred nullity is
+not a certification of the complete spectrum or degenerate eigenspaces.
+Reports record these options and replay uses the same backend.
+
+On the registered 108-CA / 1700-atom apo receptor, chunked JVP alone reduced
+median process peak RSS by 14.25% and increased mode-build time by 22.87%.
+Adding iterative ANM reduced RSS by only 6.51% relative to fully dense here.
+For a synthetic 1000-CA ANM alone, iterative RSS was 56.76% lower and runtime
+1.99 times higher. These are three-process medians for preprocessing on one CPU,
+not end-to-end docking speedups; the dense defaults remain unchanged. See
+[registered conditions](anm_memory_v1.md), the three result CSVs beside it,
+and research log §9.20.
+
+`scripts/audit_inducedfit_compression.py` separately evaluates randomized
+response-field compression. Reducing the number of response FFTs restricts the
+deformation subspace, so it is an approximation rather than an interchangeable
+backend. It is not enabled in the production pair runner and has no measured
+DockQ or HDOCK advantage.
+The input-only apo audit reduced retained FFT bytes by 44.44% / 66.67% for
+eight to four / two directions, but lost 28.93% / 54.45% of quadratic response
+gain on average over twelve union poses. Construction-inclusive timing did
+not improve consistently. See [all search attempts](anm_compression_v1_search.csv),
+[union results including the first audit failure](anm_compression_v1_union.csv),
+and research log §9.20. Timing used one PyTorch thread; NumPy/SciPy BLAS thread
+counts were not independently verified.

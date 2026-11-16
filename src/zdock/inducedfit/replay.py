@@ -122,9 +122,10 @@ class ReplayContext:
     def final_pose(self, arm: str, row: dict, *, export_tolerance: float = 1e-3) -> FrozenPose:
         """Reconstruct a final pose in the centered receptor input frame.
 
-        Receptor deformation comes from saved amplitudes. The ligand rigid
-        transform is fitted from its complete heavy atom export, then applied
-        to all original prepared atoms, including hydrogen coordinates.
+        Receptor deformation comes from saved amplitudes. The ligand uses
+        saved rigid increments when present; older reports require a rigid
+        fit to the complete heavy export. Both paths move all prepared atoms,
+        including hydrogen coordinates.
         """
         if arm not in self.report["arms"] or row not in self.report["arms"][arm].get("candidates", []):
             raise ValueError("Candidate must belong to this frozen report and arm")
@@ -214,7 +215,12 @@ def load_replay(report_path: str | Path) -> ReplayContext:
             raise ValueError(f"{side} input center changed")
     receptor, ligand = proteins["receptor"].monomer, proteins["ligand"].monomer
     model = build_torsion_modes(HydrogenatedKinematics.from_prepared(proteins["receptor"]),
-                                n_modes=config["modes"], fit_relative_damping=config["fit_damping"])
+                                n_modes=config["modes"], fit_relative_damping=config["fit_damping"],
+                                jacobian_backend=config.get("jacobian_backend", "dense"),
+                                jvp_chunk_size=config.get("jvp_chunk_size", 8),
+                                anm_backend=config.get("anm_backend", "dense"),
+                                anm_seed=config.get("anm_seed", 0),
+                                anm_tolerance=config.get("anm_tolerance", 1e-9))
     if not torch.allclose(model.stiffness, model.stiffness.new_tensor(report["stiffness"]), atol=1e-9, rtol=1e-7):
         raise ValueError("Recomputed stiffness differs from the frozen model")
     source_audit = {"report_sha256": _sha256(report_path), "manifest_sha256": _sha256(manifest_path),

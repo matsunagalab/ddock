@@ -62,6 +62,8 @@ class ANMModel:
 
     ``modes`` has shape (M, N_CA, 3), with unit Euclidean norm per mode;
     ``eigenvalues`` contains their ascending positive Hessian eigenvalues.
+    ``hessian`` is None for a matrix-free construction; the spring graph is
+    sufficient to evaluate the same nonlinear prior.
     More than six zero modes can occur even in a connected underconstrained
     network.  Their actual number is recorded, never assumed to be six.
     """
@@ -69,7 +71,7 @@ class ANMModel:
     reference: torch.Tensor
     pairs: torch.Tensor
     reference_distances: torch.Tensor
-    hessian: torch.Tensor
+    hessian: torch.Tensor | None
     eigenvalues: torch.Tensor
     modes: torch.Tensor
     cutoff: float
@@ -209,6 +211,11 @@ def build_torsion_modes(
     relative_regularization: float = 1e-4,
     allow_rank_reduction: bool = False,
     rank_rtol: float | None = None,
+    jacobian_backend: str = "dense",
+    jvp_chunk_size: int = 8,
+    anm_backend: str = "dense",
+    anm_seed: int = 0,
+    anm_tolerance: float = 1e-9,
 ) -> ModeModel:
     """Fit the lowest ANM directions into an anchored torsion Jacobian.
 
@@ -227,8 +234,14 @@ def build_torsion_modes(
     The regularizer eta is ``relative_regularization * median(positive
     eigenvalues of K_spring)``.  It is frozen in the nonlinear prior as well
     as its Hessian.  This is an explicit extra physical-model assumption,
-    not a solver-only stabilizer.  Full ANM and Jacobian eigensystems are
-    materialized in this initial implementation.
+    not a solver-only stabilizer. ``jacobian_backend='chunked'`` collects only
+    the CA Jacobian in bounded forward-AD blocks and evaluates full-atom JVPs
+    only for the adopted directions. The CA SVD, damping, whitening and spring
+    prior are unchanged. The dense reference implementation remains default.
+    ``anm_backend='iterative'`` requests only the lowest required ANM modes;
+    its optional dense Hessian is not needed by the nonlinear spring prior.
+    That backend currently requires float64 CPU input, with no silent dtype
+    conversion. Both Jacobian backends support float32 and float64.
     """
     reference = kinematics.reference
     _check_xyz(reference, "kinematics.reference")
@@ -238,6 +251,15 @@ def build_torsion_modes(
         raise ValueError("kinematics.n_torsions must be a nonnegative integer")
     if not isinstance(allow_rank_reduction, bool):
         raise TypeError("allow_rank_reduction must be a bool")
+    if jacobian_backend not in ("dense", "chunked"):
+        raise ValueError("jacobian_backend must be 'dense' or 'chunked'")
+    if isinstance(jvp_chunk_size, bool) or not isinstance(jvp_chunk_size, int) or jvp_chunk_size < 1:
+        raise ValueError("jvp_chunk_size must be a positive integer")
+    if anm_backend not in ("dense", "iterative"):
+        raise ValueError("anm_backend must be 'dense' or 'iterative'")
+    if isinstance(anm_seed, bool) or not isinstance(anm_seed, int) or anm_seed < 0:
+        raise ValueError("anm_seed must be a nonnegative integer")
+    anm_tolerance = _positive_scalar(anm_tolerance, "anm_tolerance")
     fit_relative_damping = _positive_scalar(fit_relative_damping, "fit_relative_damping", allow_zero=True)
     relative_regularization = _positive_scalar(relative_regularization, "relative_regularization", allow_zero=True)
     rtol = max(64 * torch.finfo(reference.dtype).eps, 1e-10) if rank_rtol is None else _positive_scalar(rank_rtol, "rank_rtol")
@@ -255,7 +277,12 @@ def build_torsion_modes(
     coordinate_tolerance = 64 * torch.finfo(reference.dtype).eps
     if not torch.allclose(at_origin, reference, atol=coordinate_tolerance, rtol=coordinate_tolerance):
         raise ValueError("kinematics.coordinates(0) must reproduce its reference")
-    anm = build_anm(reference[ca_indices], cutoff=cutoff, gamma=gamma)
+    if anm_backend == "dense":
+        anm = build_anm(reference[ca_indices], cutoff=cutoff, gamma=gamma)
+    else:
+        from .anm_iterative import build_anm_iterative
+        anm = build_anm_iterative(reference[ca_indices], n_modes=n_modes, cutoff=cutoff, gamma=gamma,
+                                  seed=anm_seed, tolerance=anm_tolerance, allow_rank_reduction=allow_rank_reduction)
     diagnostics = {
         "requested_modes": n_modes,
         "rank_reduction_allowed": allow_rank_reduction,
@@ -264,6 +291,12 @@ def build_torsion_modes(
         "anm": anm.diagnostics,
         "fit_relative_damping": fit_relative_damping,
         "relative_regularization": relative_regularization,
+        "jacobian_backend": jacobian_backend,
+        "jvp_chunk_size": jvp_chunk_size,
+        "anm_backend": anm_backend,
+        "anm_seed": anm_seed,
+        "anm_tolerance": anm_tolerance,
+        "materialized_full_coordinate_jacobian": jacobian_backend == "dense" and n_modes > 0,
     }
     if n_modes == 0:
         diagnostics.update({"actual_modes": 0, "rank_reduced": False, "regularization_strength": 0.0})
@@ -278,10 +311,32 @@ def build_torsion_modes(
 
     # The torsion input is much smaller than the all-atom Cartesian output;
     # forward AD avoids batching a reverse pass over every atom component.
-    full_jacobian = torch.func.jacfwd(kinematics.coordinates)(origin).detach()
-    if full_jacobian.shape != (*reference.shape, kinematics.n_torsions) or not bool(torch.isfinite(full_jacobian).all()):
-        raise ValueError("kinematics coordinate Jacobian has an invalid shape or nonfinite values")
-    ca_jacobian = full_jacobian[ca_indices].reshape(-1, kinematics.n_torsions)
+    full_jacobian = None
+    if jacobian_backend == "dense":
+        full_jacobian = torch.func.jacfwd(kinematics.coordinates)(origin).detach()
+        if full_jacobian.shape != (*reference.shape, kinematics.n_torsions) or not bool(torch.isfinite(full_jacobian).all()):
+            raise ValueError("kinematics coordinate Jacobian has an invalid shape or nonfinite values")
+        ca_jacobian = full_jacobian[ca_indices].reshape(-1, kinematics.n_torsions)
+    else:
+        ca_jacobian = reference.new_empty((3 * len(ca_indices), kinematics.n_torsions))
+
+        def ca_coordinates(angles):
+            return kinematics.coordinates(angles)[ca_indices]
+
+        def ca_jvp(direction):
+            return torch.func.jvp(ca_coordinates, (origin,), (direction,))[1]
+
+        for start in range(0, kinematics.n_torsions, jvp_chunk_size):
+            stop = min(start + jvp_chunk_size, kinematics.n_torsions)
+            # Do not allocate a full T x T identity or a full-atom T-direction
+            # output. Only this block's primal/tangent intermediates are live.
+            directions = reference.new_zeros((stop - start, kinematics.n_torsions))
+            local = torch.arange(stop - start, device=reference.device)
+            directions[local, local + start] = 1.
+            block = torch.vmap(ca_jvp)(directions).detach()
+            if block.shape != (stop - start, len(ca_indices), 3) or not bool(torch.isfinite(block).all()):
+                raise ValueError("kinematics CA Jacobian has an invalid shape or nonfinite values")
+            ca_jacobian[:, start:stop] = block.reshape(stop - start, -1).T
     left, singular_values, right_h = torch.linalg.svd(ca_jacobian, full_matrices=False)
     retained = singular_values > rtol * singular_values.amax()
     if not bool(retained.any()):
@@ -301,7 +356,20 @@ def build_torsion_modes(
     if actual_count < n_modes and not allow_rank_reduction:
         raise ValueError(f"requested {n_modes} modes but projected CA directions have numerical rank {actual_count}")
     angle_basis = (fitted_angles @ metric_vectors[:, metric_retained]) / torch.sqrt(metric_values[metric_retained])[None, :]
-    basis = torch.einsum("nct,tm->mnc", full_jacobian, angle_basis)
+    if full_jacobian is not None:
+        basis = torch.einsum("nct,tm->mnc", full_jacobian, angle_basis)
+    else:
+        basis = reference.new_empty((actual_count, *reference.shape))
+
+        def full_jvp(direction):
+            return torch.func.jvp(kinematics.coordinates, (origin,), (direction,))[1]
+
+        for start in range(0, actual_count, jvp_chunk_size):
+            stop = min(start + jvp_chunk_size, actual_count)
+            block = torch.vmap(full_jvp)(angle_basis[:, start:stop].T).detach()
+            if block.shape != (stop - start, *reference.shape) or not bool(torch.isfinite(block).all()):
+                raise ValueError("kinematics adopted coordinate directions have an invalid shape or nonfinite values")
+            basis[start:stop] = block
     amplitudes_zero = reference.new_zeros(actual_count)
 
     def spring_energy(amplitudes: torch.Tensor) -> torch.Tensor:

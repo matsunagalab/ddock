@@ -89,7 +89,7 @@ def stubbed_run(runner, monkeypatch, tmp_path):
     grid = GridSpec((3, 3, 3), 2., (-2., -2., -2.))
     pool = [proposal(i) for i in range(50)]
     quaternions = reference.new_tensor([0., 0., 0., 1.]).repeat(50, 1)
-    events, exports, verifier_options = [], [], []
+    events, exports, verifier_options, mode_options = [], [], [], []
     fail_at = {'index': None}
     manifest_path = tmp_path / 'manifest.json'
     manifest_path.write_text('{}')
@@ -98,7 +98,10 @@ def stubbed_run(runner, monkeypatch, tmp_path):
     monkeypatch.setattr(runner, 'prepare_amber_charges', lambda *a, **kw: protein)
     monkeypatch.setattr(runner, 'centered_protein', lambda value: (value, reference.new_zeros(3)))
     monkeypatch.setattr(runner.HydrogenatedKinematics, 'from_prepared', lambda value: value)
-    monkeypatch.setattr(runner, 'build_torsion_modes', lambda *a, **kw: model)
+    def build_modes(*args, **kwargs):
+        mode_options.append(kwargs)
+        return model
+    monkeypatch.setattr(runner, 'build_torsion_modes', build_modes)
     monkeypatch.setattr(runner, 'pair_grid', lambda *a, **kw: grid)
     cached = SimpleNamespace(bounded_radius=lambda radius, displacement: radius,
                              maximum_atom_motion_per_unit_amplitude=1.)
@@ -151,7 +154,7 @@ def stubbed_run(runner, monkeypatch, tmp_path):
     monkeypatch.setattr(runner, 'export_heavy_pair', export)
     monkeypatch.setattr(runner, 'relax_pose', relax)
 
-    def execute(arms):
+    def execute(arms, **options):
         args = SimpleNamespace(
             manifest=manifest_path, out=tmp_path / 'out', ph=7., seed=0, modes=1,
             fit_damping=.001, field_backend='sparse', spacing=2.,
@@ -160,13 +163,16 @@ def stubbed_run(runner, monkeypatch, tmp_path):
             response_pool_size=50, top_k=2, peaks_per_rotation=4,
             iterations=8, max_evaluations=64, checkpoint_fields=True,
         )
+        for key, value in options.items():
+            setattr(args, key, value)
         report = {'arms': {arm: {'status': 'not_attempted'} for arm in arms}}
         active_report['value'] = report
         runner.run(args, report, lambda: None)
         return report
 
     return SimpleNamespace(execute=execute, events=events, exports=exports,
-                           verifier_options=verifier_options, fail_at=fail_at, pool=pool)
+                           verifier_options=verifier_options, mode_options=mode_options,
+                           fail_at=fail_at, pool=pool)
 
 
 @pytest.mark.parametrize('arms', [('R1', 'R2', 'R2v'), ('R2v', 'R2', 'R1')])
@@ -231,3 +237,14 @@ def test_r2_alone_does_not_expand_or_verify_response_pool(stubbed_run):
     assert len(searches) == 1 and searches[0]['top_k'] == 2
     assert not state.verifier_options
     assert not any(event[0] == 'verify' for event in state.events)
+
+
+def test_runner_passes_explicit_mode_backends_without_changing_defaults(stubbed_run):
+    state = stubbed_run
+    state.execute(('R1',))
+    assert state.mode_options[-1] == dict(n_modes=1, fit_relative_damping=.001,
+        jacobian_backend='dense', jvp_chunk_size=8, anm_backend='dense', anm_seed=0, anm_tolerance=1e-9)
+    state.execute(('R1',), jacobian_backend='chunked', jvp_chunk_size=4,
+                  anm_backend='iterative', anm_seed=17, anm_tolerance=1e-8)
+    assert state.mode_options[-1] == dict(n_modes=1, fit_relative_damping=.001,
+        jacobian_backend='chunked', jvp_chunk_size=4, anm_backend='iterative', anm_seed=17, anm_tolerance=1e-8)
