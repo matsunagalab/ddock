@@ -20,9 +20,22 @@ JVP、非周期FFT相関、変位制約付き応答、固定基底での候補�
 1UBQ全鎖602原子／76残基の幾何・微分と、先頭4残基＋合成プローブのFFT→精密化接続を検証した。
 詳細は研究ログ§9.15。これはapo予測精度の評価ではない。
 
-実タンパク質の力場電荷・protonation、Ramachandran／内部非結合相互作用の妥当性、実データmanifest作成、
+さらにOpenMM ff14SBによる全水素・部分電荷、結合graphに沿う水素の内部座標変形、
+reference-freeなPDB pair manifest、R0/R1/R2 runnerと評価用の重原子PDB出力を追加した。
+実1UBQは602重原子＋629水素で前処理が通過し、重原子座標を保った。詳細は研究ログ§9.16。
+[run_induced_fit_pair.py](scripts/run_induced_fit_pair.py) の使い方と制限は
+[pair runner手順](docs/inducedfit_pair_runner.md) に記録した。
+
+NN訓練のactivation checkpointingも局所逆伝播へ転用した。合成41原子×2のCPU同条件3反復で、
+最終energy／amplitudes／PDBを変えず、peakRSS中央値64.46%減、wall時間19.88%増。
+FFT/JVP探索の経路は維持する。詳細は研究ログ§9.17。
+全水素入力・checkpoint・既存FFT回帰を含む最終対象suiteは **169テスト通過**。
+実apo入力の事前登録監査では、PINDER train辞書順5件の適格pairは0/5だった。
+サイズ・非標準残基・末端OXT欠損を記録し、成功例が出るまで選別する方法にはしていない。
+
+Ramachandran／内部非結合相互作用の妥当性、実データ母集団の監査と正規評価、
 HDOCK比較、抗体closureは残っている。下記の将来CLI群は未実装で、現在使える診断CLIは
-`verify_induced_fit.py`、`verify_internal_modes.py`、`verify_internal_fit.py` の3つ。
+`verify_induced_fit.py`、`verify_internal_modes.py`、`verify_internal_fit.py` と上記pair runner。
 各段階全体の完了とは扱わない。
 
 実構造で、無正則化のtorsion fitによる過大角度と、CA振幅だけを制限した応答の過大利得が見つかった。
@@ -603,7 +616,8 @@ uv run python scripts/compare_registered_runs.py \
 これにより、NNを必須にせず、NN訓練で成熟した計算技術を物理主体の誘導適合へ使う。
 FFTを維持する条件は、基底と剛性を一回の全探索中に固定し、更新を探索間に限定することである。
 
-P0–P3の数値接続まで進んだが、直近の次工程は力場由来の入力・chemistryと、実データのbaseline契約である。
+P0–P3の数値接続と限定された力場電荷の入力準備まで進んだ。直近の次工程は、
+実データの末端／欠損化学policy・数値収束・baseline契約と、内部非結合コストの追加である。
 適応基底、implicit calibration、H3は、固定基底の機構検証を通った後に追加する。
 特に大変形、溶媒、側鎖再配置、単量体自由エネルギーの近似は限界として残る。
 

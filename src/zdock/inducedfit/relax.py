@@ -81,6 +81,7 @@ def relax_pose(
     translation_scale: float = .5,
     amplitude_scale: float = .1,
     gradient_tolerance: float = 1e-6,
+    checkpoint_fields: bool = False,
 ) -> RelaxationResult:
     """Jointly relax pose and deformation, starting at a=0 by default.
 
@@ -144,8 +145,10 @@ def relax_pose(
         rec_xyz, lig_xyz, a = coordinates(variables)
         if not geometrically_valid(rec_xyz):
             raise ValueError("deformation exceeds actual-coordinate displacement bound")
-        rec_fields = build_fields(rec_xyz, receptor.radii, receptor.charges, grid, parameters)
-        lig_fields = build_fields(lig_xyz, ligand.radii, ligand.charges, grid, parameters)
+        rec_fields = build_fields(rec_xyz, receptor.radii, receptor.charges, grid, parameters,
+                                  checkpoint_chunks=checkpoint_fields)
+        lig_fields = build_fields(lig_xyz, ligand.radii, ligand.charges, grid, parameters,
+                                  checkpoint_chunks=checkpoint_fields)
         strain = model.deformation_energy(a)
         energy = physical_energy(rec_fields, lig_fields, grid, parameters) + strain
         if not torch.isfinite(energy):

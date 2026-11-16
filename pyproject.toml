@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7.0", "pytest-xdist>=3"]
 plot = ["matplotlib>=3.7"]
+# Optional, reproducible Amber charge/hydrogen preparation for induced fit.
+chemistry = ["openmm>=8.6.1,<8.7"]
 # Scoring with PINDER's own evaluation harness (scripts/score_decoys_with_pinder.py).
 #
 # biotite is capped below 1.7 on purpose. fastpdb (a hard dependency of pinder)

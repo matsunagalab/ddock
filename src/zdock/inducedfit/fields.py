@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import math
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from .types import GridSpec
 
@@ -109,14 +110,68 @@ def _validate_atoms(xyz: torch.Tensor, radii: torch.Tensor, charges: torch.Tenso
         raise ValueError("Molecular compact support leaves the grid; enlarge GridSpec (no truncation allowed)")
 
 
+def _charge_normalizer_atoms(atoms: torch.Tensor, points: torch.Tensor,
+                             params: FieldParameters, voxel_volume: float) -> torch.Tensor:
+    """One atom chunk, with explicit inputs for safe backward recomputation."""
+    normalizer = atoms.new_zeros(atoms.shape[0])
+    for start in range(0, points.shape[0], params.point_chunk_size):
+        block = points[start:start + params.point_chunk_size]
+        d2 = (block[:, None, :] - atoms[None, :, :]).square().sum(-1)
+        weights = _gaussian(d2, params.charge_sigma,
+                            params.charge_switch_start, params.charge_cutoff_sigma)
+        normalizer = normalizer + weights.sum(0) * voxel_volume
+    return normalizer
+
+
+def _fields_at_points(block: torch.Tensor, xyz: torch.Tensor, sigmas: torch.Tensor,
+                      expanded_sigmas: torch.Tensor, charges: torch.Tensor,
+                      normalizers: torch.Tensor, params: FieldParameters
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One point chunk; never close over a changing atom/point loop index."""
+    density = xyz.new_zeros(block.shape[0])
+    expanded = torch.zeros_like(density)
+    charge_density = torch.zeros_like(density)
+    for start in range(0, xyz.shape[0], params.atom_chunk_size):
+        sl = slice(start, start + params.atom_chunk_size)
+        d2 = (block[:, None, :] - xyz[None, sl, :]).square().sum(-1)
+        density = density + _gaussian(d2, sigmas[None, sl],
+                                     params.occupancy_switch_start, params.occupancy_cutoff_sigma).sum(1)
+        expanded = expanded + _gaussian(d2, expanded_sigmas[None, sl],
+                                       params.occupancy_switch_start, params.occupancy_cutoff_sigma).sum(1)
+        charge_weights = _gaussian(d2, params.charge_sigma,
+                                   params.charge_switch_start, params.charge_cutoff_sigma)
+        charge_density = charge_density + (charge_weights * (charges[sl] / normalizers[sl])[None, :]).sum(1)
+    occupancy = -torch.expm1(-density)
+    surface = -torch.expm1(-expanded) - occupancy
+    return occupancy, surface, charge_density
+
+
 def build_fields(xyz: torch.Tensor, radii: torch.Tensor, charges: torch.Tensor,
-                 grid: GridSpec, params: FieldParameters | None = None) -> MolecularFields:
+                 grid: GridSpec, params: FieldParameters | None = None, *,
+                 checkpoint_chunks: bool = False) -> MolecularFields:
     """Build smooth fields without allocating an atom-by-entire-grid tensor.
 
     Occupancy Gaussians have unit peak, never integral normalization. Charge
     Gaussians are normalized separately for EACH atom on this discrete grid.
     Their normalization remains in the autograd graph.
+
+    ``checkpoint_chunks=True`` uses non-reentrant activation checkpointing
+    for ordinary reverse-mode ``torch.autograd.grad``/``backward``.  It
+    recomputes one field point chunk or one normalizer atom chunk during
+    backward, trading extra compute for fewer retained atom-by-grid tensors.
+    It does NOT checkpoint the whole builder.  RNG preservation is disabled
+    because these pure tensor functions contain no random operations.
+
+    Use the default ``False`` for torch.func transforms/JVPs.  Forward AD
+    explicitly rejects checkpoint mode; other torch.func transforms are not
+    supported by the checkpoint path.  No-grad calls bypass checkpointing.
+    See https://docs.pytorch.org/docs/stable/checkpoint.html .
     """
+    if not isinstance(checkpoint_chunks, bool):
+        raise TypeError("checkpoint_chunks must be a bool")
+    if checkpoint_chunks and any(torch.autograd.forward_ad.unpack_dual(tensor).tangent is not None
+                                 for tensor in (xyz, radii, charges)):
+        raise ValueError("checkpoint_chunks is reverse-mode only; use False for forward AD/JVP")
     params = params or FieldParameters()
     _validate_atoms(xyz, radii, charges, grid, params)
     points = grid.points(device=xyz.device, dtype=xyz.dtype)
@@ -124,17 +179,17 @@ def build_fields(xyz: torch.Tensor, radii: torch.Tensor, charges: torch.Tensor,
     atom_chunk, point_chunk = params.atom_chunk_size, params.point_chunk_size
     sigmas = radii / math.sqrt(2.0 * math.log(2.0))
     expanded_sigmas = (radii + params.surface_width) / math.sqrt(2.0 * math.log(2.0))
+    use_checkpoint = checkpoint_chunks and torch.is_grad_enabled()
 
     # First pass obtains per-atom charge normalizers, retaining their JVP.
     normalizer_chunks = []
     for ia in range(0, xyz.shape[0], atom_chunk):
         atoms = xyz[ia:ia + atom_chunk]
-        normalizer = torch.zeros(atoms.shape[0], dtype=xyz.dtype, device=xyz.device)
-        for ip in range(0, points.shape[0], point_chunk):
-            d2 = (points[ip:ip + point_chunk, None, :] - atoms[None, :, :]).square().sum(-1)
-            weights = _gaussian(d2, params.charge_sigma,
-                                params.charge_switch_start, params.charge_cutoff_sigma)
-            normalizer = normalizer + weights.sum(0) * h3
+        if use_checkpoint and atoms.requires_grad:
+            normalizer = checkpoint(_charge_normalizer_atoms, atoms, points, params, h3,
+                                    use_reentrant=False, preserve_rng_state=False)
+        else:
+            normalizer = _charge_normalizer_atoms(atoms, points, params, h3)
         normalizer_chunks.append(normalizer)
     normalizers = torch.cat(normalizer_chunks)
     if bool((normalizers <= torch.finfo(xyz.dtype).tiny).any()):
@@ -143,21 +198,13 @@ def build_fields(xyz: torch.Tensor, radii: torch.Tensor, charges: torch.Tensor,
     occupancy_chunks, surface_chunks, charge_chunks = [], [], []
     for ip in range(0, points.shape[0], point_chunk):
         block = points[ip:ip + point_chunk]
-        density = torch.zeros(block.shape[0], dtype=xyz.dtype, device=xyz.device)
-        expanded = torch.zeros_like(density)
-        charge_density = torch.zeros_like(density)
-        for ia in range(0, xyz.shape[0], atom_chunk):
-            sl = slice(ia, ia + atom_chunk)
-            d2 = (block[:, None, :] - xyz[None, sl, :]).square().sum(-1)
-            density = density + _gaussian(d2, sigmas[None, sl],
-                                         params.occupancy_switch_start, params.occupancy_cutoff_sigma).sum(1)
-            expanded = expanded + _gaussian(d2, expanded_sigmas[None, sl],
-                                           params.occupancy_switch_start, params.occupancy_cutoff_sigma).sum(1)
-            charge_weights = _gaussian(d2, params.charge_sigma,
-                                       params.charge_switch_start, params.charge_cutoff_sigma)
-            charge_density = charge_density + (charge_weights * (charges[sl] / normalizers[sl])[None, :]).sum(1)
-        occupancy = -torch.expm1(-density)
-        surface = -torch.expm1(-expanded) - occupancy
+        args = (block, xyz, sigmas, expanded_sigmas, charges, normalizers, params)
+        if use_checkpoint and any(t.requires_grad for t in (xyz, radii, charges)):
+            occupancy, surface, charge_density = checkpoint(
+                _fields_at_points, *args, use_reentrant=False, preserve_rng_state=False,
+            )
+        else:
+            occupancy, surface, charge_density = _fields_at_points(*args)
         occupancy_chunks.append(occupancy)
         surface_chunks.append(surface)
         charge_chunks.append(charge_density)

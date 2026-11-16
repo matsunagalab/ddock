@@ -90,6 +90,16 @@ uv sync --index https://pypi.org/simple --reinstall-package torch
 
 </details>
 
+## Experimental physical induced fit
+
+The separate `zdock.inducedfit` prototype uses smooth fields, JVP derivative
+fields and FFT response selection before constrained torsion refinement. For
+complete, standard single chains, `uv sync --extra chemistry` enables Amber
+charges with explicit hydrogens. See the [pair runner guide](docs/inducedfit_pair_runner.md),
+[implementation plan](PLAN_INDUCED_FIT.md) and cumulative [experiment report](EXPERIMENT_REPORT.md).
+This effective energy is not a full Amber force field; apo docking accuracy and
+an advantage over HDOCK have not been demonstrated.
+
 ## Quick start — re-scoring poses
 
 ```python

@@ -7224,3 +7224,220 @@ curl -fL https://files.rcsb.org/download/1UBQ.pdb -o data/inducedfit/inputs/1UBQ
 重原子・標準単鎖・既知crosslinkなしという制限、Ramachandranと内部非結合力場の不足、
 coarse shapeモデル、電荷診断、局所反復上限が残る。次は力場由来のchemistryと実データmanifest、
 正規baseline再現を整え、複数apo系で同じ制約・候補予算のR2−R1を検証する。
+
+### 9.16 全水素・力場電荷とreference-free pair runner（2026-11-16）
+
+**問い・仮説。** §9.15の重原子／電荷0診断を、入力座標を変えずに力場由来の部分電荷へ
+置き換えられるか。また、その水素を内部座標変形・FFT・精密化まで一貫して保持できるか。
+これはchemistryと計算経路の検証であり、HDOCKに対する予測精度の仮説検定ではない。
+
+**実装と物理的範囲。** optional extra `chemistry` にOpenMM 8.6.1を追加。
+`chemistry.py` は `amber14/protein.ff14SB.xml`、pH7、Reference platformで水素を追加する。
+Python random stateを保存・seed設定・復元し、XML／hydrogens.xml／residues.xml／Modeller source hash、
+version、protonation variant、原子対応を記録する。重原子の移動が倍精度の単位変換roundoffを
+超えないことを検査してから元の座標bitsを復元する。欠損側鎖・末端OXT・非標準残基・crosslinkは
+無言で修復しない。全水素を残してNonbondedForceの各粒子電荷を用いる。
+
+`HydrogenatedKinematics` は、φ/ψ軸の結合をfull atom bond graphで切った下流成分を回転する。
+φでCAに結合したHが追随し、NのHは動かない。Proのφや閉環を切る自由度は使用しない。
+同じ全原子写像からJVP基底を作り、全原子の変位上限を適用する。エネルギーは依然として
+有効shape／screened-charge場＋CA spring priorであり、Amber kcal/molではない。
+幾何半径C1.70/N1.55/O1.52/S1.80/H1.20 ÅはAmber LJ sigmaではない。
+Ramachandran、内部非結合反発、rotamer、溶媒自由エネルギーは未実装。
+
+`pipeline.py` と `run_induced_fit_pair.py` は、厳密なallowlistのPDB pair manifestとsource SHA256を
+読み、各単量体の重原子centroidで中心化する。native path／DockQ等の追加fieldは拒否する。
+R0=rigid selection+rigid refinement、R1=rigid selection+flexible refinement、
+R2=response selection+flexible refinement。R1/R2はa=0、共通grid・rotation・候補数・局所budget・
+変位制約から開始。最終構造は両partnerともreceptorの元frameへ戻し、重原子を元の対応順に出力する。
+complex PDBのchainはR/L。最終rankはreport内、ファイル名はselection rank。
+候補不足・search失敗・精密化失敗・未実行armを区別し、段階ごとの部分reportを保存する。
+
+**入力・split・leakage・選択。** 1UBQは既使用の幾何検証用入力で、held-outではない。
+全602重原子を使い、native interfaceやholo方向をモードに与えない。学習・loss最適化・checkpoint選択なし。
+pH7／seed0、torsion診断のseed0／角度標準偏差0.02 rad。数値testは合成peptideでnetwork取得なし。
+実apo試行として旧benchmarkの1BRSに対応する1A2P chain B／1A19 chain Aを、準備可能性確認前に
+`historical_development` として登録した。これは新規testでもflexible成功例でもなく、
+入力条件を満たすかを調べる開発試行である。[元のbenchmark一次資料](https://zlab.wenglab.org/zdock/benchmark.pdf)。
+この推論manifestにnativeのファイルパスはなく、native PDBも取得していない。
+
+**実測：1UBQの全水素前処理・変形。** macOS arm64、CPU、float64、Python3.12.11、
+PyTorch2.13.0、OpenMM8.6.1。602重原子＋629H=1231原子、1237結合、147 torsion。
+全電荷3.04444e−15 e、heavyのみ−75.7103 e、水素+75.7103 e。HIS68はHIDと判定された。
+重原子のOpenMM単位変換往復差7.10543e−15 Å、検査・roundoff復元後の差0。
+全原子変形後の結合長最大変化1.78080e−13 Å、2257結合角cosineの最大変化1.97342e−13、
+heavy-only写像との座標差7.10543e−14 Å。
+`data/inducedfit/verification/1UBQ_amber_preparation.json` に再現コマンドと全provenanceを保存した。
+**解釈：** 水素電荷を捨てるheavy-only方式は全電荷を壊す。全水素の保持とbond graph変形は
+数値的に整合したが、結合幾何の保持だけでは構造全体のエネルギー的妥当性を保証しない。
+
+**実測：最初の実apo入力は準備段階で失敗。**
+公式RCSBから1A2P／1A19を取得し、下記hashでmanifestを固定した。
+
+| 入力 | chain | SHA256 |
+| --- | --- | --- |
+| 1A2P | B | `f666c1dc491d6994a859f647953c7c8bc9546fdaa4a9be6dfb520955ffbbf903` |
+| 1A19 | A | `0cd033f1646ae3da136276ebaa0eee6de825f647910308d5a39c22c683162d4e` |
+
+pair runは `PDB line 5711: unsupported non-water HETATM ZN` で読込時に停止した。
+1A2PからZnを除いて成功例に置き換えることはしていない。
+個別の原因確認では1A19 Aの前処理は1433全原子で通過したが、pairは準備失敗1/1、探索実行0/1。
+この失敗をDockQ=0という測定値に置き換えず、登録母集団に残す。
+保存先 `data/inducedfit/runs/historical_1BRS_prepare/report.json`。
+
+```bash
+uv sync --extra chemistry
+curl -fL https://files.rcsb.org/download/1A2P.pdb -o data/inducedfit/inputs/1A2P.pdb
+curl -fL https://files.rcsb.org/download/1A19.pdb -o data/inducedfit/inputs/1A19.pdb
+# manifest schemaとhash固定の方法は docs/inducedfit_pair_runner.md
+.venv/bin/python scripts/run_induced_fit_pair.py \
+  --manifest data/inducedfit/manifests/historical_1BRS_apo.json \
+  --out data/inducedfit/runs/historical_1BRS_prepare --prepare-only
+```
+
+**全経路の合成smoke。** `scripts/verify_amber_pair.py` で、完全なALA–GLY–SER–ALAを
+2個生成した。末端OXTも合成幾何として明示し、固定φ/ψ変形で非平面化した。
+input_kind=`synthetic`／split=`development`、native構造なし、pH7／seed0、各鎖21重原子＋20H。
+1 mode、identity 1回転、Top1、各回転4 peaks、spacing2 Å、grid41³、radius0.1 Å、
+最大原子変位0.5 Åから共通有効半径0.0860625 Å、局所1iteration／最大6 energy評価。
+field設定はsurface幅0.5 Å、repulsion3、charge1、charge Gaussianσ0.6 Å、screening κ0.1 Å⁻¹。
+coreやstiffnessの較正・モデル選択は行わず、全armの数値経路とexportを検査した。
+
+| arm | 初期energy | 最終energy | accepted steps | energy評価 |
+| --- | ---: | ---: | ---: | ---: |
+| R0 | −17.5821 | −18.0372 | 1 | 3 |
+| R1 | −17.5821 | −18.0162 | 1 | 3 |
+| R2 | −17.5067 | −17.7115 | 1 | 4 |
+
+全armがexportに成功し、両単量体ファイルとcombined R/Lの原子対応・座標一致を確認した。
+R0の内部座標は固定、R1/R2は非ゼロ変形。R2の予測利得は−0.299575だが、
+**最終energyはR0/R1より悪かった**。1iterationで収束を判断できず、protein精度でもない。
+粗いgridはchargeσより大きく、離散化収束は未確認。
+初回 `synthetic_amber_pair_v1` はchild5.00秒、peakRSS3,911,680,000 bytes。
+同じ入力hash／子CLI source hashでの再実行 `synthetic_amber_pair_v2_checked` は4.58秒、
+peakRSS2,635,431,936 bytes、最終energyはbit一致した。単発RSSの変動が大きいため、
+checkpointの速度・メモリ比較には同一codeでの反復が必要。失敗・skip・OOMはこの2実行では0。
+
+```bash
+.venv/bin/python scripts/verify_amber_pair.py \
+  --out data/inducedfit/verification/synthetic_amber_pair_v1 --modes 1
+.venv/bin/python scripts/verify_amber_pair.py \
+  --out data/inducedfit/verification/synthetic_amber_pair_v2_checked --modes 1
+```
+
+**PINDER trainの事前登録5件。** 公式配布先 `https://pinderdata.org/2024-02` の
+index.parquet（124,511,839 bytes）を取得し、配布manifestのMD5と一致することを確認した。
+trainかつ両apoあり136,498行をIDでsortし、先頭5件を**apo PDB取得前**に固定した。
+長さ≤150残基／sideは読込後の適格性条件であり、成功するまで次のIDに進む規則ではない。
+`input_selection_train_apo_lex5_v1.json` のSHA256は
+`89f3b8a5fec56761cc70825b96e77b7e3d338baa376679af4c54baf3ca468e96`。
+Parquet読込には既存diffem_mac環境のpyarrow/pandasを用い、chemistryは本repoの.venvを使用。
+
+| 登録ID | 入力残基数 R/L | 結果 |
+| --- | --- | --- |
+| `19hc__A1_Q9RN68--19hc__B1_Q9RN68` | 293/293 | size条件外、chemistry未実行 |
+| `1a0m__A1_P56638--1a0m__B1_P56638` | R読込失敗/16 | Rに非標準HETATM TYS |
+| `1a0n__B1_P06241--1a0n__A1_P27986` | 58/184 | size条件外、chemistry未実行 |
+| `1a0o__A1_P0AE67--1a0o__B1_P07363` | 128/69 | R成功1985全原子、L末端GLU104のOXT欠損 |
+| `1a14__A1_P03472--1a14__A2_P03472` | 387/387 | size条件外、chemistry未実行 |
+
+unique8 apo PDBのみ取得し、native未取得。適格pair0/5、ドッキング実行0/5で停止した。
+これは登録した小さな辞書順prefixでの**前処理coverageのnull結果**で、
+PINDER全体の成功率推定やddock構造精度を表さない。
+全入力hash・読込例外・準備可否は `data/inducedfit/pinder_train_apo_lex5_inputs/input_eligibility_audit_v1.json`。
+詳しい再現手順は [input audit](docs/inducedfit_input_audit.md) に保存する。
+再現用 `scripts/audit_induced_fit_inputs.py audit` を同じ登録・入力で実行し、
+全5件のstatusと0/5適格を再現した。結果は `input_eligibility_audit_reproduced_v1.json`。
+これは新たな5系の試験ではなく、再現用CLIの確認である。
+
+**HDOCK環境。** PATH上に `hdock/createpl` はない。Docker CLIは存在するがdaemon socketがなく、
+`docker info` は接続失敗。したがって比較実行は未実施で、性能値はない。
+公式[HDOCKlite](https://github.com/huang-laboratory/HDOCKlite) commit
+`9f27e0638beed12ba8665a48ac63854139b2cc84` の配布binary／README／LICENSEをignored dataに取得した。
+非実行のfile検査でLinux x86-64 ELF、libfftw3.so.3依存を確認。hdock SHA256は
+`334ac3c70300160aac0dc14c89c81d5940eaf621d16e946925409b2fbb546347`。
+academic/noncommercial利用可、研究室外再配布不可のためbinaryはcommitしない。
+HDOCKserverのtemplate利用設定を再現したわけではなく、standalone baselineの導入調査である。
+新しい計算環境が必要なことと、モデルがHDOCKに劣る／勝ることは区別する。
+
+**結論・限界・次実験。** 全水素力場電荷を持つ入力と、水素を含む内部座標変形を接続した。
+実apoの化学的入力条件は未解決であり、適格性の失敗を含む母集団監査が必要。
+全経路smokeは通過したが、実apo登録試行は0/5適格という結果だった。
+末端欠損を真の末端と同一視せず、配列／欠損区間に基づく入力化学policyが次に必要。
+また小系でも自動微分のメモリが大きいため、NN訓練のactivation checkpointingを次に検証する。
+少数回転・粗い格子のsmokeは精度benchmarkに転用せず、格子収束、内部非結合コスト、
+同一apo入力HDOCK、独立scorerを準備する。
+
+### 9.17 NN訓練のactivation checkpointingを物理場の逆伝播へ転用（2026-11-16）
+
+**問い・仮説。** §9.16で小型系でも数GBのRSSを観測した。原子×格子の中間tensorを
+すべて保存せず、逆伝播時に局所再計算すれば、エネルギー／力／最終構造を変えずに
+メモリを減らせるか。これはNNの学習済み予測を導入する実験ではなく、
+学習で使われる計算技術を物理energyの微分へ適用する実験である。
+
+**実装。** `build_fields(..., checkpoint_chunks=True)` を追加した。
+PyTorchのnon-reentrant `checkpoint(use_reentrant=False, preserve_rng_state=False)` を、
+各point chunkの場と、電荷正規化の各atom chunkに適用する。関数全体を再計算単位にすると
+再び大きな逆伝播graphを作るため、その方式は用いない。関数は純粋なtensor計算でRNGを使わず、
+必要なtensorとparameterを明示引数にする。closureのloop変数参照による再計算の不一致も避けた。
+[公式PyTorch仕様](https://docs.pytorch.org/docs/stable/checkpoint.html)を確認し、
+通常の `autograd.grad/backward` に限定した。`torch.func`／JVPの既定経路はcheckpointを使わず、
+Trueでのforward AD要求は明示的に拒否する。
+
+`relax_pose(..., checkpoint_fields=True)` とpair runnerの `--checkpoint-fields` で選べる。
+FFT探索・基底・K・場の式・charge normalization・同じenergyによる精密化は変更しない。
+line searchのno-grad評価では再計算用保存を行わない。
+
+**検証条件とleakage control。** §9.16と同じ合成41原子×2、seed0、pH7、float64 CPU、1 thread、
+grid41³、spacing2 Å、M1、1回転、各armTop1、局所1step／最大6評価。
+元の学習loss、train/validation/test、checkpoint selectionは存在しない。
+比較条件はactivation checkpointのoff/onだけで、入力SHA256・全子CLI source SHA256を照合した。
+各3回をoff/on、on/off、off/onの順で別process実行し、同じ生成器と全armを使った。
+最初の2回の§9.16結果は実装変更前の履歴として残し、比較medianには混ぜていない。
+
+**全実測。** wall timeはchild runnerの前処理・探索・全3arm精密化・exportを含む。
+RSSはmacOSのprocess peak RSSで、GPUメモリ量ではない。
+
+| repeat | checkpoint | wall秒 | peak RSS bytes |
+| ---: | --- | ---: | ---: |
+| 0 | off | 4.692820 | 2,521,677,824 |
+| 0 | on | 5.484545 | 896,319,488 |
+| 1 | on | 5.466081 | 901,185,536 |
+| 1 | off | 4.574846 | 2,832,039,936 |
+| 2 | off | 4.572731 | 2,485,288,960 |
+| 2 | on | 5.583015 | 893,992,960 |
+
+中央値はoff=4.574846秒／2,521,677,824 bytes、on=5.484545秒／896,319,488 bytes。
+**RSS 64.46%減、wall 19.88%増**。全6実行で全armの最終energy・amplitudesの最大差は0、
+出力PDBのSHA256もすべて一致。失敗・skip・OOMは0で、局所solverは予定どおり1iteration上限。
+合成smokeのR2 energyが悪いという§9.16のnull結果も変わらない。
+保存先は `data/inducedfit/verification/checkpoint_comparison_v1/comparison.json` と各trial下のreport。
+測定後のコードレビューで、外側timeoutだけでは子孫processが残る可能性を修正した。
+harnessに専用process groupの終了処理と内側120秒timeoutを追加した。
+上記6実行にはtimeoutがなく、energy経路・数値結果には影響しない。
+
+**数値テスト。** checkpoint／通常経路の座標・半径・電荷gradientを独立な空間畳み込みenergyと
+比較し、FD、電荷総量の位置微分0、複数chunk形状、no-grad、JVP拒否を検査した。
+小fixtureのforward保存tensor領域も通常経路の25%未満だったが、これはprocess RSSとは別指標。
+全水素chemistry、原子graph、manifestとframe変換、既存FFT回帰も含む最終検証は
+**169 passed in 2.35s**。これは下記対象のsuiteであり、全legacy suiteを再実行したとは扱わない。
+
+```bash
+.venv/bin/python scripts/benchmark_inducedfit_checkpoint.py \
+  --out data/inducedfit/verification/checkpoint_comparison_v1 --repeats 3
+.venv/bin/python -m pytest tests/test_inducedfit_data.py tests/test_inducedfit_fields.py \
+  tests/test_inducedfit_response.py tests/test_inducedfit_search.py \
+  tests/test_inducedfit_kinematics.py tests/test_inducedfit_modes.py \
+  tests/test_inducedfit_pdb_input.py tests/test_inducedfit_relax.py \
+  tests/test_inducedfit_hydrogen_kinematics.py tests/test_inducedfit_chemistry.py \
+  tests/test_inducedfit_pipeline.py tests/test_inducedfit_checkpoint.py \
+  tests/test_search.py::test_sc_fft_matches_direct_xcorr \
+  tests/test_search.py::test_sc_fft_matches_docking_score_elec_synthetic -q
+```
+
+**結論・限界・次実験。** このCPU小系では、FFT/JVPの探索を保ったまま局所精密化を
+時間との交換で省メモリ化できた。checkpointは構造精度を改善する方法ではなく、
+より多い候補・原子・柔軟自由度を物理的に評価する計算基盤である。
+3反復だけで一般的な高速化／スケーリングを主張せず、GPUや実タンパク質では未検証。
+実apoの末端／欠損化学policy、内部非結合力場、grid収束を先に整え、同一入力・予算の
+HDOCK比較と抗体loop closureへの展開に進む。
